@@ -1517,6 +1517,9 @@ impl<W: LayoutElement> Layout<W> {
     }
 
     pub fn should_trigger_focus_follows_mouse_on(&self, window: &W::Id) -> bool {
+        if self.sink_depth(window).is_some() {
+            return false;
+        }
         // During an animation, it's easy to trigger focus-follows-mouse on the previous workspace,
         // especially when clicking to switch workspace on a bar of some kind. This cancels the
         // workspace switch, which is annoying and not intended.
@@ -1634,6 +1637,52 @@ impl<W: LayoutElement> Layout<W> {
         };
 
         Some(&monitors[*active_monitor_idx].output)
+    }
+
+    /// Depth in the workspace-local Sink stack; zero is the current top.
+    pub fn sink_depth(&self, id: &W::Id) -> Option<usize> {
+        self.workspaces().find_map(|(_, _, ws)| ws.sink_depth(id))
+    }
+
+    /// Moves the active normal tile to its workspace's Sink owner.
+    /// The action layer is responsible for feature, seat, lock and popup-grab permission.
+    pub fn sink_window(&mut self) -> bool {
+        if self.interactive_move.is_some() || self.dnd.is_some() {
+            return false;
+        }
+        let Some(id) = self
+            .active_workspace()
+            .and_then(|ws| ws.active_window())
+            .map(|win| win.id().clone())
+        else {
+            return false;
+        };
+        let (_, window) = self.windows().find(|(_, win)| win.id() == &id).unwrap();
+        if self.windows().any(|(_, other)| {
+            other.id() != &id && (other.is_child_of(window) || window.is_child_of(other))
+        }) {
+            return false;
+        }
+        self.active_workspace_mut().unwrap().sink_window(&id)
+    }
+
+    /// Restores the top tile in the active workspace through normal insertion.
+    pub fn pull_window(&mut self) -> Option<W::Id> {
+        if self.interactive_move.is_some() || self.dnd.is_some() {
+            return None;
+        }
+        self.active_workspace_mut()?.pull_window(true)
+    }
+
+    /// Explicit recall preparation. Call after permission checks, then activate the final ID.
+    pub fn unwind_sink_to(&mut self, id: &W::Id) -> bool {
+        if self.interactive_move.is_some() || self.dnd.is_some() {
+            return false;
+        }
+        let Some(ws) = self.workspaces_mut().find(|ws| ws.sink_depth(id).is_some()) else {
+            return false;
+        };
+        ws.unwind_sink_to(id, false)
     }
 
     pub fn active_workspace(&self) -> Option<&Workspace<W>> {
@@ -2173,6 +2222,9 @@ impl<W: LayoutElement> Layout<W> {
         idx: usize,
         activate: ActivateWindow,
     ) {
+        if window.is_some_and(|id| self.sink_depth(id).is_some()) {
+            return;
+        }
         if let Some(InteractiveMoveState::Moving(move_)) = &mut self.interactive_move {
             if window.is_none() || window == Some(move_.tile.window().id()) {
                 return;
@@ -3319,6 +3371,9 @@ impl<W: LayoutElement> Layout<W> {
         target_ws_idx: Option<usize>,
         activate: ActivateWindow,
     ) {
+        if window.is_some_and(|id| self.sink_depth(id).is_some()) {
+            return;
+        }
         if let Some(InteractiveMoveState::Moving(move_)) = &mut self.interactive_move {
             if window.is_none() || window == Some(move_.tile.window().id()) {
                 return;
@@ -3570,6 +3625,9 @@ impl<W: LayoutElement> Layout<W> {
     }
 
     pub fn toggle_windowed_fullscreen(&mut self, id: &W::Id) {
+        if self.sink_depth(id).is_some() {
+            return;
+        }
         let (_, window) = self.windows().find(|(_, win)| win.id() == id).unwrap();
         if window.pending_sizing_mode().is_fullscreen() {
             // Remove the real fullscreen.
@@ -3840,7 +3898,7 @@ impl<W: LayoutElement> Layout<W> {
             return false;
         };
 
-        if mon.output() != output {
+        if mon.output() != output || ws.sink_depth(&window_id).is_some() {
             return false;
         }
 

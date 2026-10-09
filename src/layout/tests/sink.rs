@@ -398,3 +398,179 @@ fn sunk_client_commit_updates_native_geometry_without_depth_resize() {
         &workspace.windows().next().unwrap().0
     ));
 }
+
+#[test]
+fn layout_keeps_sink_workspace_through_output_disconnect_reconnect_and_close() {
+    let mut layout = Layout::default();
+    Op::AddOutput(1).apply(&mut layout);
+    Op::AddWindow {
+        params: TestWindowParams::new(1),
+    }
+    .apply(&mut layout);
+    Op::Communicate(1).apply(&mut layout);
+    Op::Refresh { is_active: true }.apply(&mut layout);
+    let win = layout.windows().next().unwrap().1.clone();
+    let workspace_id = layout.active_workspace().unwrap().id();
+    assert!(layout.sink_window());
+    layout.verify_invariants();
+    Op::Refresh { is_active: true }.apply(&mut layout);
+    assert_eq!(layout.sink_depth(&1), Some(0));
+    assert!(layout.active_workspace().unwrap().has_windows());
+    assert!(layout.focus_with_output().is_none());
+    assert!(!layout.should_trigger_focus_follows_mouse_on(&1));
+    let output = layout.outputs().next().unwrap().clone();
+    assert!(!layout.interactive_move_begin(1, &output, (10., 10.).into()));
+    layout.toggle_windowed_fullscreen(&1);
+    assert!(!win.is_pending_windowed_fullscreen());
+    win.0.output_events.borrow_mut().clear();
+    Op::RemoveOutput(1).apply(&mut layout);
+    layout.verify_invariants();
+    assert!(layout.has_window(&1));
+    assert_eq!(
+        layout
+            .find_workspace_by_id(workspace_id)
+            .unwrap()
+            .1
+            .sink_count(),
+        1
+    );
+    Op::AddOutput(2).apply(&mut layout);
+    layout.verify_invariants();
+    assert_eq!(
+        layout
+            .find_workspace_by_id(workspace_id)
+            .unwrap()
+            .1
+            .sink_count(),
+        1
+    );
+    assert_eq!(
+        win.0.output_events.take(),
+        [("output1".to_owned(), false), ("output2".to_owned(), true)]
+    );
+    Op::CloseWindow(1).apply(&mut layout);
+    layout.verify_invariants();
+    assert!(!layout.has_window(&1));
+    assert_eq!(win.0.output_events.take(), [("output2".to_owned(), false)]);
+}
+
+#[test]
+fn layout_explicit_recall_is_distinct_from_generic_activation() {
+    let mut layout = Layout::default();
+    Op::AddOutput(1).apply(&mut layout);
+    for id in 1..=3 {
+        Op::AddWindow {
+            params: TestWindowParams::new(id),
+        }
+        .apply(&mut layout);
+        Op::Communicate(id).apply(&mut layout);
+        assert!(layout.sink_window());
+        layout.verify_invariants();
+    }
+    layout.activate_window(&1);
+    layout.activate_window_without_raising(&1);
+    assert_eq!(layout.sink_depth(&1), Some(2));
+    assert!(layout.focus_with_output().is_none());
+    let mut layouts = Vec::new();
+    layout.with_windows(|window, _, workspace, ipc| {
+        layouts.push((*window.id(), workspace, ipc));
+    });
+    assert_eq!(layouts.len(), 3);
+    assert!(layouts
+        .iter()
+        .all(|(_, ws, ipc)| ws.is_some() && ipc.pos_in_scrolling_layout.is_none()));
+    Op::CloseWindow(2).apply(&mut layout);
+    assert_eq!(layout.sink_depth(&1), Some(1));
+    assert!(layout.unwind_sink_to(&1));
+    layout.activate_window(&1);
+    layout.verify_invariants();
+    assert_eq!(
+        layout.focus_with_output().map(|(win, _)| *win.id()),
+        Some(1)
+    );
+    assert_eq!(layout.sink_depth(&1), None);
+    assert_eq!(layout.sink_depth(&3), None);
+}
+
+#[test]
+fn layout_direct_moves_of_sunk_owners_are_noops() {
+    let mut layout = Layout::default();
+    Op::AddOutput(1).apply(&mut layout);
+    Op::AddOutput(2).apply(&mut layout);
+    Op::AddWindow {
+        params: TestWindowParams::new(1),
+    }
+    .apply(&mut layout);
+    assert!(layout.sink_window());
+    let workspace = layout
+        .workspaces()
+        .find(|(_, _, ws)| ws.has_window(&1))
+        .unwrap()
+        .2
+        .id();
+    let output = layout
+        .outputs()
+        .find(|o| o.name() == "output2")
+        .unwrap()
+        .clone();
+    layout.move_to_workspace(Some(&1), 1, ActivateWindow::Yes);
+    layout.move_to_output(Some(&1), &output, None, ActivateWindow::Yes);
+    layout.verify_invariants();
+    assert_eq!(
+        layout
+            .find_workspace_by_id(workspace)
+            .unwrap()
+            .1
+            .sink_depth(&1),
+        Some(0)
+    );
+    assert_eq!(layout.windows().count(), 1);
+}
+
+#[test]
+fn layout_rejects_active_transient_family_without_partial_transfer() {
+    let mut layout = Layout::default();
+    Op::AddOutput(1).apply(&mut layout);
+    Op::AddWindow {
+        params: TestWindowParams::new(1),
+    }
+    .apply(&mut layout);
+    let mut child = TestWindowParams::new(2);
+    child.parent_id = Some(1);
+    child.is_floating = true;
+    Op::AddWindow { params: child }.apply(&mut layout);
+    assert!(!layout.sink_window());
+    assert_eq!(layout.sink_depth(&2), None);
+    layout.activate_window(&1);
+    assert!(!layout.sink_window());
+    assert_eq!(layout.sink_depth(&1), None);
+    assert_eq!(layout.windows().count(), 2);
+    layout.verify_invariants();
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig {
+        cases: if std::env::var_os("RUN_SLOW_TESTS").is_some() { ProptestConfig::default().cases } else { 0 },
+        ..ProptestConfig::default()
+    })]
+
+    #[test]
+    fn random_operations_from_sink_stack_dont_panic(ops: Vec<Op>, layout_config in arbitrary_layout_part()) {
+        let options = Options { layout: niri_config::Layout::from_part(&layout_config), ..Default::default() };
+        let mut layout = Layout::with_options(Clock::with_time(Duration::ZERO), options);
+        Op::AddOutput(1).apply(&mut layout);
+        Op::AddOutput(2).apply(&mut layout);
+        for id in 1..=3 {
+            let mut params = TestWindowParams::new(id);
+            params.is_floating = id == 2;
+            Op::AddWindow { params }.apply(&mut layout);
+            Op::Communicate(id).apply(&mut layout);
+            prop_assert!(layout.sink_window());
+            layout.verify_invariants();
+        }
+        for op in ops {
+            op.apply(&mut layout);
+            layout.verify_invariants();
+        }
+    }
+}

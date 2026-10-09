@@ -210,11 +210,17 @@ impl LayoutElement for TestWindow {
     }
 
     fn output_enter(&self, output: &Output) {
-        self.0.output_events.borrow_mut().push((output.name(), true));
+        self.0
+            .output_events
+            .borrow_mut()
+            .push((output.name(), true));
     }
 
     fn output_leave(&self, output: &Output) {
-        self.0.output_events.borrow_mut().push((output.name(), false));
+        self.0
+            .output_events
+            .borrow_mut()
+            .push((output.name(), false));
     }
 
     fn set_offscreen_data(&self, _data: Option<OffscreenData>) {}
@@ -463,6 +469,9 @@ enum Op {
         ws_name: usize,
     },
     CloseWindow(#[proptest(strategy = "1..=5usize")] usize),
+    SinkWindow,
+    PullWindow,
+    UnwindSink(#[proptest(strategy = "1..=5usize")] usize),
     FullscreenWindow(#[proptest(strategy = "1..=5usize")] usize),
     SetFullscreenWindow {
         #[proptest(strategy = "1..=5usize")]
@@ -1068,6 +1077,17 @@ impl Op {
                     is_floating,
                     ActivateWindow::default(),
                 );
+            }
+            Op::SinkWindow => {
+                layout.sink_window();
+            }
+            Op::PullWindow => {
+                layout.pull_window();
+            }
+            Op::UnwindSink(id) => {
+                if layout.unwind_sink_to(&id) {
+                    layout.activate_window(&id);
+                }
             }
             Op::CloseWindow(id) => {
                 layout.remove_window(&id, Transaction::new());
@@ -1818,6 +1838,10 @@ fn operations_dont_panic() {
             params: TestWindowParams::new(3),
             ws_name: 1,
         },
+        Op::SinkWindow,
+        Op::PullWindow,
+        Op::UnwindSink(1),
+        Op::UnwindSink(2),
         Op::CloseWindow(0),
         Op::CloseWindow(1),
         Op::CloseWindow(2),
@@ -1976,6 +2000,10 @@ fn operations_from_starting_state_dont_panic() {
             params: TestWindowParams::new(5),
             ws_name: 1,
         },
+        Op::SinkWindow,
+        Op::PullWindow,
+        Op::UnwindSink(1),
+        Op::UnwindSink(2),
         Op::CloseWindow(0),
         Op::CloseWindow(1),
         Op::CloseWindow(2),
