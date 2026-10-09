@@ -1,8 +1,9 @@
 # Sink / Pull (personal fork, experimental)
 
 This feature is specific to the personal `niri-sink` fork. It is disabled by default.
-The current N1 implementation manages original window ownership and restoration. It does not yet
-draw background projections; it is a logic prototype, not a daily-use visual feature.
+The N2 implementation keeps the original live window and projects it behind normal windows.
+It is an experimental visual prototype; full system compatibility and the expanded Sink Overview
+remain later stages.
 
 Enable it explicitly:
 
@@ -35,7 +36,9 @@ Reloading with `enabled false` restores all stacks in LIFO order, including work
 outputs, preserving any existing normal focus. Changing styles retains membership. `visible-depth`
 accepts 1–4. Level indices accept 0–3, with no duplicates; scale accepts `(0,1]` and opacity accepts
 `[0,1]`. Missing styles retain defaults: `0.93*(0.85/0.93)^depth` and `0.82*(0.45/0.82)^depth`.
-These presentation parameters are parsed now; rendering is a separate implementation stage.
+The projection fits inside the working area, stays centered and scales the complete native object.
+Depth scale does not resize the client. Members beyond `visible-depth` stay owned by the workspace
+but release their projection resources after fading out. Pull reveals them again.
 
 The following Overview settings are parsed for the later expansion stage, and do not yet add
 Overview behavior:
@@ -53,7 +56,17 @@ overview {
 
 `animate` is the sole switch for additional Sink animation. Entry height accepts 1–256, tail height
 0–256, and tail decay 0.01–0.99. There is no Self Blur or mode setting. Native opacity and background
-effects are part of the visual implementation contract and have not been verified for Sink yet.
+effects are retained: native window and popup opacity, client alpha, blur (xray and non-xray),
+saturation, noise, effect regions, subsurfaces, borders, corners and shadows. Depth opacity is
+applied once to the combined object. Each capture target has its own cache and retains block-out rules.
+
+Pull immediately schedules normal layout insertion and its native resize transaction while the
+projection returns. Input waits for the visual transition and a processed commit acknowledging the
+required resize; an ack alone is insufficient. A matching already committed size takes the fast path.
+The original transaction deadline bounds an unresponsive client (normally 300 ms); after it expires,
+niri uses the existing degraded resize behavior. Changing focus, locking, unmapping or invalidating
+the restore context cancels the old focus plan, so a late commit cannot steal focus. Selecting the
+window again follows normal navigation and still respects any outstanding commit barrier.
 
 Matching CLI commands are `niri msg action sink-window` and `niri msg action pull-window`.
 Their normal IPC success response acknowledges dispatch; inspect inventory/events for actual changes.

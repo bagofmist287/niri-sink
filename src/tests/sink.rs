@@ -459,37 +459,12 @@ fn real_popup_grab_blocks_sink_and_recall_without_dismissing_popup() {
 
 #[test]
 fn actual_session_lock_rejects_even_allow_when_locked_sink_actions() {
-    use smithay::reexports::wayland_protocols::ext::session_lock::v1::client::ext_session_lock_manager_v1::ExtSessionLockManagerV1;
     let mut config = Config::default();
     config.sink.enabled = true;
     let (mut fixture, client, windows) = setup(config);
     fixture.niri_state().do_action(Action::PullWindow, false);
     settle(&mut fixture, client);
-    let manager: ExtSessionLockManagerV1 = fixture.client(client).bind();
-    let qh = fixture.client(client).qh.clone();
-    let lock = manager.lock(&qh, ());
-    let output = fixture.client(client).output("headless-1");
-    let state = &mut fixture.client(client).state;
-    let surface = state.create_surface();
-    let _lock_surface = lock.get_lock_surface(&surface, &output, &qh, ());
-    fixture.double_roundtrip(client);
-    let state = &fixture.client(client).state;
-    let buffer =
-        state
-            .spbm
-            .as_ref()
-            .unwrap()
-            .create_u32_rgba_buffer(u32::MAX, 0, 0, u32::MAX, &qh, ());
-    let viewport = state
-        .viewporter
-        .as_ref()
-        .unwrap()
-        .get_viewport(&surface, &qh, ());
-    viewport.set_destination(1280, 720);
-    surface.attach(Some(&buffer), 0, 0);
-    surface.commit();
-    fixture.double_roundtrip(client);
-    assert!(fixture.niri().is_locked());
+    let _lock = lock_fixture(&mut fixture, client);
     for action in [
         Action::SinkWindow,
         Action::PullWindow,
@@ -627,5 +602,100 @@ fn pull_matching_committed_native_size_needs_no_new_resize_commit() {
         .unwrap()
         .1;
     assert!(mapped.sink_input_deadline().is_none());
+    assert_eq!(fixture.niri().keyboard_focus.surface(), Some(&windows[2].0));
+}
+
+#[test]
+fn pull_unmap_and_feature_reload_invalidate_pending_focus() {
+    for unmap in [true, false] {
+        let (mut fixture, client, windows) = resizing_pull();
+        assert!(fixture.niri().layout.focus().is_none());
+        let surface = fixture.client(client).state.windows[2].surface.clone();
+        if unmap {
+            let window = fixture.client(client).window(&surface);
+            window.attach_null();
+            window.commit();
+        } else {
+            fixture
+                .niri_state()
+                .do_action(Action::FocusWindow(windows[1].2), false);
+            fixture.niri_state().reload_config(Ok(Config::default()));
+        }
+        fixture.double_roundtrip(client);
+        if !unmap {
+            settle(&mut fixture, client);
+        }
+        fixture.niri_complete_animations();
+        fixture.double_roundtrip(client);
+        assert_ne!(fixture.niri().keyboard_focus.surface(), Some(&windows[2].0));
+        assert_eq!(
+            fixture.niri().layout.windows().count(),
+            if unmap { 2 } else { 3 }
+        );
+    }
+}
+
+#[test]
+fn pull_new_input_owner_cancels_focus_even_after_matching_commit() {
+    let (mut fixture, client, windows) = resizing_pull();
+    fixture.niri().keyboard_focus = KeyboardFocus::ScreenshotUi;
+    fixture.double_roundtrip(client);
+    settle(&mut fixture, client);
+    assert_ne!(fixture.niri().keyboard_focus.surface(), Some(&windows[2].0));
+    // Ending the other owner's interaction does not revive the old restore plan.
+    fixture.niri().keyboard_focus = KeyboardFocus::Layout { surface: None };
+    fixture.double_roundtrip(client);
+    assert!(fixture.niri().layout.focus().is_none());
+    fixture
+        .niri_state()
+        .do_action(Action::FocusColumnLast, false);
+    fixture.double_roundtrip(client);
+    assert_eq!(fixture.niri().keyboard_focus.surface(), Some(&windows[2].0));
+}
+
+fn lock_fixture(fixture: &mut Fixture, client: ClientId) -> smithay::reexports::wayland_protocols::ext::session_lock::v1::client::ext_session_lock_v1::ExtSessionLockV1{
+    use smithay::reexports::wayland_protocols::ext::session_lock::v1::client::ext_session_lock_manager_v1::ExtSessionLockManagerV1;
+    let manager: ExtSessionLockManagerV1 = fixture.client(client).bind();
+    let qh = fixture.client(client).qh.clone();
+    let lock = manager.lock(&qh, ());
+    let output = fixture.client(client).output("headless-1");
+    let state = &mut fixture.client(client).state;
+    let surface = state.create_surface();
+    let _lock_surface = lock.get_lock_surface(&surface, &output, &qh, ());
+    fixture.double_roundtrip(client);
+    let state = &fixture.client(client).state;
+    let buffer =
+        state
+            .spbm
+            .as_ref()
+            .unwrap()
+            .create_u32_rgba_buffer(u32::MAX, 0, 0, u32::MAX, &qh, ());
+    let viewport = state
+        .viewporter
+        .as_ref()
+        .unwrap()
+        .get_viewport(&surface, &qh, ());
+    viewport.set_destination(1280, 720);
+    surface.attach(Some(&buffer), 0, 0);
+    surface.commit();
+    fixture.double_roundtrip(client);
+    assert!(fixture.niri().is_locked());
+    lock
+}
+
+#[test]
+fn pull_session_lock_cancels_old_restore_through_commit_and_unlock() {
+    let (mut fixture, client, windows) = resizing_pull();
+    let lock = lock_fixture(&mut fixture, client);
+    settle(&mut fixture, client);
+    assert_ne!(fixture.niri().keyboard_focus.surface(), Some(&windows[2].0));
+    lock.unlock_and_destroy();
+    fixture.double_roundtrip(client);
+    assert!(!fixture.niri().is_locked());
+    assert_ne!(fixture.niri().keyboard_focus.surface(), Some(&windows[2].0));
+    fixture
+        .niri_state()
+        .do_action(Action::FocusColumnLast, false);
+    fixture.double_roundtrip(client);
     assert_eq!(fixture.niri().keyboard_focus.surface(), Some(&windows[2].0));
 }

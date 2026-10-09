@@ -91,6 +91,12 @@ impl Default for ProjectionBuffer {
     }
 }
 
+impl Drop for ProjectionBuffer {
+    fn drop(&mut self) {
+        trace!(id = ?self.id, "dropping Sink projection resources");
+    }
+}
+
 impl ProjectedGroup {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
@@ -181,6 +187,7 @@ impl ProjectedGroup {
         dst: Rectangle<i32, Physical>,
         cache: &UserDataMap,
     ) -> Result<(), GlesError> {
+        trace!(id = ?self.id, target = ?self.target, "preparing Sink projection");
         let slot = &self.buffer.slots[self.target as usize];
         let rendered = cache
             .get_or_insert::<RefCell<Option<OffscreenRenderElement>>, _>(|| RefCell::new(None));
@@ -234,16 +241,35 @@ impl ProjectedGroup {
         let Some(captured) = backdrop.captured_texture(background_cache) else {
             return Ok(());
         };
+        let output = Rectangle::from_size(frame.output_size());
         let mut guard = frame.renderer();
         let renderer = guard.as_mut();
-        let pixel_size = self
+        let pixel_size: smithay::utils::Size<i32, Physical> = self
             .content_source
             .size
             .to_physical_precise_round(self.native_scale);
         if pixel_size.w <= 0 || pixel_size.h <= 0 {
             return Ok(());
         }
-        let size = pixel_size.to_logical(1).to_buffer(1, Transform::Normal);
+        // Clip the native scene to the real output before resolving child effects. Padding the
+        // scene with clamp-to-edge pixels would change the blur kernel at output boundaries.
+        let Some(visible) = full_dst.intersection(output) else {
+            return Ok(());
+        };
+        let output_to_native = pixel_size.to_f64() / full_dst.size.to_f64();
+        let scene_rect = Rectangle::new(
+            (visible.loc - full_dst.loc)
+                .to_f64()
+                .upscale(output_to_native)
+                .to_i32_round(),
+            visible
+                .size
+                .to_f64()
+                .upscale(output_to_native)
+                .to_i32_round(),
+        );
+        let scene_size = scene_rect.size;
+        let size = scene_size.to_logical(1).to_buffer(1, Transform::Normal);
         let mut scene = slot.scene.borrow_mut();
         if scene
             .as_ref()
@@ -265,8 +291,8 @@ impl ProjectedGroup {
             ),
             (0., 0.),
             1.,
-            Some(captured.source),
-            Some(self.content_source.size),
+            None,
+            Some(scene_size.to_f64().to_logical(self.native_scale)),
             Kind::Unspecified,
         );
         let children_cache = {
@@ -284,14 +310,14 @@ impl ProjectedGroup {
         };
         {
             let mut target = renderer.bind(texture)?;
-            let mut scene_frame = renderer.render(&mut target, pixel_size, Transform::Normal)?;
-            let damage = [Rectangle::from_size(pixel_size)];
+            let mut scene_frame = renderer.render(&mut target, scene_size, Transform::Normal)?;
+            let damage = [Rectangle::from_size(scene_size)];
             scene_frame.clear(Color32F::TRANSPARENT, &damage)?;
             RenderElement::<GlesRenderer>::draw(
                 &base,
                 &mut scene_frame,
                 base.src(),
-                Rectangle::from_size(pixel_size),
+                Rectangle::from_size(scene_size),
                 &damage,
                 &[],
                 None,
@@ -304,7 +330,8 @@ impl ProjectedGroup {
                     .content_source
                     .loc
                     .to_physical_precise_round(self.native_scale);
-                let Some(mut damage) = dst.intersection(Rectangle::from_size(pixel_size)) else {
+                dst.loc -= scene_rect.loc;
+                let Some(mut damage) = dst.intersection(Rectangle::from_size(scene_size)) else {
                     continue;
                 };
                 damage.loc -= dst.loc;

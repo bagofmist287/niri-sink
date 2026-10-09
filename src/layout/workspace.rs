@@ -1225,20 +1225,34 @@ impl<W: LayoutElement> Workspace<W> {
         }
     }
 
-    pub fn focus_left(&mut self) -> bool {
-        if self.floating_is_active.get() {
-            self.floating.focus_left()
-        } else {
-            self.scrolling.focus_left()
+    fn accept_selected_sink_focus(&mut self) {
+        let id = self.selected_window().map(|window| window.id().clone());
+        if let Some(tile) = self
+            .tiles_mut()
+            .find(|tile| Some(tile.window().id()) == id.as_ref())
+        {
+            tile.sink_focus_cancelled = false;
         }
     }
 
+    pub fn focus_left(&mut self) -> bool {
+        let changed = if self.floating_is_active.get() {
+            self.floating.focus_left()
+        } else {
+            self.scrolling.focus_left()
+        };
+        self.accept_selected_sink_focus();
+        changed
+    }
+
     pub fn focus_right(&mut self) -> bool {
-        if self.floating_is_active.get() {
+        let changed = if self.floating_is_active.get() {
             self.floating.focus_right()
         } else {
             self.scrolling.focus_right()
-        }
+        };
+        self.accept_selected_sink_focus();
+        changed
     }
 
     pub fn focus_column_first(&mut self) {
@@ -1247,6 +1261,7 @@ impl<W: LayoutElement> Workspace<W> {
         } else {
             self.scrolling.focus_column_first();
         }
+        self.accept_selected_sink_focus();
     }
 
     pub fn focus_column_last(&mut self) {
@@ -1255,6 +1270,7 @@ impl<W: LayoutElement> Workspace<W> {
         } else {
             self.scrolling.focus_column_last();
         }
+        self.accept_selected_sink_focus();
     }
 
     pub fn focus_column_right_or_first(&mut self) {
@@ -1274,6 +1290,7 @@ impl<W: LayoutElement> Workspace<W> {
             self.focus_tiling();
         }
         self.scrolling.focus_column(index);
+        self.accept_selected_sink_focus();
     }
 
     pub fn focus_window_in_column(&mut self, index: u8) {
@@ -1281,22 +1298,27 @@ impl<W: LayoutElement> Workspace<W> {
             return;
         }
         self.scrolling.focus_window_in_column(index);
+        self.accept_selected_sink_focus();
     }
 
     pub fn focus_down(&mut self) -> bool {
-        if self.floating_is_active.get() {
+        let changed = if self.floating_is_active.get() {
             self.floating.focus_down()
         } else {
             self.scrolling.focus_down()
-        }
+        };
+        self.accept_selected_sink_focus();
+        changed
     }
 
     pub fn focus_up(&mut self) -> bool {
-        if self.floating_is_active.get() {
+        let changed = if self.floating_is_active.get() {
             self.floating.focus_up()
         } else {
             self.scrolling.focus_up()
-        }
+        };
+        self.accept_selected_sink_focus();
+        changed
     }
 
     pub fn focus_down_or_left(&mut self) {
@@ -1305,6 +1327,7 @@ impl<W: LayoutElement> Workspace<W> {
         } else {
             self.scrolling.focus_down_or_left();
         }
+        self.accept_selected_sink_focus();
     }
 
     pub fn focus_down_or_right(&mut self) {
@@ -1313,6 +1336,7 @@ impl<W: LayoutElement> Workspace<W> {
         } else {
             self.scrolling.focus_down_or_right();
         }
+        self.accept_selected_sink_focus();
     }
 
     pub fn focus_up_or_left(&mut self) {
@@ -1321,6 +1345,7 @@ impl<W: LayoutElement> Workspace<W> {
         } else {
             self.scrolling.focus_up_or_left();
         }
+        self.accept_selected_sink_focus();
     }
 
     pub fn focus_up_or_right(&mut self) {
@@ -1329,6 +1354,7 @@ impl<W: LayoutElement> Workspace<W> {
         } else {
             self.scrolling.focus_up_or_right();
         }
+        self.accept_selected_sink_focus();
     }
 
     pub fn focus_window_top(&mut self) {
@@ -1337,6 +1363,7 @@ impl<W: LayoutElement> Workspace<W> {
         } else {
             self.scrolling.focus_top();
         }
+        self.accept_selected_sink_focus();
     }
 
     pub fn focus_window_bottom(&mut self) {
@@ -1345,6 +1372,7 @@ impl<W: LayoutElement> Workspace<W> {
         } else {
             self.scrolling.focus_bottom();
         }
+        self.accept_selected_sink_focus();
     }
 
     pub fn focus_window_down_or_top(&mut self) {

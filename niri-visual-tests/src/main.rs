@@ -131,6 +131,16 @@ fn build_ui(app: &adw::Application) {
     s.add(GradientOklabAlpha::new, "Gradient - Oklab Alpha");
     s.add(GradientOklchAlpha::new, "Gradient - Oklch Alpha");
 
+    // Select a reproducible scene for nested visual checks without changing the default UI.
+    if let Ok(title) = std::env::var("NIRI_VISUAL_TEST_CASE") {
+        for page in stack.pages().iter::<gtk::StackPage>() {
+            let page = page.unwrap();
+            if page.title().as_deref() == Some(&title) {
+                stack.set_visible_child(&page.child());
+                break;
+            }
+        }
+    }
     let content_headerbar = adw::HeaderBar::new();
 
     let anim_scale = gtk::Scale::new(gtk::Orientation::Horizontal, Some(&anim_adjustment));

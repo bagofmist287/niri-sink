@@ -48,6 +48,7 @@ struct Inner {
     /// Reusable storage for subregion-filtered damage rects.
     subregion_damage: Vec<Rectangle<i32, Physical>>,
     captured: Option<(Transform, Rectangle<f64, Logical>)>,
+    capture_clip: Option<Rectangle<f64, Logical>>,
 }
 
 impl FramebufferEffect {
@@ -125,9 +126,10 @@ impl FramebufferEffectElement {
         let input_to_clip_geo =
             Mat3::from_scale(crop_size / clip_size) * Mat3::from_translation(offset / crop_size);
 
-        // Revert the effect of the texture transform.
+        // Revert the actual texture transform used by draw(). Deriving this matrix from the
+        // output transform alone is incorrect for Smithay's flipped quarter turns.
         let transform_mat = Mat3::from_translation(Vec2::new(0.5, 0.5))
-            * transform.matrix()
+            * transform.invert().matrix().inverse()
             * Mat3::from_translation(Vec2::new(-0.5, -0.5));
         let input_to_clip_geo = input_to_clip_geo * transform_mat;
 
@@ -192,6 +194,7 @@ impl RenderElement<GlesRenderer> for FramebufferEffectElement {
 
             inner.intermediate = None;
             inner.captured = None;
+            inner.capture_clip = None;
 
             // We want clamp-to-edge behavior for out-of-bounds pixels. However, glBlitFramebuffer
             // seems to skip out-of-bounds pixels, even though my reading of the docs suggests
@@ -206,6 +209,12 @@ impl RenderElement<GlesRenderer> for FramebufferEffectElement {
                 .to_f64()
                 .upscale(src.size / dst.size.to_f64())
                 .to_logical(1.);
+            inner.capture_clip = Some(Rectangle::new(
+                src.loc.to_logical(1., Transform::Normal, &src.size) + offset,
+                src.size
+                    .to_logical(1., Transform::Normal)
+                    .upscale(clamp_scale),
+            ));
             inner.captured = Some((
                 transform.invert(),
                 Rectangle::new(
@@ -371,7 +380,24 @@ impl RenderElement<GlesRenderer> for FramebufferEffectElement {
 
         // Clamp the same way as in capture_framebuffer().
         let output_rect = Rectangle::from_size(frame.output_size());
-        let clamped_dst = match dst.intersection(output_rect) {
+        // A projected object resolves this effect in a cropped lower-scene framebuffer, then
+        // draws it in a larger transparent object. Retain the capture's native clipping region.
+        let capture_rect = inner
+            .capture_clip
+            .map(|clip| {
+                let source = src.to_logical(1., Transform::Normal, &src.size);
+                let ratio = dst.size.to_f64() / source.size;
+                Rectangle::new(
+                    dst.loc.to_f64() + (clip.loc - source.loc).to_physical(1.).upscale(ratio),
+                    clip.size.to_physical(1.).upscale(ratio),
+                )
+                .to_i32_round()
+            })
+            .unwrap_or(output_rect);
+        let clamped_dst = match dst
+            .intersection(output_rect)
+            .and_then(|r| r.intersection(capture_rect))
+        {
             Some(clamped) => clamped,
             None => return Ok(()),
         };
@@ -482,6 +508,7 @@ impl Inner {
             intermediate: None,
             subregion_damage: Vec::new(),
             captured: None,
+            capture_clip: None,
         }
     }
 }
