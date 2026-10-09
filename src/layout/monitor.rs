@@ -1711,10 +1711,10 @@ impl<W: LayoutElement> Monitor<W> {
         // - normal floating windows
         // - scrolling windows moving between workspaces
         // - normal scrolling windows
-        for pass in 0..4 {
+        for pass in 0..6 {
             // Don't cull when drawing windows moving between workspaces so that windows moving to
             // workspaces off-screen will still render.
-            let cull = matches!(pass, 1 | 3);
+            let cull = matches!(pass, 2 | 4 | 5);
 
             // Crop the elements to prevent them overflowing, currently visible during a workspace
             // switch.
@@ -1763,6 +1763,9 @@ impl<W: LayoutElement> Monitor<W> {
 
                 match pass {
                     0 => {
+                        ws.render_sink(ctx.r(), xray_pos, true, push!());
+                    }
+                    1 => {
                         ws.render_floating(
                             ctx.r(),
                             xray_pos,
@@ -1771,7 +1774,7 @@ impl<W: LayoutElement> Monitor<W> {
                             push!(),
                         );
                     }
-                    1 => {
+                    2 => {
                         ws.render_floating(
                             ctx.r(),
                             xray_pos,
@@ -1790,7 +1793,7 @@ impl<W: LayoutElement> Monitor<W> {
                             }
                         }
                     }
-                    2 => {
+                    3 => {
                         ws.render_scrolling(
                             ctx.r(),
                             xray_pos,
@@ -1799,7 +1802,7 @@ impl<W: LayoutElement> Monitor<W> {
                             push!(),
                         );
                     }
-                    _ => {
+                    4 => {
                         ws.render_scrolling(
                             ctx.r(),
                             xray_pos,
@@ -1807,6 +1810,9 @@ impl<W: LayoutElement> Monitor<W> {
                             RenderLayer::Normal,
                             push!(),
                         );
+                    }
+                    _ => {
+                        ws.render_sink(ctx.r(), xray_pos, false, push!());
                     }
                 }
             }

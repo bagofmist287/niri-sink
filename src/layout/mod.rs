@@ -84,6 +84,7 @@ pub mod opening_window;
 pub mod scrolling;
 pub mod shadow;
 pub mod sink;
+pub mod sink_presentation;
 pub mod tab_indicator;
 pub mod tile;
 pub mod workspace;
@@ -239,6 +240,18 @@ pub trait LayoutElement {
     fn output_enter(&self, output: &Output);
     fn output_leave(&self, output: &Output);
     fn set_offscreen_data(&self, data: Option<OffscreenData>);
+    /// Deferred projections publish their actual surface presentation states after drawing.
+    fn offscreen_data_slot(&self) -> Option<crate::render_helpers::offscreen::OffscreenDataSlot> {
+        None
+    }
+    fn begin_sink_restore(&mut self) {}
+    fn finish_sink_restore(&mut self) {}
+    fn sink_input_ready(&self) -> bool {
+        true
+    }
+    fn sink_input_deadline(&self) -> Option<std::time::Instant> {
+        None
+    }
     fn set_activated(&mut self, active: bool);
     fn set_active_in_column(&mut self, active: bool);
     fn set_floating(&mut self, floating: bool);
@@ -1658,7 +1671,7 @@ impl<W: LayoutElement> Layout<W> {
         }
         let Some(id) = self
             .active_workspace()
-            .and_then(|ws| ws.active_window())
+            .and_then(|ws| ws.selected_window())
             .map(|win| win.id().clone())
         else {
             return false;
@@ -3915,6 +3928,9 @@ impl<W: LayoutElement> Layout<W> {
             .tiles_with_render_positions()
             .find(|(tile, _, _)| tile.window().id() == &window_id)
             .unwrap();
+        if tile.sink_input_blocked() {
+            return false;
+        }
         let window_offset = tile.window_loc();
 
         let tile_pos = ws_geo.loc + tile_offset.upscale(zoom);

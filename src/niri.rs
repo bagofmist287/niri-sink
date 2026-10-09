@@ -200,6 +200,13 @@ const CLEAR_COLOR_LOCKED: [f32; 4] = [0.3, 0.1, 0.1, 1.];
 // should be ~1.995 seconds.
 const FRAME_CALLBACK_THROTTLE: Option<Duration> = Some(Duration::from_millis(995));
 
+struct SinkFocusPlan {
+    window: Window,
+    workspace: crate::layout::workspace::WorkspaceId,
+    output: Option<Output>,
+    generation: u64,
+}
+
 pub struct Niri {
     pub config: Rc<RefCell<Config>>,
 
@@ -347,6 +354,8 @@ pub struct Niri {
     pub suppressed_buttons: HashSet<u32>,
     pub bind_cooldown_timers: HashMap<Key, RegistrationToken>,
     pub bind_repeat_timer: Option<RegistrationToken>,
+    sink_focus_plan: Option<SinkFocusPlan>,
+    sink_input_timer: Option<(RegistrationToken, Instant)>,
     pub keyboard_focus: KeyboardFocus,
     pub layer_shell_on_demand_focus: Option<LayerSurface>,
     pub idle_inhibiting_surfaces: HashSet<WlSurface>,
@@ -1094,6 +1103,11 @@ impl State {
         let active_output = self.niri.layout.active_output().cloned();
 
         self.niri.layout.activate_window(window);
+        self.plan_sink_focus(window);
+        if self.niri.sink_focus_plan.is_some() {
+            self.niri.queue_redraw_all();
+            return;
+        }
 
         let new_active = self.niri.layout.active_output().cloned();
         if new_active != active_output {
@@ -1117,7 +1131,98 @@ impl State {
         if !self.can_recall_sink(false) {
             return false;
         }
-        self.niri.layout.unwind_sink_to(window)
+        let restored = self.niri.layout.unwind_sink_to(window);
+        if restored {
+            self.plan_sink_focus(window);
+        }
+        restored
+    }
+
+    pub fn plan_sink_focus(&mut self, window: &Window) {
+        self.niri.sink_focus_plan = self.niri.layout.workspaces().find_map(|(monitor, _, ws)| {
+            let tile = ws.tiles().find(|tile| &tile.window().window == window)?;
+            if !tile.is_sink_restoring() {
+                return None;
+            }
+            Some(SinkFocusPlan {
+                window: window.clone(),
+                workspace: ws.id(),
+                output: monitor.map(|mon| mon.output().clone()),
+                generation: tile.sink_generation(),
+            })
+        });
+    }
+
+    fn refresh_sink_focus_plan(&mut self) {
+        let Some(plan) = self.niri.sink_focus_plan.take() else {
+            return;
+        };
+        let valid = self.niri.config.borrow().sink.enabled
+            && self.can_recall_sink(false)
+            && self.niri.layout.active_output() == plan.output.as_ref()
+            && self.niri.layout.active_workspace().is_some_and(|ws| {
+                ws.id() == plan.workspace
+                    && ws
+                        .selected_window()
+                        .is_some_and(|w| w.window == plan.window)
+                    && ws.tiles().any(|tile| {
+                        tile.window().window == plan.window
+                            && tile.sink_generation() == plan.generation
+                    })
+            });
+        if !valid {
+            if let Some(tile) = self
+                .niri
+                .layout
+                .workspaces_mut()
+                .flat_map(|ws| ws.tiles_mut())
+                .find(|tile| {
+                    tile.window().window == plan.window && tile.sink_generation() == plan.generation
+                })
+            {
+                tile.cancel_sink_focus();
+            }
+            return;
+        }
+        if self
+            .niri
+            .layout
+            .focus()
+            .is_some_and(|w| w.window == plan.window)
+        {
+            self.maybe_warp_cursor_to_focus();
+        } else {
+            self.niri.sink_focus_plan = Some(plan);
+        }
+    }
+
+    fn refresh_sink_input_timer(&mut self) {
+        let now = Instant::now();
+        let deadline = self
+            .niri
+            .layout
+            .windows()
+            .filter_map(|(_, w)| w.sink_input_deadline())
+            .filter(|at| *at > now)
+            .min();
+        if self.niri.sink_input_timer.as_ref().map(|(_, at)| *at) == deadline {
+            return;
+        }
+        if let Some((token, _)) = self.niri.sink_input_timer.take() {
+            self.niri.event_loop.remove(token);
+        }
+        if let Some(deadline) = deadline {
+            let token = self
+                .niri
+                .event_loop
+                .insert_source(Timer::from_deadline(deadline), |_, _, state| {
+                    state.niri.sink_input_timer = None;
+                    state.niri.queue_redraw_all();
+                    TimeoutAction::Drop
+                })
+                .unwrap();
+            self.niri.sink_input_timer = Some((token, deadline));
+        }
     }
 
     pub fn can_recall_sink(&self, confirming_mru: bool) -> bool {
@@ -1291,6 +1396,8 @@ impl State {
     }
 
     pub fn update_keyboard_focus(&mut self) {
+        self.refresh_sink_focus_plan();
+        self.refresh_sink_input_timer();
         // Clean up on-demand layer surface focus if necessary.
         if let Some(surface) = &self.niri.layer_shell_on_demand_focus {
             // Still alive and has on-demand interactivity.
@@ -2767,6 +2874,8 @@ impl Niri {
             single_pixel_buffer_state,
 
             seat,
+            sink_focus_plan: None,
+            sink_input_timer: None,
             keyboard_focus: KeyboardFocus::Layout { surface: None },
             layer_shell_on_demand_focus: None,
             idle_inhibiting_surfaces: HashSet::new(),

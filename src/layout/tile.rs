@@ -11,6 +11,7 @@ use smithay::utils::{Logical, Point, Rectangle, Scale, Size};
 use super::focus_ring::{FocusRing, FocusRingRenderElement};
 use super::opening_window::{OpenAnimation, OpeningWindowRenderElement};
 use super::shadow::Shadow;
+use super::sink_presentation::{SinkPose, SinkPresentation};
 use super::{
     HitType, LayoutElement, LayoutElementRenderElement, LayoutElementRenderSnapshot, Options,
     SizeFrac, RESIZE_ANIMATION_THRESHOLD,
@@ -23,8 +24,10 @@ use crate::render_helpers::border::BorderRenderElement;
 use crate::render_helpers::clipped_surface::{ClippedSurfaceRenderElement, RoundedCornerDamage};
 use crate::render_helpers::damage::ExtraDamage;
 use crate::render_helpers::offscreen::{OffscreenBuffer, OffscreenRenderElement};
+use crate::render_helpers::projected_group::{ProjectedGroup, ProjectionBuffer};
 use crate::render_helpers::renderer::NiriRenderer;
 use crate::render_helpers::resize::ResizeRenderElement;
+use crate::render_helpers::shaders::{ProgramType, Shaders};
 use crate::render_helpers::shadow::ShadowRenderElement;
 use crate::render_helpers::snapshot::RenderSnapshot;
 use crate::render_helpers::solid_color::{SolidColorBuffer, SolidColorRenderElement};
@@ -38,6 +41,11 @@ use crate::utils::{
 /// Toplevel window with decorations.
 #[derive(Debug)]
 pub struct Tile<W: LayoutElement> {
+    pub(super) sink_generation: u64,
+    pub(super) sink_focus_cancelled: bool,
+    pub(super) sink_presentation: Option<SinkPresentation>,
+    projection_buffer: std::cell::RefCell<Option<Rc<ProjectionBuffer>>>,
+
     /// The toplevel window itself.
     window: W,
 
@@ -193,6 +201,10 @@ impl<W: LayoutElement> Tile<W> {
         let sizing_mode = window.sizing_mode();
 
         Self {
+            sink_generation: 0,
+            sink_focus_cancelled: false,
+            sink_presentation: None,
+            projection_buffer: Default::default(),
             window,
             border: FocusRing::new(border_config.into()),
             focus_ring: FocusRing::new(focus_ring_config),
@@ -225,6 +237,13 @@ impl<W: LayoutElement> Tile<W> {
         scale: f64,
         options: Rc<Options>,
     ) {
+        if self.options.sink.enabled && !options.sink.enabled {
+            self.sink_generation = self.sink_generation.wrapping_add(1);
+            self.sink_focus_cancelled = false;
+            self.sink_presentation = None;
+            self.release_sink_projection();
+            self.window.finish_sink_restore();
+        }
         // If preset widths or heights changed, clear our stored preset index.
         if self.options.layout.preset_column_widths != options.layout.preset_column_widths {
             self.floating_preset_width_idx = None;
@@ -415,6 +434,9 @@ impl<W: LayoutElement> Tile<W> {
     }
 
     pub fn advance_animations(&mut self) {
+        if let Some(presentation) = &mut self.sink_presentation {
+            presentation.advance();
+        }
         if let Some(open) = &mut self.open_animation {
             if open.is_done() {
                 self.open_animation = None;
@@ -445,12 +467,36 @@ impl<W: LayoutElement> Tile<W> {
         }
     }
 
+    pub fn is_sink_restoring(&self) -> bool {
+        self.sink_presentation.as_ref().is_some_and(|p| p.restoring)
+    }
+    pub fn cancel_sink_focus(&mut self) {
+        self.sink_focus_cancelled = true;
+    }
+
+    pub fn sink_generation(&self) -> u64 {
+        self.sink_generation
+    }
+
+    pub fn sink_input_blocked(&self) -> bool {
+        self.sink_presentation
+            .as_ref()
+            .is_some_and(|p| p.restoring && (!p.is_done() || !self.window.sink_input_ready()))
+    }
+
+    pub(super) fn release_sink_projection(&self) {
+        self.projection_buffer.borrow_mut().take();
+    }
+
     pub fn are_animations_ongoing(&self) -> bool {
         self.are_transitions_ongoing() || self.window.rules().baba_is_float == Some(true)
     }
 
     pub fn are_transitions_ongoing(&self) -> bool {
-        self.open_animation.is_some()
+        self.sink_presentation
+            .as_ref()
+            .is_some_and(|p| !p.is_done())
+            || self.open_animation.is_some()
             || self.resize_animation.is_some()
             || self.move_x_animation.is_some()
             || self.move_y_animation.is_some()
@@ -1361,6 +1407,10 @@ impl<W: LayoutElement> Tile<W> {
         push: &mut dyn FnMut(TileRenderElement<R>),
     ) {
         let _span = tracy_client::span!("Tile::render");
+        // The workspace projects this same owner exactly once in a separate Z pass.
+        if self.sink_presentation.is_some() {
+            return;
+        }
 
         let scale = Scale::from(self.scale);
 
@@ -1427,6 +1477,83 @@ impl<W: LayoutElement> Tile<W> {
         if !pushed {
             self.render_inner(ctx, location, xray_pos, focus_ring, &mut |elem| push(elem));
         }
+    }
+
+    pub(super) fn render_projected<R: NiriRenderer>(
+        &self,
+        mut ctx: RenderCtx<R>,
+        pose: SinkPose,
+        xray_pos: XrayPos,
+        focus_ring: bool,
+    ) -> Option<ProjectedGroup> {
+        let mut pose = pose;
+        pose.position = pose
+            .position
+            .to_physical_precise_round(self.scale)
+            .to_logical(self.scale);
+        if pose.alpha <= 0. {
+            return None;
+        }
+        let open = self
+            .open_animation
+            .as_ref()
+            .map(OpenAnimation::presentation);
+        let mut xray_pos = XrayPos {
+            pos_in_backdrop: (xray_pos.pos_in_backdrop + pose.position).downscale(pose.scale),
+            zoom: xray_pos.zoom * pose.scale,
+        };
+        let mut ctx = ctx.as_gles();
+        let custom_open = Shaders::get(ctx.renderer)
+            .program(ProgramType::Open)
+            .is_some();
+        if let Some(open) = open.as_ref().filter(|_| !custom_open) {
+            let factor = open.scale_factor();
+            let center = self.animated_tile_size().to_point().downscale(2.);
+            xray_pos.pos_in_backdrop =
+                (xray_pos.pos_in_backdrop + center.upscale(1. - factor)).downscale(factor);
+            xray_pos.zoom *= factor;
+        }
+        let slot = self.window.offscreen_data_slot();
+        let previous_data = slot.as_ref().and_then(|slot| slot.borrow_mut().take());
+        let mut elements = Vec::new();
+        self.render_inner(
+            ctx.r(),
+            Point::from((0., 0.)),
+            xray_pos,
+            focus_ring,
+            &mut |element| elements.push(element),
+        );
+        let native_data = slot.as_ref().and_then(|slot| slot.borrow_mut().take());
+        if let Some(slot) = &slot {
+            *slot.borrow_mut() = previous_data;
+        }
+        if elements.is_empty() {
+            return None;
+        }
+        let buffer = self
+            .projection_buffer
+            .borrow_mut()
+            .get_or_insert_with(|| Rc::new(ProjectionBuffer::default()))
+            .clone();
+        let alpha = self
+            .alpha_animation
+            .as_ref()
+            .map_or(1., |alpha| alpha.anim.clamped_value()) as f32;
+        Some(ProjectedGroup::new(
+            buffer,
+            elements,
+            pose.position,
+            pose.scale,
+            pose.alpha as f32,
+            self.scale,
+            ctx.target,
+            slot,
+            native_data,
+            open,
+            self.animated_tile_size(),
+            alpha,
+            custom_open,
+        ))
     }
 
     pub fn store_unmap_snapshot_if_empty(

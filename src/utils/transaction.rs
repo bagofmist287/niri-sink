@@ -42,7 +42,7 @@ pub struct TransactionBlocker(Weak<Inner>);
 #[derive(Debug)]
 enum Deadline {
     NotRegistered(Instant),
-    Registered { remove: Ping },
+    Registered { remove: Ping, at: Instant },
 }
 
 #[derive(Debug)]
@@ -51,6 +51,22 @@ struct Inner {
     completed: AtomicBool,
     /// Notifications to send out upon completing the transaction.
     notifications: Mutex<Option<(Sender<Client>, Vec<Client>)>>,
+}
+
+#[cfg(test)]
+thread_local! { static TEST_DEADLINES: std::cell::Cell<bool> = const { std::cell::Cell::new(false) }; }
+
+#[cfg(test)]
+pub struct TestDeadlineGuard(bool);
+#[cfg(test)]
+impl Drop for TestDeadlineGuard {
+    fn drop(&mut self) {
+        TEST_DEADLINES.set(self.0);
+    }
+}
+#[cfg(test)]
+pub fn enable_deadline_timers_for_test() -> TestDeadlineGuard {
+    TestDeadlineGuard(TEST_DEADLINES.replace(true))
 }
 
 impl Transaction {
@@ -88,13 +104,18 @@ impl Transaction {
         if let Deadline::NotRegistered(deadline) = *cell {
             let timer = Timer::from_deadline(deadline);
             let inner = Arc::downgrade(&self.inner);
+            #[cfg(test)]
+            let enable_deadline = TEST_DEADLINES.get();
+            #[cfg(not(test))]
+            let enable_deadline = true;
             let token = event_loop
                 .insert_source(timer, move |_, _, _| {
                     let _span = trace_span!("deadline timer", transaction = ?Weak::as_ptr(&inner))
                         .entered();
 
-                    // FIXME: come up with some way to control the deadline timer from tests.
-                    #[cfg(not(test))]
+                    if !enable_deadline {
+                        return TimeoutAction::Drop;
+                    }
                     if let Some(inner) = inner.upgrade() {
                         trace!("deadline reached, completing transaction");
                         inner.complete();
@@ -118,7 +139,17 @@ impl Transaction {
                 })
                 .unwrap();
 
-            *cell = Deadline::Registered { remove: ping };
+            *cell = Deadline::Registered {
+                remove: ping,
+                at: deadline,
+            };
+        }
+    }
+
+    /// Original deadline, retained after timer registration so callers never extend it.
+    pub fn deadline(&self) -> Instant {
+        match &*self.deadline.borrow() {
+            Deadline::NotRegistered(at) | Deadline::Registered { at, .. } => *at,
         }
     }
 
@@ -143,7 +174,7 @@ impl Drop for Transaction {
             self.inner.complete();
 
             // Also remove the timer.
-            if let Deadline::Registered { remove } = &*self.deadline.borrow() {
+            if let Deadline::Registered { remove, .. } = &*self.deadline.borrow() {
                 remove.ping();
             };
         }

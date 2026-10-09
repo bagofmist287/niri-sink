@@ -611,3 +611,66 @@ fn disabling_sink_restores_every_workspace_including_without_outputs() {
         }
     }
 }
+
+#[test]
+fn enabled_sink_projection_reverses_current_pose_and_has_one_owner() {
+    let mut layout = Layout::<TestWindow>::default();
+    Op::AddOutput(1).apply(&mut layout);
+    Op::SetSinkEnabled(true).apply(&mut layout);
+    let output = layout.outputs().next().unwrap().clone();
+    let mut clock = Clock::with_time(Duration::ZERO);
+    let options = layout.options.clone();
+    let mut workspace = Workspace::new(output, clock.clone(), options);
+    let owner = add_window(&mut workspace, 1, false);
+    let request = owner.requested_size();
+    assert!(workspace.sink_window(&1));
+    let from = workspace
+        .tiles()
+        .find(|tile| tile.window().id() == &1)
+        .unwrap()
+        .sink_presentation
+        .as_ref()
+        .unwrap()
+        .pose();
+    assert_eq!(owner.requested_size(), request);
+    assert_eq!(workspace.pull_window(true), Some(1));
+    let tile = workspace.tiles().next().unwrap();
+    assert!(Rc::ptr_eq(&tile.window().0, &owner.0));
+    assert_eq!(tile.sink_presentation.as_ref().unwrap().pose(), from);
+    assert!(workspace.active_window().is_none());
+    assert!(workspace.sink_window(&1));
+    assert_eq!(
+        workspace
+            .tiles()
+            .find(|tile| tile.window().id() == &1)
+            .unwrap()
+            .sink_presentation
+            .as_ref()
+            .unwrap()
+            .pose(),
+        from
+    );
+    assert_eq!(workspace.windows().count(), 1);
+    assert_eq!(workspace.tiles_with_render_positions().count(), 0);
+    clock.set_complete_instantly(true);
+    workspace.advance_animations();
+    clock.set_complete_instantly(false);
+    let final_pose = workspace
+        .tiles()
+        .find(|tile| tile.window().id() == &1)
+        .unwrap()
+        .sink_presentation
+        .as_ref()
+        .unwrap()
+        .pose();
+    assert!(final_pose.scale < 1.);
+    assert!(final_pose.alpha < 1.);
+    assert!(workspace
+        .tiles()
+        .find(|tile| tile.window().id() == &1)
+        .unwrap()
+        .sink_presentation
+        .as_ref()
+        .unwrap()
+        .is_done());
+}

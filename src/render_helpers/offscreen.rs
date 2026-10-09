@@ -22,6 +22,8 @@ use super::encompassing_geo;
 use super::renderer::AsGlesFrame as _;
 use crate::backend::tty::{TtyFrame, TtyRenderer, TtyRendererError};
 
+pub type OffscreenDataSlot = std::rc::Rc<RefCell<Option<OffscreenData>>>;
+
 /// Buffer for offscreen rendering.
 #[derive(Debug)]
 pub struct OffscreenBuffer {

@@ -23,6 +23,7 @@ use super::scrolling::{
 };
 use super::shadow::Shadow;
 use super::sink::{RestorePlacement, SinkEntry, SinkSpace};
+use super::sink_presentation::{desktop_pose, SinkPose, SinkPresentation};
 use super::tile::{Tile, TileRenderSnapshot};
 use super::{
     ActivateWindow, ConfigureIntent, HitType, InsertPosition, InteractiveResizeData, LayoutElement,
@@ -31,6 +32,7 @@ use super::{
 use crate::animation::Clock;
 use crate::layout::RenderLayer;
 use crate::niri_render_elements;
+use crate::render_helpers::projected_group::ProjectedGroup;
 use crate::render_helpers::renderer::NiriRenderer;
 use crate::render_helpers::shadow::ShadowRenderElement;
 use crate::render_helpers::solid_color::{SolidColorBuffer, SolidColorRenderElement};
@@ -151,6 +153,7 @@ niri_render_elements! {
     WorkspaceRenderElement<R> => {
         Scrolling = ScrollingSpaceRenderElement<R>,
         Floating = FloatingSpaceRenderElement<R>,
+        Projected = ProjectedGroup,
     }
 }
 
@@ -374,15 +377,41 @@ impl<W: LayoutElement> Workspace<W> {
     pub fn advance_animations(&mut self) {
         self.scrolling.advance_animations();
         self.floating.advance_animations();
+        self.retarget_sink_presentations();
         for tile in self.sink.tiles_mut() {
             tile.advance_animations();
+            if tile
+                .sink_presentation
+                .as_ref()
+                .is_some_and(|p| p.is_done() && p.pose().alpha <= 0.)
+            {
+                tile.release_sink_projection();
+                tile.window().set_offscreen_data(None);
+            }
+        }
+        for (tile, _) in self.tiles_with_render_positions_mut(false) {
+            if tile
+                .sink_presentation
+                .as_ref()
+                .is_some_and(|p| p.restoring && p.is_done())
+                && tile.window().sink_input_ready()
+            {
+                tile.window_mut().finish_sink_restore();
+                tile.sink_presentation = None;
+                tile.release_sink_projection();
+            }
         }
     }
 
     pub fn are_animations_ongoing(&self) -> bool {
         self.scrolling.are_animations_ongoing()
             || self.floating.are_animations_ongoing()
-            || self.sink.tiles().any(Tile::are_animations_ongoing)
+            || self.sink.tiles().any(|tile| {
+                tile.sink_presentation
+                    .as_ref()
+                    .is_none_or(|p| !p.is_done() || p.pose().alpha > 0.)
+                    && tile.are_animations_ongoing()
+            })
     }
 
     pub fn are_transitions_ongoing(&self) -> bool {
@@ -403,6 +432,9 @@ impl<W: LayoutElement> Workspace<W> {
         );
 
         if layer.is_normal() {
+            for tile in self.sink.tiles_mut() {
+                tile.update_render_elements(false, view_rect);
+            }
             self.shadow.update_render_elements(
                 self.view_size,
                 true,
@@ -529,7 +561,7 @@ impl<W: LayoutElement> Workspace<W> {
             .find_map(|id| outputs.clone().position(|output| id.matches(output)))
     }
 
-    pub fn active_window(&self) -> Option<&W> {
+    pub fn selected_window(&self) -> Option<&W> {
         if self.floating_is_active.get() {
             self.floating.active_window()
         } else {
@@ -537,7 +569,16 @@ impl<W: LayoutElement> Workspace<W> {
         }
     }
 
+    pub fn active_window(&self) -> Option<&W> {
+        let window = self.selected_window()?;
+        self.tiles_with_render_positions()
+            .find(|(tile, _, _)| tile.window().id() == window.id())
+            .filter(|(tile, _, _)| !tile.sink_input_blocked() && !tile.sink_focus_cancelled)
+            .map(|(tile, _, _)| tile.window())
+    }
+
     pub fn active_window_mut(&mut self) -> Option<&mut W> {
+        self.active_window()?;
         if self.floating_is_active.get() {
             self.floating.active_window_mut()
         } else {
@@ -923,7 +964,31 @@ impl<W: LayoutElement> Workspace<W> {
             return false;
         }
         let height = self.scrolling.window_height(id);
-        let removed = self.detach_tile(id, Transaction::new());
+        let from = tile
+            .sink_presentation
+            .as_ref()
+            .map_or(SinkPose::normal(source_pos), |p| {
+                p.pose_toward(SinkPose::normal(source_pos))
+            });
+        let mut removed = self.detach_tile(id, Transaction::new());
+        removed.tile.sink_generation = removed.tile.sink_generation.wrapping_add(1);
+        removed.tile.sink_focus_cancelled = false;
+        removed.tile.window_mut().finish_sink_restore();
+        if self.options.sink.enabled {
+            let to = desktop_pose(
+                removed.tile.animated_tile_size(),
+                self.working_area,
+                0,
+                self.options.sink,
+            );
+            removed.tile.sink_presentation = Some(SinkPresentation::new(
+                self.clock.clone(),
+                from,
+                to,
+                false,
+                self.options.animations.window_movement.0,
+            ));
+        }
         let restore = if removed.is_floating {
             RestorePlacement::Floating {
                 width: removed.width,
@@ -940,6 +1005,7 @@ impl<W: LayoutElement> Workspace<W> {
             self.sink.push(entry).is_ok(),
             "normal and Sink owners must have distinct IDs"
         );
+        self.retarget_sink_presentations();
         true
     }
 
@@ -947,7 +1013,11 @@ impl<W: LayoutElement> Workspace<W> {
     /// N2 may pass false until its visual/client-commit input barrier completes.
     pub(super) fn pull_window(&mut self, activate: bool) -> Option<W::Id> {
         let entry = self.sink.pop()?;
-        let (tile, restore, _) = entry.into_parts();
+        let (tile, restore, source) = entry.into_parts();
+        let from = tile
+            .sink_presentation
+            .as_ref()
+            .map_or(SinkPose::normal(source.tile.loc), SinkPresentation::pose);
         let id = tile.window().id().clone();
         self.attach_tile(
             tile,
@@ -965,7 +1035,46 @@ impl<W: LayoutElement> Workspace<W> {
         if let RestorePlacement::Scrolling { height, .. } = restore {
             self.scrolling.restore_window_height(&id, height);
         }
+        let enabled = self.options.sink.enabled;
+        let clock = self.clock.clone();
+        let config = self.options.animations.window_movement.0;
+        if let Some((tile, pos)) = self
+            .tiles_with_render_positions_mut(false)
+            .find(|(tile, _)| tile.window().id() == &id)
+        {
+            tile.sink_generation = tile.sink_generation.wrapping_add(1);
+            tile.sink_focus_cancelled = false;
+            if enabled {
+                tile.window_mut().begin_sink_restore();
+                tile.sink_presentation = Some(SinkPresentation::new(
+                    clock,
+                    from,
+                    SinkPose::normal(pos),
+                    true,
+                    config,
+                ));
+            } else {
+                tile.window_mut().finish_sink_restore();
+                tile.sink_presentation = None;
+                tile.release_sink_projection();
+            }
+        }
+        self.retarget_sink_presentations();
         Some(id)
+    }
+
+    fn retarget_sink_presentations(&mut self) {
+        for (depth, entry) in self.sink.entries_mut() {
+            let to = desktop_pose(
+                entry.tile().animated_tile_size(),
+                self.working_area,
+                depth,
+                self.options.sink,
+            );
+            if let Some(presentation) = &mut entry.tile_mut().sink_presentation {
+                presentation.retarget(to, self.options.animations.window_movement.0);
+            }
+        }
     }
 
     /// Explicit confirmation path only; generic activation never unwinds a Sink stack.
@@ -1890,6 +1999,38 @@ impl<W: LayoutElement> Workspace<W> {
         }
     }
 
+    pub fn render_sink<R: NiriRenderer>(
+        &self,
+        mut ctx: RenderCtx<R>,
+        xray_pos: XrayPos,
+        restoring: bool,
+        push: &mut dyn FnMut(WorkspaceRenderElement<R>),
+    ) {
+        if restoring {
+            for (tile, pos, visible) in self.tiles_with_render_positions() {
+                if !visible {
+                    continue;
+                }
+                if let Some(presentation) = &tile.sink_presentation {
+                    let pose = presentation.pose_toward(SinkPose::normal(pos));
+                    if let Some(element) = tile.render_projected(ctx.r(), pose, xray_pos, false) {
+                        push(element.into());
+                    }
+                }
+            }
+        } else {
+            for tile in self.sink.tiles() {
+                if let Some(presentation) = &tile.sink_presentation {
+                    if let Some(element) =
+                        tile.render_projected(ctx.r(), presentation.pose(), xray_pos, false)
+                    {
+                        push(element.into());
+                    }
+                }
+            }
+        }
+    }
+
     pub fn render_scrolling<R: NiriRenderer>(
         &self,
         ctx: RenderCtx<R>,
@@ -2033,13 +2174,18 @@ impl<W: LayoutElement> Workspace<W> {
             if let Some(rv) = self
                 .floating
                 .tiles_with_render_positions()
+                .filter(|(tile, _)| !tile.sink_input_blocked())
                 .find_map(|(tile, tile_pos)| HitType::hit_tile(tile, tile_pos, pos))
             {
                 return Some(rv);
             }
         }
 
-        self.scrolling.window_under(pos)
+        self.scrolling.window_under(pos).filter(|(window, _)| {
+            !self
+                .tiles_with_render_positions()
+                .any(|(tile, _, _)| tile.window().id() == window.id() && tile.sink_input_blocked())
+        })
     }
 
     pub fn resize_edges_under(&self, pos: Point<f64, Logical>) -> Option<ResizeEdge> {
@@ -2047,7 +2193,7 @@ impl<W: LayoutElement> Workspace<W> {
             .find_map(|(tile, tile_pos, visible)| {
                 // This logic should be consistent with window_under() in when it returns Some vs.
                 // None.
-                if !visible {
+                if !visible || tile.sink_input_blocked() {
                     return None;
                 }
 
@@ -2137,6 +2283,9 @@ impl<W: LayoutElement> Workspace<W> {
     }
 
     pub fn activate_window(&mut self, window: &W::Id) -> bool {
+        if let Some(tile) = self.tiles_mut().find(|tile| tile.window().id() == window) {
+            tile.sink_focus_cancelled = false;
+        }
         if self.floating.activate_window(window) {
             self.floating_is_active = FloatingActive::Yes;
             true
@@ -2149,6 +2298,9 @@ impl<W: LayoutElement> Workspace<W> {
     }
 
     pub fn activate_window_without_raising(&mut self, window: &W::Id) -> bool {
+        if let Some(tile) = self.tiles_mut().find(|tile| tile.window().id() == window) {
+            tile.sink_focus_cancelled = false;
+        }
         if self.floating.activate_window_without_raising(window) {
             self.floating_is_active = FloatingActive::Yes;
             true
@@ -2233,6 +2385,12 @@ impl<W: LayoutElement> Workspace<W> {
     }
 
     pub fn interactive_resize_begin(&mut self, window: W::Id, edges: ResizeEdge) -> bool {
+        if self
+            .tiles()
+            .any(|tile| tile.window().id() == &window && tile.sink_input_blocked())
+        {
+            return false;
+        }
         if self.sink.depth(&window).is_some() {
             return false;
         }

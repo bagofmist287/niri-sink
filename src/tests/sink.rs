@@ -7,6 +7,7 @@ use smithay::wayland::xdg_activation::{XdgActivationHandler, XdgActivationTokenD
 
 use super::client::ClientId;
 use super::*;
+use crate::layout::LayoutElement as _;
 use crate::niri::KeyboardFocus;
 
 fn setup(config: Config) -> (Fixture, ClientId, Vec<(WlSurface, Window, u64)>) {
@@ -22,6 +23,7 @@ fn setup(config: Config) -> (Fixture, ClientId, Vec<(WlSurface, Window, u64)>) {
         window.attach_new_buffer();
         window.set_size(100, 100);
         window.ack_last_and_commit();
+        window.configures_looked_at = window.configures_received.len();
         fixture.double_roundtrip(client);
         let mapped = fixture.niri().layout.focus_with_output().unwrap().0;
         windows.push((
@@ -33,6 +35,31 @@ fn setup(config: Config) -> (Fixture, ClientId, Vec<(WlSurface, Window, u64)>) {
         fixture.double_roundtrip(client);
     }
     (fixture, client, windows)
+}
+
+// Respond to all normal insertion configures, then finish only the visual phase.
+fn settle(fixture: &mut Fixture, client: ClientId) {
+    for _ in 0..3 {
+        fixture.double_roundtrip(client);
+        for window in &mut fixture.client(client).state.windows {
+            if window.configures_received.len() <= window.configures_looked_at {
+                continue;
+            }
+            if let Some((_, configure)) = window.configures_received.last() {
+                window.set_size(
+                    configure.size.0.max(100) as u16,
+                    configure.size.1.max(100) as u16,
+                );
+                window.ack_last_and_commit();
+                window.configures_looked_at = window.configures_received.len();
+            }
+        }
+    }
+    fixture.double_roundtrip(client);
+    fixture.niri_complete_animations();
+    let off = fixture.niri().config.borrow().animations.off;
+    fixture.niri().clock.set_complete_instantly(off);
+    fixture.double_roundtrip(client);
 }
 
 #[test]
@@ -256,7 +283,7 @@ fn sink_actions_are_opt_in_and_reload_restores_without_stealing_focus() {
         let (mut fixture, client, windows) = setup(config);
         // setup creates internal owners to also exercise disabling an existing stack.
         fixture.niri_state().do_action(Action::PullWindow, false);
-        fixture.double_roundtrip(client);
+        settle(&mut fixture, client);
         assert_eq!(
             fixture
                 .niri()
@@ -272,7 +299,7 @@ fn sink_actions_are_opt_in_and_reload_restores_without_stealing_focus() {
             fixture.double_roundtrip(client);
             assert_eq!(fixture.niri().layout.sink_depth(&windows[2].1), Some(0));
             fixture.niri_state().do_action(Action::PullWindow, false);
-            fixture.double_roundtrip(client);
+            settle(&mut fixture, client);
         }
         let before = fixture.niri().layout.focus().map(|win| win.window.clone());
         if !enabled {
@@ -320,7 +347,7 @@ fn real_pointer_grab_rejects_transfers_and_recall_without_ending_grab() {
     config.sink.enabled = true;
     let (mut fixture, client, windows) = setup(config);
     fixture.niri_state().do_action(Action::PullWindow, false);
-    fixture.double_roundtrip(client);
+    settle(&mut fixture, client);
     let pointer = fixture.niri().seat.get_pointer().unwrap();
     pointer.set_grab(
         fixture.niri_state(),
@@ -359,7 +386,7 @@ fn client_issued_activation_token_reaches_policy_and_recalls_only_with_serial() 
         config.sink.enabled = true;
         let (mut fixture, client, windows) = setup(config);
         fixture.niri_state().do_action(Action::PullWindow, false);
-        fixture.double_roundtrip(client);
+        settle(&mut fixture, client);
         let activation: XdgActivationV1 = fixture.client(client).bind();
         let qh = fixture.client(client).qh.clone();
         let token = activation.get_activation_token(&qh, ());
@@ -384,6 +411,7 @@ fn client_issued_activation_token_reaches_policy_and_recalls_only_with_serial() 
             if has_serial { None } else { Some(1) }
         );
         if has_serial {
+            settle(&mut fixture, client);
             assert_eq!(fixture.niri().keyboard_focus.surface(), Some(&windows[0].0));
         }
     }
@@ -395,7 +423,7 @@ fn real_popup_grab_blocks_sink_and_recall_without_dismissing_popup() {
     config.sink.enabled = true;
     let (mut fixture, client, windows) = setup(config);
     fixture.niri_state().do_action(Action::PullWindow, false);
-    fixture.double_roundtrip(client);
+    settle(&mut fixture, client);
     let state = &mut fixture.client(client).state;
     let parent = state.windows[2].xdg_surface.clone();
     let surface = state.create_surface();
@@ -436,7 +464,7 @@ fn actual_session_lock_rejects_even_allow_when_locked_sink_actions() {
     config.sink.enabled = true;
     let (mut fixture, client, windows) = setup(config);
     fixture.niri_state().do_action(Action::PullWindow, false);
-    fixture.double_roundtrip(client);
+    settle(&mut fixture, client);
     let manager: ExtSessionLockManagerV1 = fixture.client(client).bind();
     let qh = fixture.client(client).qh.clone();
     let lock = manager.lock(&qh, ());
@@ -471,4 +499,133 @@ fn actual_session_lock_rejects_even_allow_when_locked_sink_actions() {
         assert_eq!(fixture.niri().layout.sink_depth(&windows[0].1), Some(1));
         assert_eq!(fixture.niri().layout.sink_depth(&windows[2].1), None);
     }
+}
+
+fn resizing_pull() -> (Fixture, ClientId, Vec<(WlSurface, Window, u64)>) {
+    let config = Config::parse_mem("sink { enabled true; }; animations { off; }").unwrap();
+    let (mut fixture, client, windows) = setup(config);
+    fixture.niri_state().do_action(Action::PullWindow, false);
+    settle(&mut fixture, client);
+    fixture.niri_state().do_action(Action::PullWindow, false);
+    settle(&mut fixture, client);
+    fixture
+        .niri_state()
+        .do_action(Action::FocusWindow(windows[2].2), false);
+    fixture
+        .niri_state()
+        .do_action(Action::ConsumeWindowIntoColumn, false);
+    settle(&mut fixture, client);
+    assert!(fixture.niri().layout.sink_window());
+    settle(&mut fixture, client);
+    fixture.niri_state().do_action(Action::PullWindow, false);
+    fixture.double_roundtrip(client);
+    (fixture, client, windows)
+}
+
+#[test]
+fn pull_ack_only_withholds_keyboard_pointer_and_mru_until_processed_commit() {
+    let (mut fixture, client, windows) = resizing_pull();
+    let surface = fixture.client(client).state.windows[2].surface.clone();
+    assert!(fixture.niri().layout.focus().is_none());
+    assert_ne!(fixture.niri().keyboard_focus.surface(), Some(&windows[2].0));
+    let before = fixture
+        .niri()
+        .layout
+        .windows()
+        .find(|(_, w)| w.window == windows[2].1)
+        .unwrap()
+        .1
+        .get_focus_timestamp();
+    fixture.client(client).window(&surface).ack_last();
+    fixture.double_roundtrip(client);
+    assert!(fixture.niri().layout.focus().is_none());
+    let ws = fixture.niri().layout.active_workspace().unwrap();
+    let (tile, pos, _) = ws
+        .tiles_with_render_positions()
+        .find(|(tile, _, _)| tile.window().window == windows[2].1)
+        .unwrap();
+    assert!(tile.sink_input_blocked());
+    assert!(ws
+        .window_under(
+            pos + tile.window_loc()
+                + smithay::utils::Point::<f64, smithay::utils::Logical>::from((10., 10.))
+        )
+        .is_none());
+    assert_eq!(tile.window().get_focus_timestamp(), before);
+    // Ack was already sent: commit without acknowledging that same serial again.
+    let window = fixture.client(client).window(&surface);
+    let size = window.configures_received.last().unwrap().1.size;
+    window.set_size(size.0.max(1) as u16, size.1.max(1) as u16);
+    window.commit();
+    fixture.double_roundtrip(client);
+    fixture.niri_complete_animations();
+    fixture.double_roundtrip(client);
+    assert_eq!(fixture.niri().keyboard_focus.surface(), Some(&windows[2].0));
+    assert_eq!(fixture.niri().layout.focus().unwrap().window, windows[2].1);
+}
+
+#[test]
+fn pull_user_focus_cancels_late_restore_focus_and_fast_reverse_preserves_owner() {
+    let (mut fixture, client, windows) = resizing_pull();
+    assert!(fixture.niri().layout.focus().is_none());
+    assert!(fixture.niri().layout.sink_window());
+    assert_eq!(fixture.niri().layout.sink_depth(&windows[2].1), Some(0));
+    fixture.niri_state().do_action(Action::PullWindow, false);
+    fixture.double_roundtrip(client);
+    fixture
+        .niri_state()
+        .do_action(Action::FocusWindow(windows[0].2), false);
+    settle(&mut fixture, client);
+    assert_eq!(fixture.niri().layout.focus().unwrap().window, windows[0].1);
+    assert_eq!(fixture.niri().layout.windows().count(), 3);
+    assert!(fixture
+        .niri()
+        .layout
+        .windows()
+        .any(|(_, w)| w.window == windows[2].1));
+}
+
+#[test]
+fn pull_original_deadline_is_bounded_and_late_commit_cannot_steal_new_focus() {
+    let _deadline_guard = crate::utils::transaction::enable_deadline_timers_for_test();
+    let (mut fixture, client, windows) = resizing_pull();
+    let deadline = fixture
+        .niri()
+        .layout
+        .windows()
+        .find(|(_, w)| w.window == windows[2].1)
+        .unwrap()
+        .1
+        .sink_input_deadline()
+        .unwrap();
+    assert!(fixture.niri().layout.focus().is_none());
+    std::thread::sleep(
+        deadline.saturating_duration_since(Instant::now()) + Duration::from_millis(15),
+    );
+    fixture.double_roundtrip(client);
+    assert_eq!(fixture.niri().keyboard_focus.surface(), Some(&windows[2].0));
+    fixture
+        .niri_state()
+        .do_action(Action::FocusWindow(windows[1].2), false);
+    fixture.double_roundtrip(client);
+    settle(&mut fixture, client);
+    assert_eq!(fixture.niri().keyboard_focus.surface(), Some(&windows[1].0));
+    assert_eq!(fixture.niri().layout.focus().unwrap().window, windows[1].1);
+}
+
+#[test]
+fn pull_matching_committed_native_size_needs_no_new_resize_commit() {
+    let config = Config::parse_mem("sink { enabled true; }; animations { off; }").unwrap();
+    let (mut fixture, client, windows) = setup(config);
+    fixture.niri_state().do_action(Action::PullWindow, false);
+    fixture.double_roundtrip(client);
+    let mapped = fixture
+        .niri()
+        .layout
+        .windows()
+        .find(|(_, w)| w.window == windows[2].1)
+        .unwrap()
+        .1;
+    assert!(mapped.sink_input_deadline().is_none());
+    assert_eq!(fixture.niri().keyboard_focus.surface(), Some(&windows[2].0));
 }

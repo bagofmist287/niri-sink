@@ -101,6 +101,7 @@ fn build_ui(app: &adw::Application) {
         "Fixed Size Tile - CSD Shadow - Open",
     );
 
+    s.add(Layout::sink_stack, "Layout - Sink Stack / Reverse / Unwind");
     s.add(Layout::open_in_between, "Layout - Open In-Between");
     s.add(
         Layout::open_multiple_quickly,

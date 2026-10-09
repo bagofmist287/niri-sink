@@ -86,6 +86,37 @@ impl Layout {
         }
     }
 
+    pub fn sink_stack(args: Args) -> Self {
+        let mut rv = Self::new(args);
+        let mut config = niri_config::Config::default();
+        config.sink.enabled = true;
+        rv.layout.update_config(&config);
+        for id in 0..3 {
+            let window = TestWindow::fixed_size(id);
+            rv.add_window(window, Some(PresetSize::Fixed(400)));
+        }
+        for (delay, id) in [(500, 2), (1000, 1), (1500, 0)] {
+            rv.add_step(delay, move |l| {
+                l.layout.activate_window(&id);
+                l.layout.sink_window();
+            });
+        }
+        rv.add_step(2100, |l| {
+            l.layout.pull_window();
+        });
+        rv.add_step(2200, |l| {
+            l.layout.sink_window();
+        });
+        rv.add_step(3000, |l| {
+            l.layout.pull_window();
+        });
+        rv.add_step(3600, |l| {
+            l.layout.unwind_sink_to(&2);
+            l.layout.activate_window(&2);
+        });
+        rv
+    }
+
     pub fn open_in_between(args: Args) -> Self {
         let mut rv = Self::new(args);
 

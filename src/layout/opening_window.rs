@@ -24,6 +24,12 @@ pub struct OpenAnimation {
     buffer: OffscreenBuffer,
 }
 
+#[derive(Debug, Clone)]
+pub struct OpenPresentation {
+    anim: Animation,
+    random_seed: f32,
+}
+
 niri_render_elements! {
     OpeningWindowRenderElement => {
         Offscreen = RelocateRenderElement<RescaleRenderElement<OffscreenRenderElement>>,
@@ -55,13 +61,77 @@ impl OpenAnimation {
         scale: Scale<f64>,
         alpha: f32,
     ) -> anyhow::Result<(OpeningWindowRenderElement, OffscreenData)> {
-        let progress = self.anim.value();
-        let clamped_progress = self.anim.clamped_value().clamp(0., 1.);
-
-        let (elem, _sync_point, mut data) = self
+        let (elem, _sync_point, data) = self
             .buffer
             .render(renderer, scale, elements)
             .context("error rendering to offscreen buffer")?;
+        self.presentation()
+            .render(renderer, elem, data, geo_size, location, scale, alpha)
+    }
+
+    pub fn presentation(&self) -> OpenPresentation {
+        OpenPresentation {
+            anim: self.anim.clone(),
+            random_seed: self.random_seed,
+        }
+    }
+}
+
+impl OpenPresentation {
+    pub fn progress_signature(&self) -> u64 {
+        self.anim.value().to_bits()
+    }
+    pub fn geometry(
+        &self,
+        mut source: Rectangle<f64, Logical>,
+        geo_size: Size<f64, Logical>,
+        scale: Scale<f64>,
+        custom: bool,
+    ) -> Rectangle<f64, Logical> {
+        if custom {
+            let target = smithay::utils::Size::new(
+                (source.size.w * 1.5).max(source.size.w + 1000.),
+                (source.size.h * 1.5).max(source.size.h + 1000.),
+            );
+            let diff = (target - source.size)
+                .to_point()
+                .downscale(2.)
+                .to_physical_precise_round(scale)
+                .to_logical(scale);
+            source.loc -= diff;
+            source.size += diff.upscale(2.).to_size();
+            source
+        } else {
+            let factor = self.scale_factor();
+            let center = geo_size
+                .to_point()
+                .downscale(2.)
+                .to_physical_precise_round(scale)
+                .to_logical(scale);
+            Rectangle::new(
+                center + (source.loc - center).upscale(factor),
+                source.size.upscale(factor),
+            )
+        }
+    }
+
+    pub fn scale_factor(&self) -> f64 {
+        (self.anim.value() / 2. + 0.5).max(1e-6)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn render(
+        &self,
+        renderer: &mut GlesRenderer,
+        elem: OffscreenRenderElement,
+        mut data: OffscreenData,
+        geo_size: Size<f64, Logical>,
+        location: Point<f64, Logical>,
+        scale: Scale<f64>,
+        alpha: f32,
+    ) -> anyhow::Result<(OpeningWindowRenderElement, OffscreenData)> {
+        let progress = self.anim.value();
+        let clamped_progress = self.anim.clamped_value().clamp(0., 1.);
 
         if Shaders::get(renderer).program(ProgramType::Open).is_some() {
             // OffscreenBuffer renders with Transform::Normal and the scale that we passed, so we

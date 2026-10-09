@@ -47,6 +47,7 @@ struct Inner {
     intermediate: Option<GlesTexture>,
     /// Reusable storage for subregion-filtered damage rects.
     subregion_damage: Vec<Rectangle<i32, Physical>>,
+    captured: Option<(Transform, Rectangle<f64, Logical>)>,
 }
 
 impl FramebufferEffect {
@@ -93,7 +94,23 @@ impl FramebufferEffect {
     }
 }
 
+pub struct CapturedFramebuffer {
+    pub texture: GlesTexture,
+    pub transform: Transform,
+    pub source: Rectangle<f64, Logical>,
+}
+
 impl FramebufferEffectElement {
+    pub fn captured_texture(&self, cache: &UserDataMap) -> Option<CapturedFramebuffer> {
+        let inner = cache.get::<RefCell<Inner>>()?.borrow();
+        let (transform, source) = inner.captured?;
+        Some(CapturedFramebuffer {
+            texture: inner.intermediate.clone()?,
+            transform,
+            source,
+        })
+    }
+
     fn compute_uniforms(
         &self,
         crop: Rectangle<f64, Logical>,
@@ -174,6 +191,7 @@ impl RenderElement<GlesRenderer> for FramebufferEffectElement {
             let inner = &mut *inner;
 
             inner.intermediate = None;
+            inner.captured = None;
 
             // We want clamp-to-edge behavior for out-of-bounds pixels. However, glBlitFramebuffer
             // seems to skip out-of-bounds pixels, even though my reading of the docs suggests
@@ -184,6 +202,17 @@ impl RenderElement<GlesRenderer> for FramebufferEffectElement {
                 None => return Ok(()),
             };
             let clamp_scale = clamped_dst.size.to_f64() / dst.size.to_f64();
+            let offset = (clamped_dst.loc - dst.loc)
+                .to_f64()
+                .upscale(src.size / dst.size.to_f64())
+                .to_logical(1.);
+            inner.captured = Some((
+                transform.invert(),
+                Rectangle::new(
+                    offset.upscale(-1.),
+                    src.size.to_logical(1., Transform::Normal),
+                ),
+            ));
 
             let dst = transform.transform_rect_in(clamped_dst, &output_rect.size);
 
@@ -452,6 +481,7 @@ impl Inner {
             blur: Blur::new(renderer),
             intermediate: None,
             subregion_damage: Vec::new(),
+            captured: None,
         }
     }
 }

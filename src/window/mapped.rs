@@ -1,5 +1,7 @@
+use crate::layout::sink_presentation::SinkInputBarrier;
 use std::cell::{Cell, Ref, RefCell};
-use std::time::Duration;
+use std::rc::Rc;
+use std::time::{Duration, Instant};
 
 use niri_config::{Color, Config, CornerRadius, GradientInterpolation, WindowRule};
 use smithay::backend::renderer::element::surface::WaylandSurfaceRenderElement;
@@ -83,7 +85,8 @@ pub struct Mapped {
     /// Data of the offscreen element rendered in place of this window.
     ///
     /// If `None`, then the window is not offscreened.
-    offscreen_data: RefCell<Option<OffscreenData>>,
+    offscreen_data: crate::render_helpers::offscreen::OffscreenDataSlot,
+    sink_input_barrier: Option<SinkInputBarrier>,
 
     /// Whether this has an urgent indicator.
     is_urgent: bool,
@@ -284,7 +287,8 @@ impl Mapped {
             need_to_recompute_rules: false,
             needs_configure: false,
             needs_frame_callback: false,
-            offscreen_data: RefCell::new(None),
+            offscreen_data: Rc::new(RefCell::new(None)),
+            sink_input_barrier: None,
             is_urgent: false,
             is_focused: false,
             is_active_in_column: true,
@@ -954,6 +958,64 @@ impl LayoutElement for Mapped {
         self.window.output_leave(output)
     }
 
+    fn offscreen_data_slot(&self) -> Option<crate::render_helpers::offscreen::OffscreenDataSlot> {
+        Some(self.offscreen_data.clone())
+    }
+
+    fn begin_sink_restore(&mut self) {
+        let Some(target) = self.requested_size() else {
+            return;
+        };
+        let current = self.size();
+        let matching_pixels =
+            (target.w == 0 || target.w == current.w) && (target.h == 0 || target.h == current.h);
+        let matching_commit = self
+            .toplevel()
+            .with_committed_state(|state| state.and_then(|s| s.size) == Some(target));
+        if matching_pixels || matching_commit {
+            self.sink_input_barrier = None;
+            return;
+        }
+        let deadline = self
+            .transaction_for_next_configure
+            .as_ref()
+            .map(Transaction::deadline)
+            .or_else(|| self.pending_transactions.last().map(|(_, t)| t.deadline()))
+            .unwrap_or_else(|| Transaction::new().deadline());
+        let mut barrier = SinkInputBarrier::new(deadline);
+        if let Some(serial) =
+            with_toplevel_last_uncommitted_configure(self.toplevel(), |configure| {
+                let configure = configure?;
+                (configure.state.size == Some(target)).then_some(configure.serial)
+            })
+        {
+            barrier.on_configure(serial);
+        }
+        self.sink_input_barrier = Some(barrier);
+    }
+
+    fn finish_sink_restore(&mut self) {
+        if self
+            .sink_input_barrier
+            .is_some_and(|b| b.degraded(Instant::now()))
+        {
+            debug!(
+                window_id = self.id.get(),
+                "Sink restore deadline: handing off last legal content"
+            );
+        }
+        self.sink_input_barrier = None;
+    }
+
+    fn sink_input_ready(&self) -> bool {
+        self.sink_input_barrier
+            .is_none_or(|barrier| barrier.ready(Instant::now()))
+    }
+
+    fn sink_input_deadline(&self) -> Option<Instant> {
+        self.sink_input_barrier.map(|b| b.deadline)
+    }
+
     fn set_offscreen_data(&self, data: Option<OffscreenData>) {
         let Some(data) = data else {
             self.offscreen_data.replace(None);
@@ -1103,6 +1165,9 @@ impl LayoutElement for Mapped {
 
             let serial = toplevel.send_configure();
             trace!(?serial, "sending configure");
+            if let Some(barrier) = &mut self.sink_input_barrier {
+                barrier.on_configure(serial);
+            }
 
             self.needs_configure = false;
 
@@ -1393,6 +1458,9 @@ impl LayoutElement for Mapped {
     }
 
     fn on_commit(&mut self, commit_serial: Serial) {
+        if let Some(barrier) = &mut self.sink_input_barrier {
+            barrier.on_commit(commit_serial);
+        }
         if let Some(InteractiveResize::WaitingForLastCommit { serial, .. }) =
             &self.interactive_resize
         {

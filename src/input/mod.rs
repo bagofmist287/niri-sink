@@ -2197,7 +2197,8 @@ impl State {
                 }
             }
             Action::PullWindow => {
-                if self.niri.layout.pull_window().is_some() {
+                if let Some(window) = self.niri.layout.pull_window() {
+                    self.plan_sink_focus(&window);
                     self.niri.queue_redraw_all();
                 }
             }
