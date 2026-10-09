@@ -40,6 +40,7 @@ pub mod layout;
 pub mod misc;
 pub mod output;
 pub mod recent_windows;
+pub mod sink;
 pub mod utils;
 pub mod window_rule;
 pub mod workspace;
@@ -57,6 +58,7 @@ pub use crate::misc::*;
 pub use crate::output::{Output, OutputName, Outputs, Position, Vrr};
 use crate::recent_windows::RecentWindowsPart;
 pub use crate::recent_windows::{MruDirection, MruFilter, MruPreviews, MruScope, RecentWindows};
+pub use crate::sink::{OverviewSink, OverviewSinkPart, Sink, SinkPart};
 pub use crate::utils::FloatOrInt;
 use crate::utils::{expand_home_path, Flag, MergeWith as _};
 pub use crate::window_rule::{
@@ -83,6 +85,7 @@ pub struct Config {
     pub blur: Blur,
     pub gestures: Gestures,
     pub overview: Overview,
+    pub sink: Sink,
     pub environment: Environment,
     pub xwayland_satellite: XwaylandSatellite,
     pub window_rules: Vec<WindowRule>,
@@ -204,6 +207,7 @@ where
                 "blur" => m_merge!(blur),
                 "gestures" => m_merge!(gestures),
                 "overview" => m_merge!(overview),
+                "sink" => m_merge!(sink),
                 "xwayland-satellite" => m_merge!(xwayland_satellite),
                 "switch-events" => m_merge!(switch_events),
                 "debug" => m_merge!(debug),
@@ -1699,6 +1703,12 @@ mod tests {
                 },
             },
             overview: Overview {
+                sink: OverviewSink {
+                    animate: true,
+                    entry_height: 24.0,
+                    tail_height: 12.0,
+                    tail_decay: 0.5,
+                },
                 zoom: 0.5,
                 backdrop_color: Color {
                     r: 0.15,
@@ -1725,6 +1735,28 @@ mod tests {
                         a: 0.3137255,
                     },
                 },
+            },
+            sink: Sink {
+                enabled: false,
+                visible_depth: 2,
+                levels: [
+                    SinkLevel {
+                        scale: 0.93,
+                        opacity: 0.82,
+                    },
+                    SinkLevel {
+                        scale: 0.85,
+                        opacity: 0.45,
+                    },
+                    SinkLevel {
+                        scale: 0.7768817204301075,
+                        opacity: 0.24695121951219515,
+                    },
+                    SinkLevel {
+                        scale: 0.7100531853393456,
+                        opacity: 0.13552201070791198,
+                    },
+                ],
             },
             environment: Environment(
                 [

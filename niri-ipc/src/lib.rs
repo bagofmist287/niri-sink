@@ -192,6 +192,10 @@ pub struct PickedColor {
 #[cfg_attr(feature = "clap", command(subcommand_help_heading = "Actions"))]
 #[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
 pub enum Action {
+    /// Sink the active normal window into its workspace background stack (experimental fork).
+    SinkWindow {},
+    /// Restore the top window from the active workspace background stack (experimental fork).
+    PullWindow {},
     /// Exit niri.
     Quit {
         /// Skip the "Press Enter to confirm" prompt.

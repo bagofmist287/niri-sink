@@ -400,6 +400,7 @@ pub struct Options {
     pub animations: niri_config::Animations,
     pub gestures: niri_config::Gestures,
     pub overview: niri_config::Overview,
+    pub sink: niri_config::Sink,
     pub blur: niri_config::Blur,
     // Debug flags.
     pub disable_resize_throttling: bool,
@@ -669,6 +670,7 @@ impl Options {
             animations: config.animations.clone(),
             gestures: config.gestures,
             overview: config.overview,
+            sink: config.sink,
             blur: config.blur,
             disable_resize_throttling: config.debug.disable_resize_throttling,
             disable_transactions: config.debug.disable_transactions,

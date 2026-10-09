@@ -247,3 +247,228 @@ fn foreign_activation_checks_recall_input_owner() {
         windows[0].1
     );
 }
+
+#[test]
+fn sink_actions_are_opt_in_and_reload_restores_without_stealing_focus() {
+    for enabled in [false, true] {
+        let mut config = Config::default();
+        config.sink.enabled = enabled;
+        let (mut fixture, client, windows) = setup(config);
+        // setup creates internal owners to also exercise disabling an existing stack.
+        fixture.niri_state().do_action(Action::PullWindow, false);
+        fixture.double_roundtrip(client);
+        assert_eq!(
+            fixture
+                .niri()
+                .layout
+                .active_workspace()
+                .unwrap()
+                .sink_count(),
+            if enabled { 2 } else { 3 }
+        );
+        if enabled {
+            assert_eq!(fixture.niri().layout.focus().unwrap().window, windows[2].1);
+            fixture.niri_state().do_action(Action::SinkWindow, false);
+            fixture.double_roundtrip(client);
+            assert_eq!(fixture.niri().layout.sink_depth(&windows[2].1), Some(0));
+            fixture.niri_state().do_action(Action::PullWindow, false);
+            fixture.double_roundtrip(client);
+        }
+        let before = fixture.niri().layout.focus().map(|win| win.window.clone());
+        if !enabled {
+            let mut config = Config::default();
+            config.sink.enabled = true;
+            fixture.niri_state().reload_config(Ok(config));
+        }
+        fixture.niri_state().reload_config(Ok(Config::default()));
+        fixture.double_roundtrip(client);
+        assert_eq!(
+            fixture
+                .niri()
+                .layout
+                .active_workspace()
+                .unwrap()
+                .sink_count(),
+            0
+        );
+        assert_eq!(fixture.niri().layout.windows().count(), 3);
+        if let Some(before) = before {
+            assert_eq!(fixture.niri().layout.focus().unwrap().window, before);
+        }
+        let count = fixture.niri().layout.windows().count();
+        fixture.niri_state().do_action(Action::SinkWindow, false);
+        fixture.niri_state().do_action(Action::PullWindow, false);
+        assert_eq!(
+            fixture
+                .niri()
+                .layout
+                .active_workspace()
+                .unwrap()
+                .sink_count(),
+            0
+        );
+        assert_eq!(fixture.niri().layout.windows().count(), count);
+    }
+}
+
+#[test]
+fn real_pointer_grab_rejects_transfers_and_recall_without_ending_grab() {
+    use crate::input::click_grab::ClickGrab;
+    use smithay::input::pointer::{Focus, GrabStartData};
+    use smithay::utils::Serial;
+    let mut config = Config::default();
+    config.sink.enabled = true;
+    let (mut fixture, client, windows) = setup(config);
+    fixture.niri_state().do_action(Action::PullWindow, false);
+    fixture.double_roundtrip(client);
+    let pointer = fixture.niri().seat.get_pointer().unwrap();
+    pointer.set_grab(
+        fixture.niri_state(),
+        ClickGrab::new(GrabStartData {
+            focus: None,
+            button: 0x110,
+            location: (10., 10.).into(),
+        }),
+        Serial::from(501),
+        Focus::Keep,
+    );
+    for action in [
+        Action::SinkWindow,
+        Action::PullWindow,
+        Action::FocusWindow(windows[0].2),
+    ] {
+        fixture.niri_state().do_action(action, false);
+        assert!(pointer.is_grabbed());
+        assert_eq!(fixture.niri().layout.sink_depth(&windows[0].1), Some(1));
+        assert_eq!(fixture.niri().layout.focus().unwrap().window, windows[2].1);
+    }
+    pointer.unset_grab(
+        fixture.niri_state(),
+        Serial::from(502),
+        smithay::backend::input::InputTime::now(),
+    );
+    fixture.niri_state().do_action(Action::SinkWindow, false);
+    assert_eq!(fixture.niri().layout.sink_depth(&windows[2].1), Some(0));
+}
+
+#[test]
+fn client_issued_activation_token_reaches_policy_and_recalls_only_with_serial() {
+    use smithay::reexports::wayland_protocols::xdg::activation::v1::client::xdg_activation_v1::XdgActivationV1;
+    for has_serial in [false, true] {
+        let mut config = Config::default();
+        config.sink.enabled = true;
+        let (mut fixture, client, windows) = setup(config);
+        fixture.niri_state().do_action(Action::PullWindow, false);
+        fixture.double_roundtrip(client);
+        let activation: XdgActivationV1 = fixture.client(client).bind();
+        let qh = fixture.client(client).qh.clone();
+        let token = activation.get_activation_token(&qh, ());
+        if has_serial {
+            let state = &fixture.client(client).state;
+            let (seat, data) = state.seats.iter().next().unwrap();
+            token.set_serial(data.keyboard.as_ref().unwrap().last_enter.unwrap(), seat);
+        }
+        token.commit();
+        fixture.double_roundtrip(client);
+        let issued = fixture
+            .client(client)
+            .state
+            .activation_tokens
+            .pop()
+            .unwrap();
+        let surface = fixture.client(client).state.windows[0].surface.clone();
+        activation.activate(issued, &surface);
+        fixture.double_roundtrip(client);
+        assert_eq!(
+            fixture.niri().layout.sink_depth(&windows[0].1),
+            if has_serial { None } else { Some(1) }
+        );
+        if has_serial {
+            assert_eq!(fixture.niri().keyboard_focus.surface(), Some(&windows[0].0));
+        }
+    }
+}
+
+#[test]
+fn real_popup_grab_blocks_sink_and_recall_without_dismissing_popup() {
+    let mut config = Config::default();
+    config.sink.enabled = true;
+    let (mut fixture, client, windows) = setup(config);
+    fixture.niri_state().do_action(Action::PullWindow, false);
+    fixture.double_roundtrip(client);
+    let state = &mut fixture.client(client).state;
+    let parent = state.windows[2].xdg_surface.clone();
+    let surface = state.create_surface();
+    let base = state.xdg_wm_base.as_ref().unwrap();
+    let positioner = base.create_positioner(&state.qh, ());
+    positioner.set_size(20, 20);
+    positioner.set_anchor_rect(0, 0, 10, 10);
+    let xdg = base.get_xdg_surface(&surface, &state.qh, ());
+    let popup = xdg.get_popup(Some(&parent), &positioner, &state.qh, ());
+    let (seat, seat_data) = state.seats.iter().next().unwrap();
+    popup.grab(
+        seat,
+        seat_data.keyboard.as_ref().unwrap().last_enter.unwrap(),
+    );
+    state.popup_surfaces.push(xdg.clone());
+    surface.commit();
+    fixture.double_roundtrip(client);
+    assert!(fixture.niri().popup_grab.is_some());
+    for action in [
+        Action::SinkWindow,
+        Action::PullWindow,
+        Action::FocusWindow(windows[0].2),
+    ] {
+        fixture.niri_state().do_action(action, false);
+        assert!(fixture.niri().popup_grab.is_some());
+        assert_eq!(fixture.niri().layout.sink_depth(&windows[0].1), Some(1));
+    }
+    popup.destroy();
+    xdg.destroy();
+    surface.destroy();
+    fixture.double_roundtrip(client);
+}
+
+#[test]
+fn actual_session_lock_rejects_even_allow_when_locked_sink_actions() {
+    use smithay::reexports::wayland_protocols::ext::session_lock::v1::client::ext_session_lock_manager_v1::ExtSessionLockManagerV1;
+    let mut config = Config::default();
+    config.sink.enabled = true;
+    let (mut fixture, client, windows) = setup(config);
+    fixture.niri_state().do_action(Action::PullWindow, false);
+    fixture.double_roundtrip(client);
+    let manager: ExtSessionLockManagerV1 = fixture.client(client).bind();
+    let qh = fixture.client(client).qh.clone();
+    let lock = manager.lock(&qh, ());
+    let output = fixture.client(client).output("headless-1");
+    let state = &mut fixture.client(client).state;
+    let surface = state.create_surface();
+    let _lock_surface = lock.get_lock_surface(&surface, &output, &qh, ());
+    fixture.double_roundtrip(client);
+    let state = &fixture.client(client).state;
+    let buffer =
+        state
+            .spbm
+            .as_ref()
+            .unwrap()
+            .create_u32_rgba_buffer(u32::MAX, 0, 0, u32::MAX, &qh, ());
+    let viewport = state
+        .viewporter
+        .as_ref()
+        .unwrap()
+        .get_viewport(&surface, &qh, ());
+    viewport.set_destination(1280, 720);
+    surface.attach(Some(&buffer), 0, 0);
+    surface.commit();
+    fixture.double_roundtrip(client);
+    assert!(fixture.niri().is_locked());
+    for action in [
+        Action::SinkWindow,
+        Action::PullWindow,
+        Action::FocusWindow(windows[0].2),
+    ] {
+        fixture.niri_state().do_action(action, true);
+        assert_eq!(fixture.niri().layout.sink_depth(&windows[0].1), Some(1));
+        assert_eq!(fixture.niri().layout.sink_depth(&windows[2].1), None);
+    }
+}

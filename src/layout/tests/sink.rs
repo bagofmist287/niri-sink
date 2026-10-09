@@ -232,6 +232,7 @@ fn workspace_restores_native_height_policy_after_reload_and_output_resize() {
         assert!(workspace.sink_window(&1));
         let old_request = workspace.windows().next().unwrap().requested_size();
         let mut options = Options::default();
+        options.sink.enabled = true;
         options.layout.preset_window_heights.truncate(1);
         workspace.update_config(Rc::new(options));
         output.change_current_state(
@@ -571,6 +572,42 @@ proptest! {
         for op in ops {
             op.apply(&mut layout);
             layout.verify_invariants();
+        }
+    }
+}
+
+#[test]
+fn disabling_sink_restores_every_workspace_including_without_outputs() {
+    for no_outputs in [false, true] {
+        let mut layout = Layout::default();
+        Op::AddOutput(1).apply(&mut layout);
+        Op::SetSinkEnabled(true).apply(&mut layout);
+        for id in 1..=3 {
+            Op::AddWindow {
+                params: TestWindowParams::new(id),
+            }
+            .apply(&mut layout);
+            Op::Communicate(id).apply(&mut layout);
+            assert!(layout.sink_window());
+        }
+        let owners = layout.windows().map(|(_, w)| w.clone()).collect::<Vec<_>>();
+        if no_outputs {
+            Op::RemoveOutput(1).apply(&mut layout);
+        }
+        for owner in &owners {
+            owner.0.output_events.borrow_mut().clear();
+        }
+        Op::SetSinkEnabled(false).apply(&mut layout);
+        layout.verify_invariants();
+        assert_eq!(layout.windows().count(), 3);
+        for owner in &owners {
+            assert_eq!(layout.sink_depth(owner.id()), None);
+            assert!(owner.0.output_events.borrow().is_empty());
+            let (_, restored) = layout
+                .windows()
+                .find(|(_, w)| w.id() == owner.id())
+                .unwrap();
+            assert!(Rc::ptr_eq(&owner.0, &restored.0));
         }
     }
 }

@@ -39,6 +39,14 @@ use wayland_client::protocol::wl_seat::{self, WlSeat};
 use wayland_client::protocol::wl_surface::{self, WlSurface};
 use wayland_client::{Connection, Dispatch, Proxy as _, QueueHandle};
 
+use smithay::reexports::wayland_protocols::xdg::activation::v1::client::xdg_activation_v1::XdgActivationV1;
+use smithay::reexports::wayland_protocols::xdg::activation::v1::client::xdg_activation_token_v1::{self, XdgActivationTokenV1};
+use smithay::reexports::wayland_protocols::ext::session_lock::v1::client::ext_session_lock_manager_v1::ExtSessionLockManagerV1;
+use smithay::reexports::wayland_protocols::ext::session_lock::v1::client::ext_session_lock_v1::ExtSessionLockV1;
+use smithay::reexports::wayland_protocols::ext::session_lock::v1::client::ext_session_lock_surface_v1::{self, ExtSessionLockSurfaceV1};
+use smithay::reexports::wayland_protocols::xdg::shell::client::xdg_popup::XdgPopup;
+use smithay::reexports::wayland_protocols::xdg::shell::client::xdg_positioner::XdgPositioner;
+
 use crate::utils::id::IdCounter;
 
 pub struct Client {
@@ -47,6 +55,7 @@ pub struct Client {
     pub connection: Connection,
     pub qh: QueueHandle<State>,
     pub display: WlDisplay,
+    pub registry: WlRegistry,
     pub state: State,
 }
 
@@ -66,6 +75,8 @@ pub struct State {
     pub viewporter: Option<WpViewporter>,
     pub ksim: Option<ZwpKeyboardShortcutsInhibitManagerV1>,
 
+    pub popup_surfaces: Vec<XdgSurface>,
+    pub activation_tokens: Vec<String>,
     pub windows: Vec<Window>,
     pub layers: Vec<LayerSurface>,
 }
@@ -112,6 +123,7 @@ pub struct Surface {
 #[derive(Debug)]
 pub struct Keyboard {
     pub proxy: WlKeyboard,
+    pub last_enter: Option<u32>,
     pub surface: Option<WlSurface>,
 }
 
@@ -236,6 +248,24 @@ impl fmt::Display for LayerConfigure {
 }
 
 impl Client {
+    pub fn bind<T: wayland_client::Proxy + 'static>(&self) -> T
+    where
+        State: Dispatch<T, ()>,
+    {
+        let global = self
+            .state
+            .globals
+            .iter()
+            .find(|g| g.interface == T::interface().name)
+            .unwrap();
+        self.registry.bind(
+            global.name,
+            global.version.min(T::interface().version),
+            &self.qh,
+            (),
+        )
+    }
+
     pub fn new(stream: UnixStream) -> Self {
         let id = ClientId::next();
 
@@ -249,7 +279,7 @@ impl Client {
             .unwrap();
 
         let display = connection.display();
-        let _registry = display.get_registry(&qh, ());
+        let registry = display.get_registry(&qh, ());
         connection.flush().unwrap();
 
         let state = State {
@@ -265,6 +295,8 @@ impl Client {
             spbm: None,
             viewporter: None,
             ksim: None,
+            popup_surfaces: Vec::new(),
+            activation_tokens: Vec::new(),
             windows: Vec::new(),
             layers: Vec::new(),
         };
@@ -275,6 +307,7 @@ impl Client {
             connection,
             qh,
             display,
+            registry,
             state,
         }
     }
@@ -711,6 +744,7 @@ impl Dispatch<WlSeat, ()> for State {
                     if data.keyboard.is_none() {
                         let keyboard = Keyboard {
                             proxy: seat.get_keyboard(qh, seat.clone()),
+                            last_enter: None,
                             surface: None,
                         };
                         data.keyboard = Some(keyboard);
@@ -741,7 +775,12 @@ impl Dispatch<WlKeyboard, WlSeat> for State {
 
         match event {
             wl_keyboard::Event::Keymap { .. } => (),
-            wl_keyboard::Event::Enter { surface, keys, .. } => {
+            wl_keyboard::Event::Enter {
+                serial,
+                surface,
+                keys,
+            } => {
+                keyboard.last_enter = Some(serial);
                 keyboard.surface = Some(surface.clone());
 
                 let event = KeyboardEvent::Enter { keys };
@@ -871,6 +910,10 @@ impl Dispatch<XdgSurface, ()> for State {
     ) {
         match event {
             xdg_surface::Event::Configure { serial } => {
+                if state.popup_surfaces.contains(xdg_surface) {
+                    xdg_surface.ack_configure(serial);
+                    return;
+                }
                 let window = state
                     .windows
                     .iter_mut()
@@ -1039,6 +1082,42 @@ impl Dispatch<ZwpKeyboardShortcutsInhibitorV1, ()> for State {
             zwp_keyboard_shortcuts_inhibitor_v1::Event::Active => (),
             zwp_keyboard_shortcuts_inhibitor_v1::Event::Inactive => (),
             _ => unreachable!(),
+        }
+    }
+}
+
+wayland_client::delegate_noop!(State: XdgActivationV1);
+wayland_client::delegate_noop!(State: ExtSessionLockManagerV1);
+wayland_client::delegate_noop!(State: ignore ExtSessionLockV1);
+wayland_client::delegate_noop!(State: ignore XdgPopup);
+wayland_client::delegate_noop!(State: XdgPositioner);
+
+impl Dispatch<XdgActivationTokenV1, ()> for State {
+    fn event(
+        state: &mut Self,
+        _proxy: &XdgActivationTokenV1,
+        event: xdg_activation_token_v1::Event,
+        _data: &(),
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+    ) {
+        if let xdg_activation_token_v1::Event::Done { token } = event {
+            state.activation_tokens.push(token);
+        }
+    }
+}
+
+impl Dispatch<ExtSessionLockSurfaceV1, ()> for State {
+    fn event(
+        _state: &mut Self,
+        proxy: &ExtSessionLockSurfaceV1,
+        event: ext_session_lock_surface_v1::Event,
+        _data: &(),
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+    ) {
+        if let ext_session_lock_surface_v1::Event::Configure { serial, .. } = event {
+            proxy.ack_configure(serial);
         }
     }
 }

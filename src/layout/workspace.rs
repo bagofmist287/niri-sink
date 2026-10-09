@@ -445,7 +445,11 @@ impl<W: LayoutElement> Workspace<W> {
             .set_color(options.layout.background_color);
 
         self.base_options = base_options;
+        let disable_sink = self.options.sink.enabled && !options.sink.enabled;
         self.options = options;
+        if disable_sink {
+            while self.pull_window(false).is_some() {}
+        }
     }
 
     fn update_sink_config(&mut self, options: Rc<Options>) {

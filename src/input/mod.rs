@@ -698,6 +698,12 @@ impl State {
             return;
         }
 
+        if matches!(action, Action::SinkWindow | Action::PullWindow)
+            && (!self.niri.config.borrow().sink.enabled || !self.can_recall_sink(false))
+        {
+            return;
+        }
+
         // Reject an explicit Sink recall before the common touch cancellation can end a grab.
         let recall = match &action {
             Action::FocusWindow(id) => self
@@ -2183,6 +2189,16 @@ impl State {
                             }
                         }
                     }
+                }
+            }
+            Action::SinkWindow => {
+                if self.niri.layout.sink_window() {
+                    self.niri.queue_redraw_all();
+                }
+            }
+            Action::PullWindow => {
+                if self.niri.layout.pull_window().is_some() {
+                    self.niri.queue_redraw_all();
                 }
             }
             Action::ToggleWindowFloating => {

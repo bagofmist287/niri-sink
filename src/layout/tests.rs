@@ -766,6 +766,7 @@ enum Op {
         window: usize,
     },
     ToggleOverview,
+    SetSinkEnabled(bool),
     UpdateConfig {
         #[proptest(strategy = "arbitrary_layout_part().prop_map(Box::new)")]
         layout_config: Box<niri_config::LayoutPart>,
@@ -1648,6 +1649,11 @@ impl Op {
             Op::ToggleOverview => {
                 layout.toggle_overview();
             }
+            Op::SetSinkEnabled(enabled) => {
+                let mut options = (*layout.options).clone();
+                options.sink.enabled = enabled;
+                layout.update_options(options);
+            }
             Op::UpdateConfig { layout_config } => {
                 let options = Options {
                     layout: niri_config::Layout::from_part(&layout_config),
@@ -1838,6 +1844,8 @@ fn operations_dont_panic() {
             params: TestWindowParams::new(3),
             ws_name: 1,
         },
+        Op::SetSinkEnabled(true),
+        Op::SetSinkEnabled(false),
         Op::SinkWindow,
         Op::PullWindow,
         Op::UnwindSink(1),
@@ -2000,6 +2008,8 @@ fn operations_from_starting_state_dont_panic() {
             params: TestWindowParams::new(5),
             ws_name: 1,
         },
+        Op::SetSinkEnabled(true),
+        Op::SetSinkEnabled(false),
         Op::SinkWindow,
         Op::PullWindow,
         Op::UnwindSink(1),
