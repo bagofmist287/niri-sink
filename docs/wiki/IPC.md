@@ -79,3 +79,20 @@ Please prefer the JSON output for scripts, since I reserve the right to make any
 
 The `niri-ipc` sub-crate (like other niri sub-crates) is *not* API-stable in terms of the Rust semver; rather, it follows the version of niri itself.
 In particular, new struct fields and enum variants will be added.
+
+### Sink inventory (personal fork, experimental)
+
+This fork adds `is_sunk` and `sink_depth` to window inventory, and `sink_count` to workspace inventory.
+Depth zero is the top of the workspace-local stack. A normal window has `is_sunk: false` and `sink_depth: null`.
+Older JSON without these fields deserializes to false, null, and zero respectively.
+
+A sunk window keeps its window ID, workspace and output membership. `is_floating` describes its base placement,
+and `layout.window_size` / `layout.tile_size` retain native dimensions. Its scrolling-layout position is null.
+These inventory fields describe ownership; they do not imply a visual projection or input support.
+
+Role and depth changes use `WindowOpenedOrChanged` for every affected owner. Workspace counts use
+`WorkspacesChanged`; ordinary layout changes continue to use `WindowLayoutsChanged`.
+A role change does not emit `WindowClosed`. Actual unmap or destruction still does.
+
+The current implementation is an internal logic prototype. Sink/Pull bindings and IPC actions are not yet
+registered, and Sink rendering and native-effect inheritance remain unverified.

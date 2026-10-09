@@ -1352,10 +1352,14 @@ pub struct Window {
     ///
     /// There can be either one focused window or zero (e.g. when a layer-shell surface has focus).
     pub is_focused: bool,
-    /// Whether this window is currently floating.
-    ///
-    /// If the window isn't floating then it is in the tiling layout.
+    /// Whether this window's base placement is floating, including while sunk.
     pub is_floating: bool,
+    /// Whether this window is owned by its workspace's Sink stack.
+    #[serde(default)]
+    pub is_sunk: bool,
+    /// Depth in that stack, with zero indicating the top; absent for normal windows.
+    #[serde(default)]
+    pub sink_depth: Option<usize>,
     /// Whether this window requests your attention.
     pub is_urgent: bool,
     /// Position- and size-related properties of the window.
@@ -1475,6 +1479,9 @@ pub struct Workspace {
     pub is_focused: bool,
     /// Id of the active window on this workspace, if any.
     pub active_window_id: Option<u64>,
+    /// Number of original window owners in this workspace's Sink stack.
+    #[serde(default)]
+    pub sink_count: usize,
 }
 
 /// Configured keyboard layouts.
@@ -2172,3 +2179,6 @@ mod tests {
         assert!("10% ".parse::<PositionChange>().is_err());
     }
 }
+
+#[cfg(test)]
+mod tests_sink;

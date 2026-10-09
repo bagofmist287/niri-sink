@@ -517,6 +517,7 @@ fn make_ipc_window(
     mapped: &Mapped,
     workspace_id: Option<WorkspaceId>,
     layout: WindowLayout,
+    sink_depth: Option<usize>,
 ) -> niri_ipc::Window {
     with_toplevel_role(mapped.toplevel(), |role| niri_ipc::Window {
         id: mapped.id().get(),
@@ -526,6 +527,8 @@ fn make_ipc_window(
         workspace_id: workspace_id.map(|id| id.get()),
         is_focused: mapped.is_focused(),
         is_floating: mapped.is_floating(),
+        is_sunk: sink_depth.is_some(),
+        sink_depth,
         is_urgent: mapped.is_urgent(),
         layout,
         focus_timestamp: mapped.get_focus_timestamp().map(Timestamp::from),
@@ -619,6 +622,7 @@ impl State {
             if ipc_ws.idx != u8::try_from(ws_idx + 1).unwrap_or(u8::MAX)
                 || ipc_ws.name.as_ref() != ws.name()
                 || ipc_ws.output.as_ref() != output_name
+                || ipc_ws.sink_count != ws.sink_count()
             {
                 need_workspaces_changed = true;
                 break;
@@ -673,6 +677,7 @@ impl State {
                         is_active: mon.is_some_and(|mon| mon.active_workspace_idx() == ws_idx),
                         is_focused: Some(id) == focused_ws_id,
                         active_window_id: ws.active_window().map(|win| win.id().get()),
+                        sink_count: ws.sink_count(),
                     }
                 })
                 .collect();
@@ -712,22 +717,25 @@ impl State {
                 focused_id = Some(id);
             }
 
+            let sink_depth = layout.sink_depth(&mapped.window);
             let Some(ipc_win) = state.windows.get(&id) else {
-                let window = make_ipc_window(mapped, ws_id, window_layout);
+                let window = make_ipc_window(mapped, ws_id, window_layout, sink_depth);
                 events.push(Event::WindowOpenedOrChanged { window });
                 return;
             };
 
             let workspace_id = ws_id.map(|id| id.get());
-            let mut changed =
-                ipc_win.workspace_id != workspace_id || ipc_win.is_floating != mapped.is_floating();
+            let mut changed = ipc_win.workspace_id != workspace_id
+                || ipc_win.is_floating != mapped.is_floating()
+                || ipc_win.is_sunk != sink_depth.is_some()
+                || ipc_win.sink_depth != sink_depth;
 
             changed |= with_toplevel_role(mapped.toplevel(), |role| {
                 ipc_win.title != role.title || ipc_win.app_id != role.app_id
             });
 
             if changed {
-                let window = make_ipc_window(mapped, ws_id, window_layout);
+                let window = make_ipc_window(mapped, ws_id, window_layout, sink_depth);
                 events.push(Event::WindowOpenedOrChanged { window });
                 return;
             }
@@ -984,3 +992,6 @@ impl State {
         server.send_event(event);
     }
 }
+
+#[cfg(test)]
+mod tests_sink;
