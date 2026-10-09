@@ -695,7 +695,7 @@ fn restore_pending_floating_role_change_preserves_selected_container() {
             .active_workspace()
             .unwrap()
             .scrolling()
-            .has_window(&5));
+            .tiles().any(|tile| tile.window().id() == &5));
         assert_eq!(layout.windows().count(), 1);
     }
 }
