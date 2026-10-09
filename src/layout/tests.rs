@@ -2059,7 +2059,7 @@ fn operations_from_starting_state_dont_panic() {
                     op.clone().apply(&mut layout);
                 }
 
-                let mut layout = Layout::default();
+                layout.verify_invariants();
                 first.clone().apply(&mut layout);
                 layout.verify_invariants();
                 second.clone().apply(&mut layout);
