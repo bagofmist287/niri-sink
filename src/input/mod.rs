@@ -698,6 +698,38 @@ impl State {
             return;
         }
 
+        // Reject an explicit Sink recall before the common touch cancellation can end a grab.
+        let recall = match &action {
+            Action::FocusWindow(id) => self
+                .niri
+                .layout
+                .windows()
+                .find(|(_, win)| win.id().get() == *id)
+                .map(|(_, win)| &win.window),
+            Action::FocusWindowPrevious => {
+                let current = self.niri.layout.focus().map(|win| win.id());
+                self.niri
+                    .layout
+                    .windows()
+                    .map(|(_, win)| win)
+                    .filter(|win| Some(win.id()) != current)
+                    .max_by_key(|win| win.get_focus_timestamp())
+                    .map(|win| &win.window)
+            }
+            Action::MruConfirm => self
+                .niri
+                .window_mru_ui
+                .current_window_id()
+                .and_then(|id| self.niri.layout.windows().find(|(_, win)| win.id() == id))
+                .map(|(_, win)| &win.window),
+            _ => None,
+        };
+        if recall.is_some_and(|window| self.niri.layout.sink_depth(window).is_some())
+            && !self.can_recall_sink(matches!(action, Action::MruConfirm))
+        {
+            return;
+        }
+
         if let Some(touch) = self.niri.seat.get_touch() {
             touch.cancel(self);
         }

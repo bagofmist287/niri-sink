@@ -94,5 +94,10 @@ Role and depth changes use `WindowOpenedOrChanged` for every affected owner. Wor
 `WorkspacesChanged`; ordinary layout changes continue to use `WindowLayoutsChanged`.
 A role change does not emit `WindowClosed`. Actual unmap or destruction still does.
 
+Existing explicit focus-by-ID, previous-window focus and MRU confirmation recall a sunk owner through
+the stack's normal LIFO restoration. Passive MRU browsing and ordinary directional focus keep the stack.
+Application activation still obeys the existing focus/urgency policy and token lifetime; a recall is
+rejected while an incompatible input owner, grab or layout interaction is active.
+
 The current implementation is an internal logic prototype. Sink/Pull bindings and IPC actions are not yet
 registered, and Sink rendering and native-effect inheritance remain unverified.

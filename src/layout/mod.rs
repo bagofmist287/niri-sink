@@ -1644,6 +1644,10 @@ impl<W: LayoutElement> Layout<W> {
         self.workspaces().find_map(|(_, _, ws)| ws.sink_depth(id))
     }
 
+    pub fn can_transfer_sink(&self) -> bool {
+        self.interactive_move.is_none() && self.dnd.is_none()
+    }
+
     /// Moves the active normal tile to its workspace's Sink owner.
     /// The action layer is responsible for feature, seat, lock and popup-grab permission.
     pub fn sink_window(&mut self) -> bool {

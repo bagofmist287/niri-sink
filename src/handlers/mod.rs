@@ -539,6 +539,9 @@ impl ForeignToplevelHandler for State {
     fn activate(&mut self, wl_surface: WlSurface) {
         if let Some((mapped, _)) = self.niri.layout.find_window_and_output(&wl_surface) {
             let window = mapped.window.clone();
+            if !self.prepare_sink_recall(&window) {
+                return;
+            }
             self.niri.layout.activate_window(&window);
             self.niri.layer_shell_on_demand_focus = None;
             self.niri.queue_redraw_all();
@@ -815,27 +818,28 @@ impl XdgActivationHandler for State {
         if token_data.timestamp.elapsed() < XDG_ACTIVATION_TOKEN_TIMEOUT {
             if let Some((mapped, _)) = self.niri.layout.find_window_and_output_mut(&surface) {
                 let window = mapped.window.clone();
-                match mapped.rules().on_xdg_activate {
-                    Some(niri_config::OnXdgActivate::Ignore) => {}
+                let focus = match mapped.rules().on_xdg_activate {
+                    Some(niri_config::OnXdgActivate::Ignore) => false,
                     Some(niri_config::OnXdgActivate::SetUrgent) => {
                         mapped.set_urgent(true);
                         self.niri.queue_redraw_all();
+                        false
                     }
-                    Some(niri_config::OnXdgActivate::Focus) => {
-                        self.niri.layout.activate_window(&window);
-                        self.niri.layer_shell_on_demand_focus = None;
-                        self.niri.queue_redraw_all();
-                    }
+                    Some(niri_config::OnXdgActivate::Focus) => true,
                     None => {
                         if token_data.user_data.get::<UrgentOnlyMarker>().is_some() {
                             mapped.set_urgent(true);
                             self.niri.queue_redraw_all();
+                            false
                         } else {
-                            self.niri.layout.activate_window(&window);
-                            self.niri.layer_shell_on_demand_focus = None;
-                            self.niri.queue_redraw_all();
+                            true
                         }
                     }
+                };
+                if focus && self.prepare_sink_recall(&window) {
+                    self.niri.layout.activate_window(&window);
+                    self.niri.layer_shell_on_demand_focus = None;
+                    self.niri.queue_redraw_all();
                 }
             } else if let Some(unmapped) = self.niri.unmapped_windows.get_mut(&surface) {
                 unmapped.activation_token_data = Some(token_data);

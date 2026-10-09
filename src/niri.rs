@@ -1088,6 +1088,9 @@ impl State {
     /// Focus a specific window, taking care of a potential active output change and cursor
     /// warp.
     pub fn focus_window(&mut self, window: &Window) {
+        if !self.prepare_sink_recall(window) {
+            return;
+        }
         let active_output = self.niri.layout.active_output().cloned();
 
         self.niri.layout.activate_window(window);
@@ -1105,8 +1108,57 @@ impl State {
         self.niri.queue_redraw_all();
     }
 
+    /// Prepares an explicit Sink recall after the caller's activation policy allows focus.
+    /// Normal activation remains unchanged; generic Layout activation never unwinds the stack.
+    pub fn prepare_sink_recall(&mut self, window: &Window) -> bool {
+        if self.niri.layout.sink_depth(window).is_none() {
+            return true;
+        }
+        if !self.can_recall_sink(false) {
+            return false;
+        }
+        self.niri.layout.unwind_sink_to(window)
+    }
+
+    pub fn can_recall_sink(&self, confirming_mru: bool) -> bool {
+        if self.niri.is_locked()
+            || self.niri.popup_grab.is_some()
+            || (self.niri.window_mru_ui.is_open() && !confirming_mru)
+            || !self.niri.layout.can_transfer_sink()
+            || !matches!(
+                self.niri.keyboard_focus,
+                KeyboardFocus::Layout { .. } | KeyboardFocus::Overview | KeyboardFocus::Mru
+            )
+            || self
+                .niri
+                .seat
+                .get_keyboard()
+                .is_some_and(|keyboard| keyboard.is_grabbed())
+            || self
+                .niri
+                .seat
+                .get_pointer()
+                .is_some_and(|pointer| pointer.is_grabbed())
+            || self
+                .niri
+                .seat
+                .get_touch()
+                .is_some_and(|touch| touch.is_grabbed())
+        {
+            return false;
+        }
+        true
+    }
+
     pub fn confirm_mru(&mut self) {
         if let Some(window) = self.niri.close_mru(MruCloseRequest::Confirm) {
+            if self.niri.layout.sink_depth(&window).is_some() {
+                if !self.prepare_sink_recall(&window) {
+                    return;
+                }
+                // Select the restored target before handing the closed MRU's keyboard focus back.
+                self.niri.layout.activate_window(&window);
+            }
             // focus_window() will warp the cursor to the window only when the keyboard focus is on
             // the layout. However, right now the keyboard focus is still on the MRU (that we had
             // just closed) since it's only updated at the end of the event loop cycle. Force-update
