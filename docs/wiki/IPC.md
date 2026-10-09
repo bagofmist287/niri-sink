@@ -99,5 +99,6 @@ the stack's normal LIFO restoration. Passive MRU browsing and ordinary direction
 Application activation still obeys the existing focus/urgency policy and token lifetime; a recall is
 rejected while an incompatible input owner, grab or layout interaction is active.
 
-The current implementation is an internal logic prototype. Sink/Pull bindings and IPC actions are not yet
-registered, and Sink rendering and native-effect inheritance remain unverified.
+The current implementation is an experimental logic prototype. The opt-in `sink-window` and
+`pull-window` bindings and IPC actions are registered; rendering and native-effect inheritance
+remain unverified. See [Sink](Sink.md) for configuration and current limits.
