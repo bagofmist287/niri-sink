@@ -1,3 +1,4 @@
+use adw::gio::prelude::ListModelExtManual as _;
 #[macro_use]
 extern crate tracing;
 
