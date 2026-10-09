@@ -674,3 +674,28 @@ fn enabled_sink_projection_reverses_current_pose_and_has_one_owner() {
         .unwrap()
         .is_done());
 }
+
+#[test]
+fn restore_pending_floating_role_change_preserves_selected_container() {
+    for state in [
+        Op::MaximizeWindowToEdges { id: Some(5) },
+        Op::FullscreenWindow(5),
+    ] {
+        let mut params = TestWindowParams::new(5);
+        params.is_floating = true;
+        let layout = check_ops([
+            Op::SetSinkEnabled(true),
+            Op::AddOutput(1),
+            Op::AddWindow { params },
+            Op::SinkWindow,
+            Op::PullWindow,
+            state,
+        ]);
+        assert!(layout
+            .active_workspace()
+            .unwrap()
+            .scrolling()
+            .has_window(&5));
+        assert_eq!(layout.windows().count(), 1);
+    }
+}

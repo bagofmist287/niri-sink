@@ -1774,7 +1774,10 @@ impl<W: LayoutElement> Workspace<W> {
             return;
         }
         let active_id = self.active_window().map(|win| win.id().clone());
-        let target_is_active = id.is_none_or(|id| Some(id) == active_id.as_ref());
+        // Explicit role changes must preserve the container selection even while the selected
+        // tile's restore barrier temporarily withholds input.
+        let selected_id = self.selected_window().map(|win| win.id().clone());
+        let target_is_active = id.is_none_or(|id| Some(id) == selected_id.as_ref());
         let Some(id) = id.cloned().or(active_id) else {
             return;
         };
