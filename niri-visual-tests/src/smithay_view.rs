@@ -212,6 +212,17 @@ mod imp {
                         element
                             .capture_framebuffer(&mut frame, src, dst, &cache)
                             .context("error in capture_framebuffer()")?;
+                        // Framebuffer effects may borrow the renderer for intermediate passes.
+                        // The guard restores Smithay's dummy target, so restore Gtk's external
+                        // framebuffer again before drawing the resolved effect and later elements.
+                        frame
+                            .with_context(|gl| unsafe {
+                                gl.BindFramebuffer(
+                                    smithay::backend::renderer::gles::ffi::FRAMEBUFFER,
+                                    framebuffer as u32,
+                                );
+                            })
+                            .context("error restoring Gtk framebuffer after effect capture")?;
                     }
                     element
                         .draw(&mut frame, src, dst, &[damage], &[], Some(&cache))
