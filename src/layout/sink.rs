@@ -165,4 +165,8 @@ impl<W: LayoutElement> SinkSpace<W> {
     pub fn entries(&self) -> impl Iterator<Item = (usize, &SinkEntry<W>)> {
         self.entries.iter().rev().enumerate()
     }
+
+    pub fn entries_mut(&mut self) -> impl Iterator<Item = (usize, &mut SinkEntry<W>)> {
+        self.entries.iter_mut().rev().enumerate()
+    }
 }

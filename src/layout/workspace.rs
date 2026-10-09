@@ -22,10 +22,11 @@ use super::scrolling::{
     Column, ColumnWidth, ScrollDirection, ScrollingSpace, ScrollingSpaceRenderElement,
 };
 use super::shadow::Shadow;
+use super::sink::{RestorePlacement, SinkEntry, SinkSpace};
 use super::tile::{Tile, TileRenderSnapshot};
 use super::{
-    ActivateWindow, HitType, InsertPosition, InteractiveResizeData, LayoutElement, Options,
-    RemovedTile, SizeFrac,
+    ActivateWindow, ConfigureIntent, HitType, InsertPosition, InteractiveResizeData, LayoutElement,
+    Options, RemovedTile, SizeFrac,
 };
 use crate::animation::Clock;
 use crate::layout::RenderLayer;
@@ -50,6 +51,9 @@ pub struct Workspace<W: LayoutElement> {
 
     /// The floating layout.
     floating: FloatingSpace<W>,
+
+    /// Original tiles owned by Sink, excluded from normal layout and input.
+    sink: SinkSpace<W>,
 
     /// Whether the floating layout is active instead of the scrolling layout.
     floating_is_active: FloatingActive,
@@ -261,6 +265,7 @@ impl<W: LayoutElement> Workspace<W> {
         Self {
             scrolling,
             floating,
+            sink: SinkSpace::default(),
             floating_is_active: FloatingActive::No,
             original_outputs,
             scale,
@@ -323,6 +328,7 @@ impl<W: LayoutElement> Workspace<W> {
         Self {
             scrolling,
             floating,
+            sink: SinkSpace::default(),
             floating_is_active: FloatingActive::No,
             output: None,
             scale,
@@ -368,14 +374,21 @@ impl<W: LayoutElement> Workspace<W> {
     pub fn advance_animations(&mut self) {
         self.scrolling.advance_animations();
         self.floating.advance_animations();
+        for tile in self.sink.tiles_mut() {
+            tile.advance_animations();
+        }
     }
 
     pub fn are_animations_ongoing(&self) -> bool {
-        self.scrolling.are_animations_ongoing() || self.floating.are_animations_ongoing()
+        self.scrolling.are_animations_ongoing()
+            || self.floating.are_animations_ongoing()
+            || self.sink.tiles().any(Tile::are_animations_ongoing)
     }
 
     pub fn are_transitions_ongoing(&self) -> bool {
-        self.scrolling.are_transitions_ongoing() || self.floating.are_transitions_ongoing()
+        self.scrolling.are_transitions_ongoing()
+            || self.floating.are_transitions_ongoing()
+            || self.sink.tiles().any(Tile::are_transitions_ongoing)
     }
 
     pub fn update_render_elements(&mut self, is_active: bool, layer: RenderLayer) {
@@ -422,6 +435,8 @@ impl<W: LayoutElement> Workspace<W> {
             options.clone(),
         );
 
+        self.update_sink_config(options.clone());
+
         let shadow_config =
             compute_workspace_shadow_config(options.overview.workspace_shadow, self.view_size);
         self.shadow.update_config(shadow_config);
@@ -431,6 +446,17 @@ impl<W: LayoutElement> Workspace<W> {
 
         self.base_options = base_options;
         self.options = options;
+    }
+
+    fn update_sink_config(&mut self, options: Rc<Options>) {
+        for (_, entry) in self.sink.entries_mut() {
+            entry.tile_mut().update_config(
+                self.view_size,
+                self.scale.fractional_scale(),
+                options.clone(),
+            );
+            entry.update_source_size();
+        }
     }
 
     pub fn update_layout_config(&mut self, layout_config: Option<niri_config::LayoutPart>) {
@@ -445,6 +471,9 @@ impl<W: LayoutElement> Workspace<W> {
     pub fn update_shaders(&mut self) {
         self.scrolling.update_shaders();
         self.floating.update_shaders();
+        for tile in self.sink.tiles_mut() {
+            tile.update_shaders();
+        }
         self.shadow.update_shaders();
     }
 
@@ -459,17 +488,28 @@ impl<W: LayoutElement> Workspace<W> {
     pub fn tiles(&self) -> impl Iterator<Item = &Tile<W>> + '_ {
         let scrolling = self.scrolling.tiles();
         let floating = self.floating.tiles();
-        scrolling.chain(floating)
+        scrolling.chain(floating).chain(self.sink.tiles())
     }
 
     pub fn tiles_mut(&mut self) -> impl Iterator<Item = &mut Tile<W>> + '_ {
         let scrolling = self.scrolling.tiles_mut();
         let floating = self.floating.tiles_mut();
-        scrolling.chain(floating)
+        scrolling.chain(floating).chain(self.sink.tiles_mut())
     }
 
     pub fn is_floating(&self, id: &W::Id) -> bool {
-        self.floating.has_window(id)
+        self.sink.get(id).map_or_else(
+            || self.floating.has_window(id),
+            |entry| entry.restore.is_floating(),
+        )
+    }
+
+    pub fn sink_depth(&self, id: &W::Id) -> Option<usize> {
+        self.sink.depth(id)
+    }
+
+    pub fn sink_count(&self) -> usize {
+        self.sink.len()
     }
 
     pub fn current_output(&self) -> Option<&Output> {
@@ -604,6 +644,8 @@ impl<W: LayoutElement> Workspace<W> {
                 self.options.clone(),
             );
 
+            self.update_sink_config(self.options.clone());
+
             let shadow_config =
                 compute_workspace_shadow_config(self.options.overview.workspace_shadow, size);
             self.shadow.update_config(shadow_config);
@@ -671,6 +713,23 @@ impl<W: LayoutElement> Workspace<W> {
         is_floating: bool,
         anim: Option<niri_config::Animation>,
     ) {
+        // A child targeting a sunk window is inserted normally, without implicitly pulling it.
+        // Preserve NextTo's Smart activation decision: a sunk target is never active.
+        let activate = if matches!(target, WorkspaceAddWindowTarget::NextTo(id) if self.sink.depth(id).is_some())
+        {
+            match activate {
+                ActivateWindow::Smart => ActivateWindow::No,
+                activate => activate,
+            }
+        } else {
+            activate
+        };
+        let target = match target {
+            WorkspaceAddWindowTarget::NextTo(id) if self.sink.depth(id).is_some() => {
+                WorkspaceAddWindowTarget::Auto
+            }
+            target => target,
+        };
         match target {
             WorkspaceAddWindowTarget::Auto => {
                 // Don't steal focus from an active fullscreen window.
@@ -703,7 +762,8 @@ impl<W: LayoutElement> Workspace<W> {
                 }
             }
             WorkspaceAddWindowTarget::NextTo(next_to) => {
-                let activate = activate.map_smart(|| self.active_window().unwrap().id() == next_to);
+                let activate = activate
+                    .map_smart(|| self.active_window().is_some_and(|win| win.id() == next_to));
 
                 let floating_has_window = self.floating.has_window(next_to);
 
@@ -817,6 +877,15 @@ impl<W: LayoutElement> Workspace<W> {
 
     /// Removes a tile from its layout while retaining its membership of this workspace's output.
     pub(super) fn detach_tile(&mut self, id: &W::Id, transaction: Transaction) -> RemovedTile<W> {
+        if let Some(entry) = self.sink.remove(id) {
+            let (tile, restore, _) = entry.into_parts();
+            return RemovedTile {
+                tile,
+                width: restore.width(),
+                is_full_width: restore.is_full_width(),
+                is_floating: restore.is_floating(),
+            };
+        }
         let mut from_floating = false;
         let removed = if self.floating.has_window(id) {
             from_floating = true;
@@ -828,6 +897,82 @@ impl<W: LayoutElement> Workspace<W> {
         self.update_focus_floating_tiling_after_removing(from_floating);
 
         removed
+    }
+
+    /// Internal role transfer. Action callers must additionally reject grabs, lock and transients.
+    pub(super) fn sink_window(&mut self, id: &W::Id) -> bool {
+        if self.sink.depth(id).is_some() {
+            return false;
+        }
+        let Some((tile, source_pos, _)) = self
+            .tiles_with_render_positions()
+            .find(|(tile, _, _)| tile.window().id() == id)
+        else {
+            return false;
+        };
+        if !tile.window().sizing_mode().is_normal()
+            || !tile.window().pending_sizing_mode().is_normal()
+            || tile.window().is_windowed_fullscreen()
+            || tile.window().is_pending_windowed_fullscreen()
+            || tile.window().interactive_resize_data().is_some()
+        {
+            return false;
+        }
+        let height = self.scrolling.window_height(id);
+        let removed = self.detach_tile(id, Transaction::new());
+        let restore = if removed.is_floating {
+            RestorePlacement::Floating {
+                width: removed.width,
+            }
+        } else {
+            RestorePlacement::Scrolling {
+                width: removed.width,
+                is_full_width: removed.is_full_width,
+                height: height.expect("scrolling tile must have a height policy"),
+            }
+        };
+        let entry = SinkEntry::new(removed.tile, restore, source_pos);
+        assert!(
+            self.sink.push(entry).is_ok(),
+            "normal and Sink owners must have distinct IDs"
+        );
+        true
+    }
+
+    /// Restores the top owner through normal insertion, without output notifications.
+    /// N2 may pass false until its visual/client-commit input barrier completes.
+    pub(super) fn pull_window(&mut self, activate: bool) -> Option<W::Id> {
+        let entry = self.sink.pop()?;
+        let (tile, restore, _) = entry.into_parts();
+        let id = tile.window().id().clone();
+        self.attach_tile(
+            tile,
+            WorkspaceAddWindowTarget::Auto,
+            if activate {
+                ActivateWindow::Yes
+            } else {
+                ActivateWindow::No
+            },
+            restore.width(),
+            restore.is_full_width(),
+            restore.is_floating(),
+            None,
+        );
+        if let RestorePlacement::Scrolling { height, .. } = restore {
+            self.scrolling.restore_window_height(&id, height);
+        }
+        Some(id)
+    }
+
+    /// Explicit confirmation path only; generic activation never unwinds a Sink stack.
+    pub(super) fn unwind_sink_to(&mut self, id: &W::Id, activate: bool) -> bool {
+        let Some(depth) = self.sink.depth(id) else {
+            return false;
+        };
+        for index in 0..=depth {
+            self.pull_window(activate && index == depth);
+        }
+        true
     }
 
     pub fn remove_active_column(&mut self) -> Option<Column<W>> {
@@ -1159,6 +1304,9 @@ impl<W: LayoutElement> Workspace<W> {
     }
 
     pub fn consume_or_expel_window_left(&mut self, window: Option<&W::Id>) {
+        if window.is_some_and(|id| self.sink.depth(id).is_some()) {
+            return;
+        }
         if window.map_or(self.floating_is_active.get(), |id| {
             self.floating.has_window(id)
         }) {
@@ -1168,6 +1316,9 @@ impl<W: LayoutElement> Workspace<W> {
     }
 
     pub fn consume_or_expel_window_right(&mut self, window: Option<&W::Id>) {
+        if window.is_some_and(|id| self.sink.depth(id).is_some()) {
+            return;
+        }
         if window.map_or(self.floating_is_active.get(), |id| {
             self.floating.has_window(id)
         }) {
@@ -1220,6 +1371,9 @@ impl<W: LayoutElement> Workspace<W> {
     }
 
     pub fn center_window(&mut self, id: Option<&W::Id>) {
+        if id.is_some_and(|id| self.sink.depth(id).is_some()) {
+            return;
+        }
         if id.map_or(self.floating_is_active.get(), |id| {
             self.floating.has_window(id)
         }) {
@@ -1262,6 +1416,9 @@ impl<W: LayoutElement> Workspace<W> {
     }
 
     pub fn set_window_width(&mut self, window: Option<&W::Id>, change: SizeChange) {
+        if window.is_some_and(|id| self.sink.depth(id).is_some()) {
+            return;
+        }
         if window.map_or(self.floating_is_active.get(), |id| {
             self.floating.has_window(id)
         }) {
@@ -1272,6 +1429,9 @@ impl<W: LayoutElement> Workspace<W> {
     }
 
     pub fn set_window_height(&mut self, window: Option<&W::Id>, change: SizeChange) {
+        if window.is_some_and(|id| self.sink.depth(id).is_some()) {
+            return;
+        }
         if window.map_or(self.floating_is_active.get(), |id| {
             self.floating.has_window(id)
         }) {
@@ -1282,6 +1442,9 @@ impl<W: LayoutElement> Workspace<W> {
     }
 
     pub fn reset_window_height(&mut self, window: Option<&W::Id>) {
+        if window.is_some_and(|id| self.sink.depth(id).is_some()) {
+            return;
+        }
         if window.map_or(self.floating_is_active.get(), |id| {
             self.floating.has_window(id)
         }) {
@@ -1291,6 +1454,9 @@ impl<W: LayoutElement> Workspace<W> {
     }
 
     pub fn toggle_window_width(&mut self, window: Option<&W::Id>, forwards: bool) {
+        if window.is_some_and(|id| self.sink.depth(id).is_some()) {
+            return;
+        }
         if window.map_or(self.floating_is_active.get(), |id| {
             self.floating.has_window(id)
         }) {
@@ -1301,6 +1467,9 @@ impl<W: LayoutElement> Workspace<W> {
     }
 
     pub fn toggle_window_height(&mut self, window: Option<&W::Id>, forwards: bool) {
+        if window.is_some_and(|id| self.sink.depth(id).is_some()) {
+            return;
+        }
         if window.map_or(self.floating_is_active.get(), |id| {
             self.floating.has_window(id)
         }) {
@@ -1318,6 +1487,9 @@ impl<W: LayoutElement> Workspace<W> {
     }
 
     pub fn set_fullscreen(&mut self, window: &W::Id, is_fullscreen: bool) {
+        if self.sink.depth(window).is_some() {
+            return;
+        }
         let mut restore_to_floating = false;
         if self.floating.has_window(window) {
             if is_fullscreen {
@@ -1374,6 +1546,9 @@ impl<W: LayoutElement> Workspace<W> {
     }
 
     pub fn toggle_fullscreen(&mut self, window: &W::Id) {
+        if self.sink.depth(window).is_some() {
+            return;
+        }
         let tile = self
             .tiles()
             .find(|tile| tile.window().id() == window)
@@ -1383,6 +1558,9 @@ impl<W: LayoutElement> Workspace<W> {
     }
 
     pub fn set_maximized(&mut self, window: &W::Id, maximize: bool) {
+        if self.sink.depth(window).is_some() {
+            return;
+        }
         let mut restore_to_floating = false;
         if self.floating.has_window(window) {
             if maximize {
@@ -1433,6 +1611,9 @@ impl<W: LayoutElement> Workspace<W> {
     }
 
     pub fn toggle_maximized(&mut self, window: &W::Id) {
+        if self.sink.depth(window).is_some() {
+            return;
+        }
         let mut current = false;
 
         // We have to check the column property in case the window is in the scrolling layout and
@@ -1448,6 +1629,9 @@ impl<W: LayoutElement> Workspace<W> {
     }
 
     pub fn toggle_window_floating(&mut self, id: Option<&W::Id>) {
+        if id.is_some_and(|id| self.sink.depth(id).is_some()) {
+            return;
+        }
         let active_id = self.active_window().map(|win| win.id().clone());
         let target_is_active = id.is_none_or(|id| Some(id) == active_id.as_ref());
         let Some(id) = id.cloned().or(active_id) else {
@@ -1508,6 +1692,9 @@ impl<W: LayoutElement> Workspace<W> {
     }
 
     pub fn set_window_floating(&mut self, id: Option<&W::Id>, floating: bool) {
+        if id.is_some_and(|id| self.sink.depth(id).is_some()) {
+            return;
+        }
         if id.map_or(self.floating_is_active.get(), |id| {
             self.floating.has_window(id)
         }) == floating
@@ -1553,6 +1740,9 @@ impl<W: LayoutElement> Workspace<W> {
         y: PositionChange,
         animate: bool,
     ) {
+        if id.is_some_and(|id| self.sink.depth(id).is_some()) {
+            return;
+        }
         if id.map_or(self.floating_is_active.get(), |id| {
             self.floating.has_window(id)
         }) {
@@ -1668,7 +1858,11 @@ impl<W: LayoutElement> Workspace<W> {
     pub fn tiles_with_ipc_layouts(&self) -> impl Iterator<Item = (&Tile<W>, WindowLayout)> {
         let scrolling = self.scrolling.tiles_with_ipc_layouts();
         let floating = self.floating.tiles_with_ipc_layouts();
-        floating.chain(scrolling)
+        let sink = self
+            .sink
+            .tiles()
+            .map(|tile| (tile, tile.ipc_layout_template()));
+        floating.chain(scrolling).chain(sink)
     }
 
     pub fn active_window_visual_rectangle(&self) -> Option<Rectangle<f64, Logical>> {
@@ -1680,6 +1874,11 @@ impl<W: LayoutElement> Workspace<W> {
     }
 
     pub fn popup_target_rect(&self, window: &W::Id) -> Option<Rectangle<f64, Logical>> {
+        if let Some(entry) = self.sink.get(window) {
+            let mut rect = self.working_area;
+            rect.loc -= entry.source.tile.loc + entry.tile().window_loc();
+            return Some(rect);
+        }
         if self.floating.has_window(window) {
             self.floating.popup_target_rect(window)
         } else {
@@ -1796,6 +1995,9 @@ impl<W: LayoutElement> Workspace<W> {
         window: &W::Id,
         blocker: TransactionBlocker,
     ) {
+        if self.sink.depth(window).is_some() {
+            return;
+        }
         if self.floating.has_window(window) {
             self.floating
                 .start_close_animation_for_window(renderer, window, blocker);
@@ -1873,12 +2075,45 @@ impl<W: LayoutElement> Workspace<W> {
     }
 
     pub fn update_window(&mut self, window: &W::Id, serial: Option<Serial>) {
+        if let Some(entry) = self.sink.get_mut(window) {
+            if let Some(serial) = serial {
+                entry.tile_mut().window_mut().on_commit(serial);
+            }
+            entry.tile_mut().update_window();
+            entry.update_source_size();
+            return;
+        }
         if !self.floating.update_window(window, serial) {
             self.scrolling.update_window(window, serial);
         }
     }
 
     pub fn refresh(&mut self, is_active: bool, is_focused: bool) {
+        for (_, entry) in self.sink.entries_mut() {
+            let is_floating = entry.restore.is_floating();
+            let win = entry.tile_mut().window_mut();
+            win.set_activated(false);
+            win.set_active_in_column(false);
+            win.set_floating(is_floating);
+            win.set_interactive_resize(None);
+            let bounds = if is_floating {
+                self.floating.new_window_toplevel_bounds(win.rules())
+            } else {
+                self.scrolling.new_window_toplevel_bounds(win.rules())
+            };
+            win.set_bounds(bounds);
+            // Preserve requested size while sunk. Only real output/layout
+            // restoration may request a new native size, never a presentation depth change.
+            if self.options.disable_resize_throttling
+                || matches!(
+                    win.configure_intent(),
+                    ConfigureIntent::CanSend | ConfigureIntent::ShouldSend
+                )
+            {
+                win.send_pending_configure();
+            }
+            win.refresh();
+        }
         self.scrolling
             .refresh(is_active && !self.floating_is_active.get(), is_focused);
         self.floating
@@ -1886,7 +2121,7 @@ impl<W: LayoutElement> Workspace<W> {
     }
 
     pub fn scroll_amount_to_activate(&self, window: &W::Id) -> f64 {
-        if self.floating.has_window(window) {
+        if self.sink.depth(window).is_some() || self.floating.has_window(window) {
             return 0.;
         }
 
@@ -1994,6 +2229,9 @@ impl<W: LayoutElement> Workspace<W> {
     }
 
     pub fn interactive_resize_begin(&mut self, window: W::Id, edges: ResizeEdge) -> bool {
+        if self.sink.depth(&window).is_some() {
+            return false;
+        }
         if self.floating.has_window(&window) {
             self.floating.interactive_resize_begin(window, edges)
         } else {
@@ -2006,6 +2244,9 @@ impl<W: LayoutElement> Workspace<W> {
         window: &W::Id,
         delta: Point<f64, Logical>,
     ) -> bool {
+        if self.sink.depth(window).is_some() {
+            return false;
+        }
         if self.floating.has_window(window) {
             self.floating.interactive_resize_update(window, delta)
         } else {
@@ -2014,6 +2255,9 @@ impl<W: LayoutElement> Workspace<W> {
     }
 
     pub fn interactive_resize_end(&mut self, window: Option<&W::Id>) {
+        if window.is_some_and(|id| self.sink.depth(id).is_some()) {
+            return;
+        }
         if let Some(window) = window {
             if self.floating.has_window(window) {
                 self.floating.interactive_resize_end(Some(window));
@@ -2093,6 +2337,22 @@ impl<W: LayoutElement> Workspace<W> {
         assert_eq!(&self.clock, self.floating.clock());
         assert!(Rc::ptr_eq(&self.options, self.floating.options()));
         self.floating.verify_invariants();
+
+        for (_, entry) in self.sink.entries() {
+            let tile = entry.tile();
+            assert!(Rc::ptr_eq(&self.options, &tile.options));
+            assert_eq!(self.clock, tile.clock);
+            assert_eq!(scale, tile.scale());
+            assert_eq!(self.view_size, tile.view_size());
+            assert!(!self
+                .scrolling
+                .tiles()
+                .chain(self.floating.tiles())
+                .any(|normal| normal.window().id() == tile.window().id()));
+            tile.verify_invariants();
+            assert_eq!(entry.source.window_size, tile.window().size());
+            assert_eq!(entry.source.tile.size, tile.tile_size());
+        }
 
         if self.floating.is_empty() {
             assert!(

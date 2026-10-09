@@ -2673,6 +2673,47 @@ impl<W: LayoutElement> ScrollingSpace<W> {
         cancel_resize_for_column(&mut self.interactive_resize, col);
     }
 
+    /// Captures the native height policy before an internal role transfer removes its column data.
+    pub(super) fn window_height(&self, window: &W::Id) -> Option<WindowHeight> {
+        self.columns.iter().find_map(|col| {
+            col.tiles
+                .iter()
+                .position(|tile| tile.window().id() == window)
+                .map(|idx| col.data[idx].height)
+        })
+    }
+
+    /// Restores a height policy after normal insertion, using the current layout constraints.
+    pub(super) fn restore_window_height(&mut self, window: &W::Id, height: WindowHeight) {
+        let col = self
+            .columns
+            .iter_mut()
+            .find(|col| col.contains(window))
+            .unwrap();
+        let idx = col
+            .tiles
+            .iter()
+            .position(|tile| tile.window().id() == window)
+            .unwrap();
+        match height {
+            WindowHeight::Auto { .. } => {
+                // A restored tile starts in a new column, with the normal automatic weight.
+            }
+            WindowHeight::Fixed(height) => {
+                col.convert_heights_to_auto();
+                col.apply_window_height(height, idx, false);
+            }
+            WindowHeight::Preset(preset) => {
+                if preset < col.options.layout.preset_window_heights.len() {
+                    col.convert_heights_to_auto();
+                    col.data[idx].height = WindowHeight::Preset(preset);
+                    col.update_tile_sizes(false);
+                }
+                // A removed preset falls back to the new column's normal automatic height.
+            }
+        }
+    }
+
     pub fn set_window_height(&mut self, window: Option<&W::Id>, change: SizeChange) {
         if self.columns.is_empty() {
             return;
@@ -5072,10 +5113,7 @@ impl<W: LayoutElement> Column<W> {
             (current_tile_px + gaps) / full
         };
 
-        // FIXME: fix overflows then remove limits.
-        const MAX_PX: f64 = 100000.;
-
-        let mut window_height = match change {
+        let window_height = match change {
             SizeChange::SetFixed(fixed) => f64::from(fixed),
             SizeChange::SetProportion(proportion) => {
                 let tile_height = (working_size - gaps) * (proportion / 100.) - gaps - extra_size;
@@ -5088,6 +5126,17 @@ impl<W: LayoutElement> Column<W> {
                 tile.window_height_for_tile_height(tile_height)
             }
         };
+
+        self.apply_window_height(window_height, tile_idx, animate);
+    }
+
+    fn apply_window_height(&mut self, mut window_height: f64, tile_idx: usize, animate: bool) {
+        // FIXME: fix overflows then remove limits.
+        const MAX_PX: f64 = 100000.;
+        let working_size = self.working_area.size.h;
+        let extra_size = self.extra_size().h;
+        let gaps = self.options.layout.gaps;
+        let tile = &self.tiles[tile_idx];
 
         // Clamp the height according to other windows' min sizes, or simply to working area height.
         let min_height_taken = if self.display_mode == ColumnDisplay::Tabbed {

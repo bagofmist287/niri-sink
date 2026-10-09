@@ -106,3 +106,295 @@ fn source_geometry_and_restore_metadata_survive_storage() {
     assert_eq!(window.0.requested_size.get(), None);
     assert!(window.0.output_events.borrow().is_empty());
 }
+
+use crate::layout::scrolling::WindowHeight;
+use crate::layout::workspace::WorkspaceAddWindowTarget;
+
+fn add_window(workspace: &mut Workspace<TestWindow>, id: usize, floating: bool) -> TestWindow {
+    let mut params = TestWindowParams::new(id);
+    params.is_floating = floating;
+    let window = TestWindow::new(params);
+    workspace.add_tile(
+        workspace.make_tile(window.clone()),
+        WorkspaceAddWindowTarget::Auto,
+        ActivateWindow::Yes,
+        ColumnWidth::Fixed(400.),
+        false,
+        floating,
+        None,
+    );
+    settle(workspace);
+    window
+}
+
+fn settle(workspace: &mut Workspace<TestWindow>) {
+    let changed = workspace
+        .windows()
+        .filter_map(|win| win.communicate().then_some(*win.id()))
+        .collect::<Vec<_>>();
+    for id in changed {
+        workspace.update_window(&id, None);
+    }
+    workspace.refresh(true, true);
+    workspace.verify_invariants(None);
+}
+
+#[test]
+fn workspace_only_sink_keeps_inventory_and_output_but_has_no_normal_focus() {
+    for floating in [false, true] {
+        let mut layout = Layout::<TestWindow>::default();
+        Op::AddOutput(1).apply(&mut layout);
+        let output = layout.outputs().next().unwrap().clone();
+        let mut workspace = Workspace::new(output, Clock::with_time(Duration::ZERO), Rc::default());
+        let win = add_window(&mut workspace, 1, floating);
+        win.0.output_events.borrow_mut().clear();
+        let size = win.size();
+        let requested = win.requested_size();
+        assert!(workspace.sink_window(&1));
+        settle(&mut workspace);
+        assert!(workspace.has_windows_or_name());
+        assert!(workspace.has_window(&1));
+        assert_eq!(workspace.windows().count(), 1);
+        assert_eq!(workspace.sink_count(), 1);
+        assert_eq!(workspace.sink_depth(&1), Some(0));
+        assert_eq!(workspace.is_floating(&1), floating);
+        assert!(workspace.active_window().is_none());
+        assert!(!win.0.pending_activated.get());
+        assert_eq!(workspace.tiles_with_render_positions().count(), 0);
+        assert!(workspace.window_under((100., 100.).into()).is_none());
+        let (_, ipc) = workspace.tiles_with_ipc_layouts().next().unwrap();
+        assert!(ipc.pos_in_scrolling_layout.is_none());
+        assert_eq!(win.size(), size);
+        assert_eq!(win.requested_size(), requested);
+        assert!(win.0.output_events.borrow().is_empty());
+        assert!(!workspace.activate_window(&1));
+        assert!(!workspace.activate_window_without_raising(&1));
+        assert_eq!(workspace.sink_depth(&1), Some(0));
+        assert_eq!(workspace.pull_window(true), Some(1));
+        settle(&mut workspace);
+        assert_eq!(workspace.active_window().map(LayoutElement::id), Some(&1));
+        assert_eq!(workspace.is_floating(&1), floating);
+        assert!(win.0.output_events.borrow().is_empty());
+        assert!(Rc::ptr_eq(&win.0, &workspace.windows().next().unwrap().0));
+        assert_eq!(workspace.pull_window(true), None);
+    }
+}
+
+#[test]
+fn workspace_lifo_unwind_and_arbitrary_close_preserve_other_owners() {
+    let mut workspace = Workspace::new_no_outputs(Clock::with_time(Duration::ZERO), Rc::default());
+    for id in 1..=4 {
+        add_window(&mut workspace, id, id % 2 == 0);
+        assert!(workspace.sink_window(&id));
+        settle(&mut workspace);
+    }
+    assert!(!workspace.sink_window(&4));
+    assert!(!workspace.sink_window(&99));
+    let removed = workspace.remove_tile(&2, Transaction::new());
+    assert_eq!(removed.tile.window().id(), &2);
+    assert!(removed.is_floating);
+    settle(&mut workspace);
+    assert_eq!(workspace.sink_depth(&4), Some(0));
+    assert_eq!(workspace.sink_depth(&3), Some(1));
+    assert_eq!(workspace.sink_depth(&1), Some(2));
+    assert!(!workspace.unwind_sink_to(&99, true));
+    assert!(workspace.unwind_sink_to(&3, true));
+    settle(&mut workspace);
+    assert_eq!(workspace.sink_count(), 1);
+    assert_eq!(workspace.sink_depth(&1), Some(0));
+    assert_eq!(workspace.active_window().map(LayoutElement::id), Some(&3));
+    assert_eq!(workspace.windows().count(), 3);
+    assert_eq!(workspace.pull_window(false), Some(1));
+    settle(&mut workspace);
+    assert_eq!(workspace.active_window().map(LayoutElement::id), Some(&3));
+}
+
+#[test]
+fn workspace_restores_native_height_policy_after_reload_and_output_resize() {
+    for height in [
+        WindowHeight::Auto { weight: 9. },
+        WindowHeight::Fixed(180.5),
+        WindowHeight::Preset(0),
+        WindowHeight::Preset(1),
+    ] {
+        let mut layout = Layout::<TestWindow>::default();
+        Op::AddOutput(1).apply(&mut layout);
+        let output = layout.outputs().next().unwrap().clone();
+        let mut workspace = Workspace::new(
+            output.clone(),
+            Clock::with_time(Duration::ZERO),
+            Rc::default(),
+        );
+        add_window(&mut workspace, 1, false);
+        workspace.scrolling_mut().restore_window_height(&1, height);
+        settle(&mut workspace);
+        let saved = workspace.scrolling().window_height(&1).unwrap();
+        assert!(workspace.sink_window(&1));
+        let old_request = workspace.windows().next().unwrap().requested_size();
+        let mut options = Options::default();
+        options.layout.preset_window_heights.truncate(1);
+        workspace.update_config(Rc::new(options));
+        output.change_current_state(
+            Some(Mode {
+                size: (1350, 900).into(),
+                refresh: 60000,
+            }),
+            Some(Transform::Normal),
+            Some(output::Scale::Fractional(1.5)),
+            None,
+        );
+        workspace.update_output_size();
+        settle(&mut workspace);
+        assert_eq!(
+            workspace.windows().next().unwrap().requested_size(),
+            old_request
+        );
+        assert_eq!(workspace.pull_window(true), Some(1));
+        settle(&mut workspace);
+        let restored = workspace.scrolling().window_height(&1).unwrap();
+        match saved {
+            WindowHeight::Auto { .. } => assert_eq!(restored, WindowHeight::Auto { weight: 1. }),
+            WindowHeight::Fixed(height) => assert_eq!(restored, WindowHeight::Fixed(height)),
+            WindowHeight::Preset(0) => assert_eq!(restored, saved),
+            WindowHeight::Preset(_) => assert_eq!(restored, WindowHeight::Auto { weight: 1. }),
+        }
+    }
+}
+
+#[test]
+fn workspace_rejects_non_normal_state_before_mutation() {
+    for case in 0..6 {
+        let mut workspace =
+            Workspace::new_no_outputs(Clock::with_time(Duration::ZERO), Rc::default());
+        let win = add_window(&mut workspace, 1, false);
+        match case {
+            0 => win.0.pending_sizing_mode.set(SizingMode::Fullscreen),
+            1 => win.0.pending_sizing_mode.set(SizingMode::Maximized),
+            2 => win.0.sizing_mode.set(SizingMode::Fullscreen),
+            3 => win.0.sizing_mode.set(SizingMode::Maximized),
+            4 => win.0.is_pending_windowed_fullscreen.set(true),
+            _ => win.0.is_windowed_fullscreen.set(true),
+        }
+        let requested = win.requested_size();
+        assert!(!workspace.sink_window(&1));
+        assert_eq!(workspace.sink_count(), 0);
+        assert_eq!(workspace.active_window().map(LayoutElement::id), Some(&1));
+        assert_eq!(win.requested_size(), requested);
+        assert_eq!(workspace.tiles_with_render_positions().count(), 1);
+    }
+}
+
+#[test]
+fn sunk_direct_layout_edits_are_noops_and_child_insertion_is_normal() {
+    let mut workspace = Workspace::new_no_outputs(Clock::with_time(Duration::ZERO), Rc::default());
+    let win = add_window(&mut workspace, 1, false);
+    add_window(&mut workspace, 2, false);
+    assert!(workspace.sink_window(&1));
+    let requested = win.requested_size();
+    workspace.set_window_width(Some(&1), SizeChange::SetFixed(700));
+    workspace.set_window_height(Some(&1), SizeChange::SetFixed(100));
+    workspace.reset_window_height(Some(&1));
+    workspace.toggle_window_width(Some(&1), true);
+    workspace.toggle_window_height(Some(&1), true);
+    workspace.set_window_floating(Some(&1), true);
+    workspace.toggle_window_floating(Some(&1));
+    workspace.center_window(Some(&1));
+    workspace.consume_or_expel_window_left(Some(&1));
+    workspace.consume_or_expel_window_right(Some(&1));
+    workspace.move_floating_window(
+        Some(&1),
+        PositionChange::SetFixed(10.),
+        PositionChange::SetFixed(10.),
+        false,
+    );
+    workspace.set_fullscreen(&1, true);
+    workspace.toggle_fullscreen(&1);
+    workspace.set_maximized(&1, true);
+    workspace.toggle_maximized(&1);
+    assert!(!workspace.interactive_resize_begin(1, ResizeEdge::RIGHT));
+    assert!(!workspace.interactive_resize_update(&1, (20., 0.).into()));
+    workspace.interactive_resize_end(Some(&1));
+    assert_eq!(win.requested_size(), requested);
+    assert_eq!(workspace.sink_depth(&1), Some(0));
+    let child = TestWindow::new(TestWindowParams::new(3));
+    workspace.add_tile(
+        workspace.make_tile(child),
+        WorkspaceAddWindowTarget::NextTo(&1),
+        ActivateWindow::Smart,
+        ColumnWidth::Fixed(300.),
+        false,
+        true,
+        None,
+    );
+    settle(&mut workspace);
+    assert_eq!(workspace.sink_depth(&1), Some(0));
+    assert_eq!(workspace.windows().count(), 3);
+    assert_eq!(workspace.active_window().map(LayoutElement::id), Some(&2));
+}
+
+#[test]
+fn sunk_owners_receive_real_output_changes_and_close_notifications() {
+    let mut layout = Layout::<TestWindow>::default();
+    Op::AddOutput(1).apply(&mut layout);
+    Op::AddOutput(2).apply(&mut layout);
+    let output1 = layout
+        .outputs()
+        .find(|o| o.name() == "output1")
+        .unwrap()
+        .clone();
+    let output2 = layout
+        .outputs()
+        .find(|o| o.name() == "output2")
+        .unwrap()
+        .clone();
+    let mut workspace = Workspace::new(output1, Clock::with_time(Duration::ZERO), Rc::default());
+    let first = add_window(&mut workspace, 1, true);
+    let second = add_window(&mut workspace, 2, false);
+    assert!(workspace.sink_window(&1));
+    assert!(workspace.sink_window(&2));
+    first.0.output_events.borrow_mut().clear();
+    second.0.output_events.borrow_mut().clear();
+    workspace.set_output(None);
+    workspace.set_output(Some(output2));
+    settle(&mut workspace);
+    for win in [&first, &second] {
+        assert_eq!(
+            win.0.output_events.take(),
+            [("output1".to_owned(), false), ("output2".to_owned(), true)]
+        );
+    }
+    let removed = workspace.remove_tile(&1, Transaction::new());
+    assert!(removed.is_floating);
+    assert!(Rc::ptr_eq(&removed.tile.window().0, &first.0));
+    assert_eq!(
+        first.0.output_events.take(),
+        [("output2".to_owned(), false)]
+    );
+    assert!(second.0.output_events.borrow().is_empty());
+    assert_eq!(workspace.sink_depth(&2), Some(0));
+    assert_eq!(workspace.pull_window(true), Some(2));
+    settle(&mut workspace);
+    assert!(second.0.output_events.borrow().is_empty());
+}
+
+#[test]
+fn sunk_client_commit_updates_native_geometry_without_depth_resize() {
+    let mut workspace = Workspace::new_no_outputs(Clock::with_time(Duration::ZERO), Rc::default());
+    let window = add_window(&mut workspace, 1, true);
+    assert!(workspace.sink_window(&1));
+    let requested = window.requested_size();
+    window.0.forced_size.set(Some((345, 234).into()));
+    assert!(window.communicate());
+    workspace.update_window(&1, Some(Serial::from(7)));
+    workspace.verify_invariants(None);
+    let (_, ipc) = workspace.tiles_with_ipc_layouts().next().unwrap();
+    assert_eq!(ipc.window_size, (345, 234));
+    assert_eq!(window.requested_size(), requested);
+    assert_eq!(workspace.sink_depth(&1), Some(0));
+    assert_eq!(workspace.pull_window(false), Some(1));
+    settle(&mut workspace);
+    assert!(Rc::ptr_eq(
+        &window.0,
+        &workspace.windows().next().unwrap().0
+    ));
+}
