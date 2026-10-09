@@ -646,6 +646,31 @@ impl<W: LayoutElement> Workspace<W> {
         self.enter_output_for_window(tile.window());
         tile.restore_to_floating = is_floating;
 
+        self.attach_tile(
+            tile,
+            target,
+            activate,
+            width,
+            is_full_width,
+            is_floating,
+            anim,
+        );
+    }
+
+    /// Adds a tile already belonging to this workspace without sending output notifications.
+    ///
+    /// Unlike add_tile(), this preserves the tile's fullscreen restore-to-floating state.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn attach_tile(
+        &mut self,
+        mut tile: Tile<W>,
+        target: WorkspaceAddWindowTarget<W>,
+        activate: ActivateWindow,
+        width: ColumnWidth,
+        is_full_width: bool,
+        is_floating: bool,
+        anim: Option<niri_config::Animation>,
+    ) {
         match target {
             WorkspaceAddWindowTarget::Auto => {
                 // Don't steal focus from an active fullscreen window.
@@ -781,6 +806,17 @@ impl<W: LayoutElement> Workspace<W> {
     }
 
     pub fn remove_tile(&mut self, id: &W::Id, transaction: Transaction) -> RemovedTile<W> {
+        let removed = self.detach_tile(id, transaction);
+
+        if let Some(output) = &self.output {
+            removed.tile.window().output_leave(output);
+        }
+
+        removed
+    }
+
+    /// Removes a tile from its layout while retaining its membership of this workspace's output.
+    pub(super) fn detach_tile(&mut self, id: &W::Id, transaction: Transaction) -> RemovedTile<W> {
         let mut from_floating = false;
         let removed = if self.floating.has_window(id) {
             from_floating = true;
@@ -788,10 +824,6 @@ impl<W: LayoutElement> Workspace<W> {
         } else {
             self.scrolling.remove_tile(id, transaction)
         };
-
-        if let Some(output) = &self.output {
-            removed.tile.window().output_leave(output);
-        }
 
         self.update_focus_floating_tiling_after_removing(from_floating);
 

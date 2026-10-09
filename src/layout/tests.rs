@@ -15,6 +15,7 @@ use super::*;
 
 mod animations;
 mod fullscreen;
+mod transfers;
 
 impl<W: LayoutElement> Default for Layout<W> {
     fn default() -> Self {
@@ -41,6 +42,7 @@ struct TestWindowInner {
     animate_next_configure: Cell<bool>,
     animation_snapshot: RefCell<Option<LayoutElementRenderSnapshot>>,
     rules: ResolvedWindowRules,
+    output_events: RefCell<Vec<(String, bool)>>,
 }
 
 #[derive(Debug, Clone)]
@@ -93,6 +95,7 @@ impl TestWindow {
             animate_next_configure: Cell::new(false),
             animation_snapshot: RefCell::new(None),
             rules: params.rules.unwrap_or_default(),
+            output_events: RefCell::new(Vec::new()),
         }))
     }
 
@@ -205,9 +208,13 @@ impl LayoutElement for TestWindow {
         false
     }
 
-    fn output_enter(&self, _output: &Output) {}
+    fn output_enter(&self, output: &Output) {
+        self.0.output_events.borrow_mut().push((output.name(), true));
+    }
 
-    fn output_leave(&self, _output: &Output) {}
+    fn output_leave(&self, output: &Output) {
+        self.0.output_events.borrow_mut().push((output.name(), false));
+    }
 
     fn set_offscreen_data(&self, _data: Option<OffscreenData>) {}
 
