@@ -27,6 +27,14 @@ the same. Explicit focus by ID, focus-previous, MRU confirmation and permitted a
 the stack from the top through the requested window. Intermediate members do not acquire focus.
 MRU browsing, ordinary directional focus and pointer focus do not restore background members.
 
+In Overview, clicking or tapping an exposed, visible background projection restores the stack
+through that window and closes Overview onto its workspace. Hover and press remain passive;
+confirmation happens on release and still waits for the normal Pull input barrier. Moving beyond
+the tap threshold, cancelling a touch, adding another touch or losing the selection context cancels
+confirmation. Background projections do not receive normal client pointer or touch input.
+Fully covered or hidden members remain accessible through MRU or explicit window ID; the complete
+expanded Overview is a later stage.
+
 Both actions do nothing when disabled, locked, grabbed, conflicting with another input owner or
 an interactive move/resize, or when their target is absent. Sink currently rejects transient families.
 Direct layout edits targeting a sunk ID do nothing. Closing and inventory queries still work.

@@ -2069,7 +2069,8 @@ impl<W: LayoutElement> Workspace<W> {
                 }
             }
         } else {
-            for tile in self.sink.tiles() {
+            for (_, entry) in self.sink.entries() {
+                let tile = entry.tile();
                 if let Some(presentation) = &tile.sink_presentation {
                     if let Some(element) =
                         tile.render_projected(ctx.r(), presentation.pose(), xray_pos, false)
@@ -2235,6 +2236,42 @@ impl<W: LayoutElement> Workspace<W> {
             !self
                 .tiles_with_render_positions()
                 .any(|(tile, _, _)| tile.window().id() == window.id() && tile.sink_input_blocked())
+        })
+    }
+
+    /// Passive Overview hit on the exposed live projection. Normal windows keep Z priority.
+    pub(super) fn sink_window_under(&self, pos: Point<f64, Logical>) -> Option<(&W, HitType)> {
+        // Restoring projections are drawn above both normal and sunk windows, even while their
+        // input barrier blocks ordinary hits. Do not click through them to another stack member.
+        if self
+            .tiles_with_render_positions()
+            .any(|(tile, position, visible)| {
+                visible
+                    && tile.sink_presentation.as_ref().is_some_and(|presentation| {
+                        let pose = presentation.pose_toward(SinkPose::normal(position));
+                        pose.alpha > 0.
+                            && tile
+                                .hit((pos - pose.position).downscale(pose.scale))
+                                .is_some()
+                    })
+            })
+        {
+            return None;
+        }
+        self.sink.entries().find_map(|(_, entry)| {
+            let tile = entry.tile();
+            let pose = tile.sink_presentation.as_ref()?.pose();
+            if pose.alpha <= 0. {
+                return None;
+            }
+            let scale = self.scale.fractional_scale();
+            let origin = pose
+                .position
+                .to_physical_precise_round(scale)
+                .to_logical(scale);
+            let point = (pos - origin).downscale(pose.scale);
+            tile.hit(point)
+                .map(|hit| (tile.window(), hit.to_activate()))
         })
     }
 

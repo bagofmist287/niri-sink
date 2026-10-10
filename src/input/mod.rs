@@ -3798,6 +3798,9 @@ impl State {
 
                             let mapped = self.niri.window_under(pos);
                             let window = mapped.map(|mapped| mapped.window.clone());
+                            let sink_selection = window
+                                .as_ref()
+                                .and_then(|window| self.niri.sink_overview_selection(window, pos));
 
                             let start_data = TabletToolGrabStartData {
                                 focus: None,
@@ -3814,7 +3817,8 @@ impl State {
                                 ws_id,
                                 matched_narrow,
                                 window,
-                            );
+                            )
+                            .with_sink_selection(sink_selection);
                             tool.set_grab(self, grab, time, serial, Focus::Clear);
                         } else if let Some((window, _)) = under.window {
                             self.niri.layout.activate_window(&window);
@@ -4415,6 +4419,9 @@ impl State {
 
                 let mapped = self.niri.window_under(pos);
                 let window = mapped.map(|mapped| mapped.window.clone());
+                let sink_selection = window
+                    .as_ref()
+                    .and_then(|window| self.niri.sink_overview_selection(window, pos));
 
                 let start_data = TouchGrabStartData {
                     focus: None,
@@ -4431,7 +4438,8 @@ impl State {
                     ws_id,
                     matched_narrow,
                     window,
-                );
+                )
+                .with_sink_selection(sink_selection);
                 handle.set_grab(self, grab, serial);
             } else if let Some((window, _)) = under.window {
                 self.niri.layout.activate_window(&window);

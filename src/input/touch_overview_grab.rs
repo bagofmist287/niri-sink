@@ -15,7 +15,7 @@ use smithay::utils::{IsAlive, Logical, Point, SERIAL_COUNTER};
 
 use crate::input::AnyStartData;
 use crate::layout::workspace::{Workspace, WorkspaceId};
-use crate::niri::State;
+use crate::niri::{SinkOverviewSelection, State};
 use crate::window::Mapped;
 
 // When the touch is stationary for this much time, it becomes an interactive move.
@@ -30,6 +30,9 @@ pub struct TouchOverviewGrab {
     workspace_id: Option<WorkspaceId>,
     workspace_matched_narrow: bool,
     window: Option<Window>,
+    sink_selection: Option<SinkOverviewSelection>,
+    sink_confirmed: bool,
+    sink_cancelled: bool,
     gesture: GestureState,
 
     // Accumulated and applied in frame().
@@ -66,16 +69,31 @@ impl TouchOverviewGrab {
             workspace_id,
             workspace_matched_narrow,
             window,
+            sink_selection: None,
+            sink_confirmed: false,
+            sink_cancelled: false,
             gesture: GestureState::Recognizing,
             new_location: location,
             event_timestamp: None,
         }
     }
 
+    pub(crate) fn with_sink_selection(mut self, selection: Option<SinkOverviewSelection>) -> Self {
+        self.sink_selection = selection;
+        self
+    }
+
     fn on_frame(&mut self, data: &mut State) -> bool {
         let Some(timestamp) = self.event_timestamp.take() else {
             return true;
         };
+
+        if self.sink_selection.is_some() {
+            let delta = self.new_location - self.start_data.location();
+            return !self.sink_cancelled
+                && self.window.as_ref().is_some_and(|window| window.alive())
+                && delta.x * delta.x + delta.y * delta.y < 16. * 16.;
+        }
 
         let layout = &mut data.niri.layout;
 
@@ -176,6 +194,23 @@ impl TouchOverviewGrab {
     }
 
     fn on_ungrab(&mut self, state: &mut State) {
+        if let Some(selection) = self.sink_selection.take() {
+            let delta = self.new_location - self.start_data.location();
+            if self.sink_confirmed
+                && !self.sink_cancelled
+                && delta.x * delta.x + delta.y * delta.y < 16. * 16.
+            {
+                state.queue_sink_overview_confirmation(selection);
+            }
+            if !self.start_data.is_touch() {
+                state
+                    .niri
+                    .cursor_manager
+                    .set_cursor_image(CursorImageStatus::default_named());
+            }
+            state.niri.queue_redraw_all();
+            return;
+        }
         let layout = &mut state.niri.layout;
         match self.gesture {
             GestureState::Recognizing => {
@@ -250,6 +285,8 @@ impl TouchGrab<State> for TouchOverviewGrab {
             return;
         }
 
+        self.sink_cancelled = true;
+
         if matches!(self.gesture, GestureState::InteractiveMove) {
             if let Some(window) = &self.window.as_ref() {
                 data.niri.layout.toggle_window_floating(Some(window));
@@ -265,6 +302,7 @@ impl TouchGrab<State> for TouchOverviewGrab {
             return;
         }
 
+        self.sink_confirmed = true;
         handle.unset_grab(self, data);
     }
 
@@ -370,6 +408,7 @@ impl TabletToolGrab<State> for TouchOverviewGrab {
         event: &tablet::tool::UpEvent,
     ) {
         handle.up(data, event);
+        self.sink_confirmed = true;
         handle.unset_grab(self, data, event.serial, event.time, true);
     }
 

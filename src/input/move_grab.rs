@@ -19,7 +19,7 @@ use smithay::output::Output;
 use smithay::utils::{IsAlive, Logical, Point, SERIAL_COUNTER};
 
 use crate::input::AnyStartData;
-use crate::niri::State;
+use crate::niri::{SinkOverviewSelection, State};
 
 pub struct MoveGrab {
     start_data: AnyStartData<State>,
@@ -27,6 +27,8 @@ pub struct MoveGrab {
     start_pos_within_output: Point<f64, Logical>,
     last_location: Point<f64, Logical>,
     window: Window,
+    sink_selection: Option<SinkOverviewSelection>,
+    sink_confirmed: bool,
     gesture: GestureState,
     enable_view_offset: bool,
     move_icon: CursorIcon,
@@ -60,6 +62,8 @@ impl MoveGrab {
             start_data,
             start_output: output.clone(),
             start_pos_within_output: pos_within_output,
+            sink_selection: state.niri.sink_overview_selection(&window, location),
+            sink_confirmed: false,
             window,
             gesture: GestureState::Recognizing,
             enable_view_offset,
@@ -80,6 +84,17 @@ impl MoveGrab {
     }
 
     fn on_ungrab(&mut self, data: &mut State) {
+        if let Some(selection) = self.sink_selection.take() {
+            let delta = self.new_location - self.start_data.location();
+            if self.sink_confirmed && delta.x * delta.x + delta.y * delta.y < 8. * 8. {
+                data.queue_sink_overview_confirmation(selection);
+            }
+            data.niri
+                .cursor_manager
+                .set_cursor_image(CursorImageStatus::default_named());
+            data.niri.queue_redraw_all();
+            return;
+        }
         let layout = &mut data.niri.layout;
         match self.gesture {
             GestureState::Recognizing => {
@@ -179,6 +194,11 @@ impl MoveGrab {
         let mut relative_delta = self.relative_delta.take().unwrap_or(delta);
         self.last_location = self.new_location;
 
+        if self.sink_selection.is_some() {
+            let c = self.new_location - self.start_data.location();
+            return self.window.alive() && c.x * c.x + c.y * c.y < 8. * 8.;
+        }
+
         // Try to recognize the gesture.
         if self.gesture == GestureState::Recognizing {
             // Check if the window has closed.
@@ -260,6 +280,9 @@ impl MoveGrab {
     }
 
     fn on_toggle_floating(&mut self, data: &mut State) -> bool {
+        if self.sink_selection.is_some() {
+            return false;
+        }
         if self.gesture == GestureState::ViewOffset {
             return true;
         }
@@ -339,6 +362,8 @@ impl PointerGrab<State> for MoveGrab {
         let start_data = self.start_data.unwrap_pointer();
 
         if !handle.current_pressed().contains(&start_data.button) {
+            self.sink_confirmed =
+                event.state == ButtonState::Released && event.button == start_data.button;
             // The button that initiated the grab was released.
             handle.unset_grab(self, data, event.serial, event.time, true);
             return;
@@ -492,6 +517,7 @@ impl TouchGrab<State> for MoveGrab {
         handle.up(data, event);
 
         if event.slot == self.start_data.unwrap_touch().slot {
+            self.sink_confirmed = true;
             handle.unset_grab(self, data);
         }
     }
@@ -598,6 +624,7 @@ impl TabletToolGrab<State> for MoveGrab {
         event: &tablet::tool::UpEvent,
     ) {
         handle.up(data, event);
+        self.sink_confirmed = true;
         handle.unset_grab(self, data, event.serial, event.time, true);
     }
 

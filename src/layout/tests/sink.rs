@@ -181,6 +181,74 @@ fn workspace_only_sink_keeps_inventory_and_output_but_has_no_normal_focus() {
 }
 
 #[test]
+fn overview_projection_hits_follow_lifo_and_visible_pose_without_input() {
+    for scale in [1., 1.25, 1.5] {
+        let mut config = Config::default();
+        config.sink.enabled = true;
+        let mut layout = Layout::<TestWindow>::new(Clock::with_time(Duration::ZERO), &config);
+        Op::AddOutput(1).apply(&mut layout);
+        let output = layout.outputs().next().unwrap().clone();
+        output.change_current_state(
+            None,
+            None,
+            Some(smithay::output::Scale::Fractional(scale)),
+            None,
+        );
+        layout.update_output_size(&output);
+        let ws = layout.active_workspace_mut().unwrap();
+        for id in 1..=3 {
+            add_window(ws, id, true);
+            assert!(ws.sink_window(&id));
+        }
+        layout.clock.set_complete_instantly(true);
+        layout.advance_animations();
+        layout.clock.set_complete_instantly(false);
+        let ws = layout.active_workspace().unwrap();
+        let top = ws.tiles().find(|tile| tile.window().id() == &3).unwrap();
+        let pose = top.sink_presentation.as_ref().unwrap().pose();
+        let center = pose.rectangle(top.animated_tile_size()).loc
+            + pose
+                .rectangle(top.animated_tile_size())
+                .size
+                .to_point()
+                .downscale(2.);
+        assert_eq!(
+            ws.sink_window_under(center).map(|(w, h)| (*w.id(), h)),
+            Some((
+                3,
+                HitType::Activate {
+                    is_tab_indicator: false
+                }
+            ))
+        );
+        assert!(ws.window_under(center).is_none());
+        assert!(layout.window_under(&output, center).is_none());
+        layout.open_overview();
+        Op::CompleteAnimations.apply(&mut layout);
+        let mon = layout.monitor_for_output(&output).unwrap();
+        let (ws, geo) = mon
+            .workspaces_with_render_geo()
+            .find(|(ws, _)| ws.sink_count() == 3)
+            .unwrap();
+        let point = center.upscale(mon.overview_zoom()) + geo.loc;
+        assert_eq!(
+            layout
+                .window_under(&output, point)
+                .map(|(w, h)| (*w.id(), h)),
+            Some((
+                3,
+                HitType::Activate {
+                    is_tab_indicator: false
+                }
+            ))
+        );
+        assert_eq!(ws.sink_count(), 3);
+        layout.close_overview();
+        assert!(layout.window_under(&output, point).is_none());
+    }
+}
+
+#[test]
 fn workspace_lifo_unwind_and_arbitrary_close_preserve_other_owners() {
     let mut workspace = Workspace::new_no_outputs(Clock::with_time(Duration::ZERO), Rc::default());
     for id in 1..=4 {

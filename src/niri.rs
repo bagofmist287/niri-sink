@@ -207,6 +207,16 @@ struct SinkFocusPlan {
     generation: u64,
 }
 
+#[derive(Clone)]
+pub(crate) struct SinkOverviewSelection {
+    window: Window,
+    position: Point<f64, Logical>,
+    workspace: crate::layout::workspace::WorkspaceId,
+    output: Output,
+    generation: u64,
+    overview_generation: u64,
+}
+
 pub struct Niri {
     pub config: Rc<RefCell<Config>>,
 
@@ -1120,6 +1130,47 @@ impl State {
 
         // FIXME: granular
         self.niri.queue_redraw_all();
+    }
+
+    /// Defer until our selection grab has actually ended; retain all normal recall permissions.
+    pub(crate) fn queue_sink_overview_confirmation(&mut self, selection: SinkOverviewSelection) {
+        self.niri.event_loop.insert_idle(move |state| {
+            if !state.niri.layout.is_overview_open()
+                || state.niri.layout.overview_generation() != selection.overview_generation
+                || !state.can_recall_sink(false)
+                || state
+                    .niri
+                    .window_under(selection.position)
+                    .is_none_or(|mapped| mapped.window != selection.window)
+            {
+                return;
+            }
+            let target = state.niri.layout.workspaces().find_map(|(mon, idx, ws)| {
+                if ws.id() != selection.workspace
+                    || mon.is_none_or(|mon| mon.output() != &selection.output)
+                    || ws.sink_depth(&selection.window).is_none()
+                {
+                    return None;
+                }
+                ws.tiles()
+                    .any(|tile| {
+                        tile.window().window == selection.window
+                            && tile.sink_generation() == selection.generation
+                    })
+                    .then_some(idx)
+            });
+            let Some(ws_idx) = target else {
+                return;
+            };
+            if !state.prepare_sink_recall(&selection.window) {
+                return;
+            }
+            state.niri.layout.focus_output(&selection.output);
+            state.niri.layout.toggle_overview_to_workspace(ws_idx);
+            state.niri.layout.activate_window(&selection.window);
+            state.plan_sink_focus(&selection.window);
+            state.niri.queue_redraw_all();
+        });
     }
 
     /// Prepares an explicit Sink recall after the caller's activation policy allows focus.
@@ -3594,6 +3645,32 @@ impl Niri {
     pub fn window_under_cursor(&self) -> Option<&Mapped> {
         let pos = self.seat.get_pointer().unwrap().current_location();
         self.window_under(pos)
+    }
+
+    pub(crate) fn sink_overview_selection(
+        &self,
+        window: &Window,
+        position: Point<f64, Logical>,
+    ) -> Option<SinkOverviewSelection> {
+        if !self.layout.is_overview_open()
+            || self
+                .window_under(position)
+                .is_none_or(|mapped| &mapped.window != window)
+        {
+            return None;
+        }
+        self.layout.workspaces().find_map(|(mon, _, ws)| {
+            ws.sink_depth(window)?;
+            let tile = ws.tiles().find(|tile| &tile.window().window == window)?;
+            Some(SinkOverviewSelection {
+                window: window.clone(),
+                position,
+                workspace: ws.id(),
+                output: mon?.output().clone(),
+                generation: tile.sink_generation(),
+                overview_generation: self.layout.overview_generation(),
+            })
+        })
     }
 
     /// Returns contents under the given point.

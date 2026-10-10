@@ -383,6 +383,7 @@ pub struct Layout<W: LayoutElement> {
     /// This is a boolean flag that controls things like where input goes to. The actual animation
     /// is controlled by overview_progress.
     overview_open: bool,
+    overview_generation: u64,
     /// The overview zoom progress.
     overview_progress: Option<OverviewProgress>,
     /// Configurable properties of the layout.
@@ -743,6 +744,7 @@ impl<W: LayoutElement> Layout<W> {
             clock,
             update_render_elements_time: Duration::ZERO,
             overview_open: false,
+            overview_generation: 0,
             overview_progress: None,
             options: Rc::new(options),
         }
@@ -768,6 +770,7 @@ impl<W: LayoutElement> Layout<W> {
             clock,
             update_render_elements_time: Duration::ZERO,
             overview_open: false,
+            overview_generation: 0,
             overview_progress: None,
             options: opts,
         }
@@ -4695,6 +4698,7 @@ impl<W: LayoutElement> Layout<W> {
     }
 
     pub fn set_monitors_overview_state(&mut self) {
+        self.overview_generation = self.overview_generation.wrapping_add(1);
         let MonitorSet::Normal { monitors, .. } = &mut self.monitor_set else {
             return;
         };
@@ -5100,6 +5104,10 @@ impl<W: LayoutElement> Layout<W> {
 
     pub fn is_overview_open(&self) -> bool {
         self.overview_open
+    }
+
+    pub(crate) fn overview_generation(&self) -> u64 {
+        self.overview_generation
     }
 }
 

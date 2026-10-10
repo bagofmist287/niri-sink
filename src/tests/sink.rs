@@ -220,6 +220,257 @@ fn settle(fixture: &mut Fixture, client: ClientId) {
     fixture.double_roundtrip(client);
 }
 
+fn overview_point(
+    fixture: &mut Fixture,
+    window: &Window,
+) -> smithay::utils::Point<f64, smithay::utils::Logical> {
+    for y in (0..720).step_by(5) {
+        for x in (0..1280).step_by(5) {
+            let pos = (f64::from(x), f64::from(y)).into();
+            if fixture
+                .niri()
+                .window_under(pos)
+                .is_some_and(|mapped| &mapped.window == window)
+            {
+                return pos;
+            }
+        }
+    }
+    panic!("no exposed Overview projection for target");
+}
+
+#[test]
+fn overview_real_pointer_is_passive_then_unwinds_on_release_after_own_grab() {
+    use wayland_client::protocol::wl_pointer::ButtonState;
+
+    let mut config = Config::default();
+    config.sink.enabled = true;
+    config.animations.off = true;
+    let (mut fixture, client, windows) = setup(config);
+    // A larger older visible member exposes a strip outside the stack top, allowing an Unwind
+    // to an intermediate member instead of only a one-window Pull.
+    let window = &mut fixture.client(client).state.windows[1];
+    window.attach_new_buffer();
+    window.set_size(500, 400);
+    window.commit();
+    fixture.double_roundtrip(client);
+    fixture.niri_complete_animations();
+    fixture.niri().layout.open_overview();
+    fixture.double_roundtrip(client);
+    fixture.niri_complete_animations();
+    let pos = overview_point(&mut fixture, &windows[1].1);
+    let under = fixture.niri().contents_under(pos);
+    assert!(under.surface.is_none());
+    assert_eq!(under.window.unwrap().0, windows[1].1);
+    assert_eq!(fixture.niri().layout.sink_depth(&windows[1].1), Some(1));
+    let c = fixture.client(client);
+    let pointer = c
+        .state
+        .virtual_pointer_manager
+        .as_ref()
+        .unwrap()
+        .create_virtual_pointer(None, &c.qh, ());
+    pointer.motion_absolute(1, pos.x as u32, pos.y as u32, 1280, 720);
+    pointer.frame();
+    fixture.double_roundtrip(client);
+    pointer.button(2, 0x110, ButtonState::Pressed);
+    pointer.frame();
+    fixture.double_roundtrip(client);
+    assert_eq!(
+        fixture
+            .niri()
+            .layout
+            .active_workspace()
+            .unwrap()
+            .sink_count(),
+        3
+    );
+    assert!(fixture.niri().layout.is_overview_open());
+    pointer.button(3, 0x110, ButtonState::Released);
+    pointer.frame();
+    fixture.double_roundtrip(client);
+    assert!(!fixture.niri().layout.is_overview_open());
+    assert_eq!(fixture.niri().layout.sink_depth(&windows[0].1), Some(0));
+    assert_eq!(fixture.niri().layout.sink_depth(&windows[1].1), None);
+    assert_eq!(fixture.niri().layout.sink_depth(&windows[2].1), None);
+    assert_ne!(fixture.niri().keyboard_focus.surface(), Some(&windows[1].0));
+    settle(&mut fixture, client);
+    assert_eq!(fixture.niri().keyboard_focus.surface(), Some(&windows[1].0));
+}
+
+#[test]
+fn overview_confirmation_rejects_stale_cycle_membership_and_competing_grab() {
+    use crate::input::click_grab::ClickGrab;
+    use smithay::input::pointer::{Focus, GrabStartData};
+    use smithay::utils::Serial;
+
+    for change in ["close", "reopen", "resink", "grab", "remove"] {
+        let mut config = Config::default();
+        config.sink.enabled = true;
+        config.animations.off = true;
+        let (mut fixture, client, windows) = setup(config);
+        fixture.niri_complete_animations();
+        fixture.niri().layout.open_overview();
+        fixture.double_roundtrip(client);
+        fixture.niri_complete_animations();
+        let pos = overview_point(&mut fixture, &windows[2].1);
+        let selection = fixture
+            .niri()
+            .sink_overview_selection(&windows[2].1, pos)
+            .unwrap();
+        fixture
+            .niri_state()
+            .queue_sink_overview_confirmation(selection);
+        match change {
+            "close" => {
+                fixture.niri().layout.close_overview();
+            }
+            "reopen" => {
+                fixture.niri().layout.close_overview();
+                fixture.niri().layout.open_overview();
+            }
+            "resink" => {
+                fixture.niri().layout.pull_window();
+                fixture.niri().layout.sink_window();
+            }
+            "grab" => {
+                fixture.niri().seat.get_pointer().unwrap().set_grab(
+                    fixture.niri_state(),
+                    ClickGrab::new(GrabStartData {
+                        focus: None,
+                        button: 0x110,
+                        location: pos,
+                    }),
+                    Serial::from(900),
+                    Focus::Clear,
+                );
+            }
+            "remove" => {
+                fixture
+                    .niri()
+                    .layout
+                    .remove_window(&windows[2].1, crate::utils::transaction::Transaction::new());
+            }
+            _ => unreachable!(),
+        }
+        fixture.double_roundtrip(client);
+        assert_eq!(
+            fixture.niri().layout.sink_depth(&windows[0].1),
+            Some(if change == "remove" { 1 } else { 2 })
+        );
+        assert_eq!(
+            fixture.niri().layout.sink_depth(&windows[1].1),
+            Some(if change == "remove" { 0 } else { 1 })
+        );
+    }
+}
+
+#[test]
+fn overview_touch_tap_confirms_but_cancel_motion_and_second_contact_do_not() {
+    use crate::input::touch_overview_grab::TouchOverviewGrab;
+    use crate::input::AnyStartData;
+    use smithay::backend::input::InputTime;
+    use smithay::input::touch::{DownEvent, GrabStartData, MotionEvent, UpEvent};
+    use smithay::utils::Serial;
+
+    for gesture in ["tap", "cancel", "motion", "second"] {
+        let mut config = Config::default();
+        config.sink.enabled = true;
+        config.animations.off = true;
+        let (mut fixture, client, windows) = setup(config);
+        fixture.niri_complete_animations();
+        fixture.niri().layout.open_overview();
+        fixture.double_roundtrip(client);
+        fixture.niri_complete_animations();
+        let pos = overview_point(&mut fixture, &windows[2].1);
+        let selection = fixture
+            .niri()
+            .sink_overview_selection(&windows[2].1, pos)
+            .unwrap();
+        let output = fixture.niri_output(1);
+        let workspace = fixture.niri().layout.active_workspace().unwrap().id();
+        let handle = fixture.niri().seat.add_touch();
+        let slot = Some(0).into();
+        let grab = TouchOverviewGrab::new(
+            AnyStartData::Touch(GrabStartData {
+                focus: None,
+                slot,
+                location: pos,
+            }),
+            Duration::ZERO,
+            output,
+            pos,
+            Some(workspace),
+            true,
+            Some(windows[2].1.clone()),
+        )
+        .with_sink_selection(Some(selection));
+        handle.set_grab(fixture.niri_state(), grab, Serial::from(910));
+        handle.down(
+            fixture.niri_state(),
+            None,
+            &DownEvent {
+                slot,
+                location: pos,
+                serial: Serial::from(911),
+                time: InputTime::now(),
+            },
+        );
+        fixture.double_roundtrip(client);
+        assert_eq!(fixture.niri().layout.sink_depth(&windows[2].1), Some(0));
+        match gesture {
+            "cancel" => handle.cancel(fixture.niri_state()),
+            "motion" => {
+                handle.motion(
+                    fixture.niri_state(),
+                    None,
+                    &MotionEvent {
+                        slot,
+                        location: pos + smithay::utils::Point::from((30., 0.)),
+                        time: InputTime::now(),
+                    },
+                );
+                handle.frame(fixture.niri_state());
+            }
+            "second" => {
+                handle.down(
+                    fixture.niri_state(),
+                    None,
+                    &DownEvent {
+                        slot: Some(1).into(),
+                        location: pos,
+                        serial: Serial::from(912),
+                        time: InputTime::now(),
+                    },
+                );
+            }
+            _ => {}
+        }
+        if gesture != "cancel" {
+            handle.up(
+                fixture.niri_state(),
+                &UpEvent {
+                    slot,
+                    serial: Serial::from(913),
+                    time: InputTime::now(),
+                },
+            );
+        }
+        handle.frame(fixture.niri_state());
+        fixture.double_roundtrip(client);
+        if gesture == "tap" {
+            assert!(!fixture.niri().layout.is_overview_open());
+            assert_eq!(fixture.niri().layout.sink_depth(&windows[2].1), None);
+            settle(&mut fixture, client);
+            assert_eq!(fixture.niri().keyboard_focus.surface(), Some(&windows[2].0));
+        } else {
+            assert!(fixture.niri().layout.is_overview_open());
+            assert_eq!(fixture.niri().layout.sink_depth(&windows[0].1), Some(2));
+            assert_eq!(fixture.niri().layout.sink_depth(&windows[2].1), Some(0));
+        }
+    }
+}
+
 #[test]
 fn explicit_focus_action_unwinds_to_final_client_only() {
     let (mut fixture, client, windows) = setup(Config::default());
