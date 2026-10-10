@@ -3488,6 +3488,9 @@ impl<W: LayoutElement> Layout<W> {
             let mut removed = ws.remove_tile(&window, transaction);
 
             removed.tile.stop_move_animations();
+            if mon_idx != new_idx {
+                removed.tile.invalidate_sink_restore_context();
+            }
 
             let mon = &mut monitors[new_idx];
             mon.add_tile(
@@ -3539,9 +3542,13 @@ impl<W: LayoutElement> Layout<W> {
                 return;
             }
 
-            let Some(column) = ws.remove_active_column() else {
+            let Some(mut column) = ws.remove_active_column() else {
                 return;
             };
+
+            if new_idx != *active_monitor_idx {
+                column.invalidate_sink_restore_context();
+            }
 
             let workspace_idx = target_ws_idx
                 .unwrap_or(monitors[new_idx].active_workspace_idx)

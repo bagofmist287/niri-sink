@@ -241,6 +241,14 @@ impl<W: LayoutElement> Tile<W> {
         scale: f64,
         options: Rc<Options>,
     ) {
+        if self.view_size != view_size && self.is_sink_restoring() {
+            let source = self.animated_tile_size();
+            self.sink_presentation
+                .as_mut()
+                .unwrap()
+                .rebase_view(self.view_size, view_size, source);
+            self.invalidate_sink_restore_context();
+        }
         if self.options.sink.enabled && !options.sink.enabled {
             self.sink_generation = self.sink_generation.wrapping_add(1);
             self.sink_focus_cancelled = false;
@@ -477,6 +485,14 @@ impl<W: LayoutElement> Tile<W> {
 
     pub fn is_sink_restoring(&self) -> bool {
         self.sink_presentation.as_ref().is_some_and(|p| p.restoring)
+    }
+
+    /// Local Overview coordinates and projection buffers belong to the old output context.
+    pub(super) fn invalidate_sink_restore_context(&mut self) {
+        if self.is_sink_restoring() {
+            self.sink_overview_presentation = None;
+            self.release_sink_projection();
+        }
     }
     /// A restoring tile changes workspace coordinates, but keeps its animation and commit state.
     pub(super) fn translate_sink_restore(

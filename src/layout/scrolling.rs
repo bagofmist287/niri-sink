@@ -5449,6 +5449,12 @@ impl<W: LayoutElement> Column<W> {
         zip(&self.tiles, offsets)
     }
 
+    pub(super) fn invalidate_sink_restore_context(&mut self) {
+        for tile in &mut self.tiles {
+            tile.invalidate_sink_restore_context();
+        }
+    }
+
     fn tiles_mut(&mut self) -> impl Iterator<Item = (&mut Tile<W>, Point<f64, Logical>)> + '_ {
         let offsets = self.tile_offsets_iter(self.data.iter().copied());
         zip(&mut self.tiles, offsets)

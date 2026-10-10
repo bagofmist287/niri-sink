@@ -111,6 +111,30 @@ impl SinkPresentation {
         self.to.position += delta;
     }
 
+    /// Map a native restore origin into a new viewport without restarting its clock.
+    pub fn rebase_view(
+        &mut self,
+        old: Size<f64, Logical>,
+        new: Size<f64, Logical>,
+        source: Size<f64, Logical>,
+    ) {
+        let fit = |view: Size<f64, Logical>| {
+            (view.w / source.w.max(1.))
+                .min(view.h / source.h.max(1.))
+                .clamp(1e-6, 1.)
+        };
+        let from_scale = (self.from.scale * fit(new) / fit(old)).clamp(1e-6, 1.);
+        for (pose, scale) in [(&mut self.from, from_scale), (&mut self.to, 1.)] {
+            let center = pose.position + source.upscale(pose.scale).to_point().downscale(2.);
+            let center = Point::from((
+                center.x / old.w.max(1.) * new.w,
+                center.y / old.h.max(1.) * new.h,
+            ));
+            pose.scale = scale;
+            pose.position = center - source.upscale(scale).to_point().downscale(2.);
+        }
+    }
+
     pub fn finish(&mut self) {
         self.finished = true;
     }

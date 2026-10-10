@@ -128,6 +128,11 @@ the required commit while retaining the original deadline.
 Moving a restoring window or column to another workspace on the same output preserves its
 current displayed pose, including during Overview opening or closing. The move keeps the
 original restore animation progress and commit deadline; it does not acknowledge client commits.
+Moving a restoring window or column to another output discards local Overview coordinates and
+projection buffers from the old output. Changing the viewport maps the native restore origin's
+center and fit into the new viewport, including workspace moves and output resize/rotation.
+Local Overview properties rebuild in the destination's allocation; the native restore clock,
+alpha and processed-commit barrier remain intact. Native window effects keep their usual rules.
 The original transaction deadline bounds an unresponsive client (normally 300 ms); after it expires,
 niri uses the existing degraded resize behavior. Changing focus, locking, unmapping or invalidating
 the restore context cancels the old focus plan, so a late commit cannot steal focus. Selecting the

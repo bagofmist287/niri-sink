@@ -866,6 +866,180 @@ fn overview_restoring_window_workspace_move_keeps_the_displayed_frame() {
 }
 
 #[test]
+fn restoring_output_context_changes_keep_the_window_visible() {
+    for operation in ["window", "column", "workspace", "resize"] {
+        for floating in [false, true] {
+            if operation == "column" && floating {
+                continue;
+            }
+            for overview in [false, true] {
+                for smaller in [false, true] {
+                    if operation == "resize" && !smaller {
+                        continue;
+                    }
+                    let mut config = Config::parse_mem(
+                        r#"
+                    sink { enabled true; }
+                    animations {
+                        window-movement { duration-ms 1000; curve "linear"; }
+                    }
+                    "#,
+                    )
+                    .unwrap();
+                    config.layout.gaps = 0.;
+                    let mut layout =
+                        Layout::<TestWindow>::new(Clock::with_time(Duration::ZERO), &config);
+                    Op::AddOutput(1).apply(&mut layout);
+                    let source = layout.outputs().next().unwrap().clone();
+                    Op::AddOutput(2).apply(&mut layout);
+                    let target = layout
+                        .outputs()
+                        .find(|o| o.name() == "output2")
+                        .unwrap()
+                        .clone();
+                    if smaller {
+                        target.change_current_state(
+                            Some(Mode {
+                                size: (360, 480).into(),
+                                refresh: 60000,
+                            }),
+                            Some(Transform::_90),
+                            Some(output::Scale::Fractional(1.5)),
+                            None,
+                        );
+                        layout.update_output_size(&target);
+                    }
+                    layout.focus_output(&source);
+                    let mut params = TestWindowParams::new(1);
+                    params.is_floating = floating;
+                    Op::AddWindow { params }.apply(&mut layout);
+                    Op::SetForcedSize {
+                        id: 1,
+                        size: Some((300, 200).into()),
+                    }
+                    .apply(&mut layout);
+                    settle_system_layout(&mut layout);
+                    assert!(layout.sink_window());
+                    settle_system_layout(&mut layout);
+                    Op::CompleteAnimations.apply(&mut layout);
+                    if overview {
+                        layout.open_overview();
+                        Op::CompleteAnimations.apply(&mut layout);
+                    }
+                    assert_eq!(layout.pull_window(), Some(1));
+                    Op::AdvanceAnimations { msec_delta: 32 }.apply(&mut layout);
+                    let owner = layout
+                        .windows()
+                        .find(|(_, w)| w.id() == &1)
+                        .unwrap()
+                        .1
+                        .clone();
+                    let before_alpha = {
+                        let (_, _, ws) = layout
+                            .workspaces()
+                            .find(|(_, _, ws)| ws.has_window(&1))
+                            .unwrap();
+                        let (tile, position, _) = ws
+                            .tiles_with_render_positions()
+                            .find(|(t, _, _)| t.window().id() == &1)
+                            .unwrap();
+                        tile.sink_presentation
+                            .as_ref()
+                            .unwrap()
+                            .pose_toward(crate::layout::sink_presentation::SinkPose::normal(
+                                position,
+                            ))
+                            .alpha
+                    };
+                    let generation = layout
+                        .workspaces()
+                        .find(|(_, _, ws)| ws.has_window(&1))
+                        .unwrap()
+                        .2
+                        .tiles()
+                        .find(|t| t.window().id() == &1)
+                        .unwrap()
+                        .sink_generation();
+                    match operation {
+                        "window" => {
+                            layout.move_to_output(Some(&1), &target, None, ActivateWindow::No)
+                        }
+                        "column" => layout.move_column_to_output(&target, None, false),
+                        "workspace" => {
+                            assert!(layout.move_workspace_to_output(&target));
+                        }
+                        "resize" => {
+                            source.change_current_state(
+                                Some(Mode {
+                                    size: (360, 480).into(),
+                                    refresh: 60000,
+                                }),
+                                Some(Transform::_90),
+                                Some(output::Scale::Fractional(1.5)),
+                                None,
+                            );
+                            layout.update_output_size(&source);
+                        }
+                        _ => unreachable!(),
+                    }
+                    // Refresh the destination's shared Overview basis at the same clock time.
+                    Op::AdvanceAnimations { msec_delta: 0 }.apply(&mut layout);
+                    let (_, _, ws) = layout
+                        .workspaces()
+                        .find(|(_, _, ws)| ws.has_window(&1))
+                        .unwrap();
+                    let (tile, position, _) = ws
+                        .tiles_with_render_positions()
+                        .find(|(tile, _, _)| tile.window().id() == &1)
+                        .unwrap();
+                    let pose = ws.sink_restore_pose(tile, position).unwrap();
+                    // Context changes rebuild local Overview properties; the native restore
+                    // alpha, animation clock and client commit state must remain intact.
+                    assert_abs_diff_eq!(
+                        tile.sink_presentation
+                            .as_ref()
+                            .unwrap()
+                            .pose_toward(crate::layout::sink_presentation::SinkPose::normal(
+                                position
+                            ))
+                            .alpha,
+                        before_alpha,
+                        epsilon = 1e-8
+                    );
+                    assert!(tile.sink_overview_presentation.is_none());
+                    let rect = pose.rectangle(tile.animated_tile_size());
+                    let view = ws.view_size();
+                    assert!(rect.loc.x < view.w && rect.loc.x + rect.size.w > 0.
+                    && rect.loc.y < view.h && rect.loc.y + rect.size.h > 0.,
+                    "restoring window lost after {operation}, floating={floating}, overview={overview}, smaller={smaller}: {rect:?}, view={view:?}");
+                    assert_eq!(tile.sink_generation(), generation);
+                    assert!(tile.sink_input_blocked());
+                    assert!(Rc::ptr_eq(&owner.0, &tile.window().0));
+                    assert_eq!(tile.window().size(), Size::from((300, 200)));
+                    layout.verify_invariants();
+                    Op::AdvanceAnimations { msec_delta: 980 }.apply(&mut layout);
+                    let tile = layout
+                        .workspaces()
+                        .find(|(_, _, ws)| ws.has_window(&1))
+                        .unwrap()
+                        .2
+                        .tiles()
+                        .find(|t| t.window().id() == &1)
+                        .unwrap();
+                    assert!(
+                        tile.sink_presentation.as_ref().is_none_or(|p| p.is_done()),
+                        "restore clock restarted after {operation}"
+                    );
+                    settle_system_layout(&mut layout);
+                    Op::CompleteAnimations.apply(&mut layout);
+                    layout.verify_invariants();
+                }
+            }
+        }
+    }
+}
+
+#[test]
 fn overview_lifecycle_interruptions_keep_surviving_owners_and_release_restore_tracks() {
     for animate in [false, true] {
         for closing in [false, true] {
