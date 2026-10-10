@@ -112,6 +112,9 @@ Setting tail height to zero hides the tail hint. There is no Self Blur or mode s
 effects are retained: native window and popup opacity, client alpha, blur (xray and non-xray),
 saturation, noise, effect regions, subsurfaces, borders, corners and shadows. Depth opacity is
 applied once to the combined object. Each capture target has its own cache and retains block-out rules.
+Native opacity and background-effect rules can be reloaded while Overview is opening, closing
+or reflowing a local stack. The additional animation switch does not replace those native rules;
+updated client effect regions and changes underneath the projection use the current lower scene.
 Output recording follows the composed desktop; single-window recording keeps the native source
 without the depth transform. While locked, window recordings clear their buffers and output
 recordings follow the lock screen. Unlocking resumes recording through the existing stream.

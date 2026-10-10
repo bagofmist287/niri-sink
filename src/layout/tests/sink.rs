@@ -718,6 +718,202 @@ fn overview_disabling_additional_animation_finishes_local_tracks_without_changin
 }
 
 #[test]
+fn overview_gesture_reversal_reload_and_release_share_native_progress_without_an_extra_clock() {
+    use crate::layout::sink_presentation::SinkPose;
+
+    fn pose(layout: &Layout<TestWindow>) -> SinkPose {
+        let ws = layout.active_workspace().unwrap();
+        let tile = ws.tiles().find(|tile| tile.window().id() == &1).unwrap();
+        let mut pose = ws.sink_render_pose(0, tile).unwrap();
+        pose.position.y += ws.sink_overview_foreground_offset();
+        pose
+    }
+    fn assert_pose(actual: SinkPose, desktop: SinkPose, expanded: SinkPose, progress: f64) {
+        assert_abs_diff_eq!(
+            actual.position.x,
+            desktop.position.x + (expanded.position.x - desktop.position.x) * progress,
+            epsilon = 1e-8
+        );
+        assert_abs_diff_eq!(
+            actual.position.y,
+            desktop.position.y + (expanded.position.y - desktop.position.y) * progress,
+            epsilon = 1e-8
+        );
+        assert_abs_diff_eq!(
+            actual.scale,
+            (desktop.scale + (expanded.scale - desktop.scale) * progress).max(1e-6),
+            epsilon = 1e-8
+        );
+        assert_abs_diff_eq!(
+            actual.alpha,
+            (desktop.alpha + (expanded.alpha - desktop.alpha) * progress).clamp(0., 1.),
+            epsilon = 1e-8
+        );
+    }
+    for animate in [false, true] {
+        for global_off in [false, true] {
+            for scale in [1.25, 1.5] {
+                let mut config = Config::default();
+                config.sink.enabled = true;
+                config.sink.levels[0].scale = 0.73;
+                config.sink.levels[0].opacity = 0.41;
+                config.overview.sink.animate = animate;
+                config.animations.off = global_off;
+                let mut clock = Clock::with_time(Duration::ZERO);
+                clock.set_complete_instantly(global_off);
+                let mut layout = Layout::<TestWindow>::new(clock, &config);
+                Op::AddOutput(1).apply(&mut layout);
+                let output = layout.active_output().unwrap().clone();
+                output.change_current_state(
+                    None,
+                    None,
+                    Some(output::Scale::Fractional(scale)),
+                    None,
+                );
+                layout.update_output_size(&output);
+                Op::AddWindow {
+                    params: TestWindowParams::new(1),
+                }
+                .apply(&mut layout);
+                Op::SetForcedSize {
+                    id: 1,
+                    size: Some((300, 200).into()),
+                }
+                .apply(&mut layout);
+                settle_system_layout(&mut layout);
+                let owner = layout
+                    .active_workspace()
+                    .unwrap()
+                    .windows()
+                    .next()
+                    .unwrap()
+                    .clone();
+                let size = owner.size();
+                assert!(layout.sink_window());
+                Op::CompleteAnimations.apply(&mut layout);
+                settle_system_layout(&mut layout);
+                Op::CompleteAnimations.apply(&mut layout);
+                let desktop = pose(&layout);
+                layout.open_overview();
+                Op::CompleteAnimations.apply(&mut layout);
+                let expanded = pose(&layout);
+                layout.close_overview();
+                Op::CompleteAnimations.apply(&mut layout);
+
+                layout.clock.set_complete_instantly(global_off);
+                layout.overview_gesture_begin();
+                for (delta, msec) in [(120., 10), (-60., 30)] {
+                    let time = layout.clock.now_unadjusted() + Duration::from_millis(msec);
+                    layout.clock.set_unadjusted(time);
+                    assert_eq!(layout.overview_gesture_update(delta, time), Some(true));
+                    let native_progress = layout.overview_progress.as_ref().unwrap().value();
+                    assert!(native_progress > 0. && native_progress < 1.);
+                    let additional = if animate && !global_off {
+                        native_progress
+                    } else {
+                        1.
+                    };
+                    assert_pose(pose(&layout), desktop, expanded, additional);
+                    let before = pose(&layout);
+                    Op::AdvanceAnimations { msec_delta: 200 }.apply(&mut layout);
+                    assert_pose(pose(&layout), before, before, 0.);
+                    assert_abs_diff_eq!(
+                        layout.overview_progress.as_ref().unwrap().value(),
+                        native_progress,
+                        epsilon = 1e-10
+                    );
+                    let ws = layout.active_workspace().unwrap();
+                    let tile = ws.tiles().next().unwrap();
+                    assert!(tile.sink_overview_presentation.as_ref().unwrap().is_done());
+                    let mon = layout.monitor_for_output(&output).unwrap();
+                    let (_, geo) = mon
+                        .workspaces_with_render_geo()
+                        .find(|(w, _)| w.id() == ws.id())
+                        .unwrap();
+                    let local = ws
+                        .sink_render_pose(0, tile)
+                        .unwrap()
+                        .rectangle(tile.animated_tile_size());
+                    let rendered = Rectangle::new(
+                        geo.loc + local.loc.upscale(mon.overview_zoom()),
+                        local.size.upscale(mon.overview_zoom()),
+                    );
+                    assert!(mon.workspace_bounds(ws, geo).contains_rect(rendered));
+                }
+                let progress = layout.overview_progress.as_ref().unwrap().value();
+                config.overview.sink.animate = false;
+                layout.update_config(&config);
+                assert_abs_diff_eq!(
+                    layout.overview_progress.as_ref().unwrap().value(),
+                    progress,
+                    epsilon = 1e-10
+                );
+                assert_pose(pose(&layout), desktop, expanded, 1.);
+                config.overview.sink.animate = animate;
+                layout.update_config(&config);
+                assert_pose(
+                    pose(&layout),
+                    desktop,
+                    expanded,
+                    if animate && !global_off { progress } else { 1. },
+                );
+                // Idle before releasing makes the reversed, low-progress gesture cancel opening.
+                Op::AdvanceAnimations { msec_delta: 1000 }.apply(&mut layout);
+                assert!(layout.overview_gesture_end());
+                assert!(!layout.is_overview_open());
+                for msec_delta in [16, 32, 200, 1000] {
+                    Op::AdvanceAnimations { msec_delta }.apply(&mut layout);
+                    if let Some(progress) = &layout.overview_progress {
+                        assert_pose(
+                            pose(&layout),
+                            desktop,
+                            expanded,
+                            if animate && !global_off {
+                                progress.value()
+                            } else {
+                                0.
+                            },
+                        );
+                    }
+                }
+                Op::CompleteAnimations.apply(&mut layout);
+                assert_pose(pose(&layout), desktop, desktop, 0.);
+
+                // Release a fast forward gesture above one: the default spring must reuse its
+                // real initial velocity and allocate room for the same scale/alpha interpolation.
+                layout.clock.set_complete_instantly(global_off);
+                layout.overview_gesture_begin();
+                for _ in 0..2 {
+                    let time = layout.clock.now_unadjusted() + Duration::from_millis(10);
+                    layout.clock.set_unadjusted(time);
+                    layout.overview_gesture_update(180., time);
+                }
+                assert!(layout.overview_gesture_end());
+                assert!(layout.is_overview_open());
+                for msec_delta in [16, 32, 100, 400] {
+                    Op::AdvanceAnimations { msec_delta }.apply(&mut layout);
+                    let progress = layout.overview_progress.as_ref().unwrap().value();
+                    assert_pose(
+                        pose(&layout),
+                        desktop,
+                        expanded,
+                        if animate && !global_off { progress } else { 1. },
+                    );
+                    layout.verify_invariants();
+                }
+                Op::CompleteAnimations.apply(&mut layout);
+                assert_pose(pose(&layout), expanded, expanded, 0.);
+                let ws = layout.active_workspace().unwrap();
+                assert_eq!(ws.sink_depth(&1), Some(0));
+                let current = ws.windows().next().unwrap();
+                assert!(Rc::ptr_eq(&owner.0, &current.0));
+                assert_eq!(current.size(), size);
+            }
+        }
+    }
+}
+
+#[test]
 fn overview_drag_moves_original_owner_to_existing_and_new_allocations_without_touching_stacks() {
     use crate::layout::monitor::InsertWorkspace;
 
