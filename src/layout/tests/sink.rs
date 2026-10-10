@@ -1,6 +1,7 @@
 use super::*;
 use crate::layout::sink::{RestorePlacement, SinkEntry, SinkSpace};
 use crate::layout::workspace::Workspace;
+use approx::assert_abs_diff_eq;
 
 fn entry(id: usize) -> SinkEntry<TestWindow> {
     let workspace = Workspace::new_no_outputs(Clock::with_time(Duration::ZERO), Rc::default());
@@ -230,7 +231,12 @@ fn overview_projection_hits_follow_lifo_and_visible_pose_without_input() {
             .workspaces_with_render_geo()
             .find(|(ws, _)| ws.sink_count() == 3)
             .unwrap();
-        let point = center.upscale(mon.overview_zoom()) + geo.loc;
+        // Expanded Overview selects its exposed top entry, not the old desktop projection center.
+        let point = geo.loc
+            + Point::from((
+                ws.view_size().w * mon.overview_zoom() / 2.,
+                -config.overview.sink.entry_height / 2.,
+            ));
         assert_eq!(
             layout
                 .window_under(&output, point)
@@ -246,6 +252,324 @@ fn overview_projection_hits_follow_lifo_and_visible_pose_without_input() {
         layout.close_overview();
         assert!(layout.window_under(&output, point).is_none());
     }
+}
+
+#[test]
+fn overview_expansion_preserves_sources_aligns_foreground_and_limits_tail_hits() {
+    for depth in 1..=4 {
+        for scale in [1., 1.25, 1.5] {
+            for foreground in 0..4 {
+                let mut config = Config::default();
+                config.sink.enabled = true;
+                config.sink.visible_depth = depth;
+                let mut layout =
+                    Layout::<TestWindow>::new(Clock::with_time(Duration::ZERO), &config);
+                Op::AddOutput(1).apply(&mut layout);
+                let output = layout.outputs().next().unwrap().clone();
+                output.change_current_state(
+                    None,
+                    None,
+                    Some(smithay::output::Scale::Fractional(scale)),
+                    None,
+                );
+                layout.update_output_size(&output);
+                for (index, size) in [
+                    (320, 200),
+                    (700, 120),
+                    (200, 650),
+                    (900, 900),
+                    (180, 400),
+                    (600, 300),
+                ]
+                .into_iter()
+                .enumerate()
+                {
+                    let id = index + 1;
+                    let mut params = TestWindowParams::new(id);
+                    params.is_floating = true;
+                    params.bbox = Rectangle::from_size(size.into());
+                    Op::AddWindow { params }.apply(&mut layout);
+                    Op::SetForcedSize {
+                        id,
+                        size: Some(size.into()),
+                    }
+                    .apply(&mut layout);
+                    settle_system_layout(&mut layout);
+                    assert!(layout.sink_window());
+                }
+                if foreground != 0 {
+                    let mut params = TestWindowParams::new(7);
+                    params.is_floating = foreground == 2;
+                    Op::AddWindow { params }.apply(&mut layout);
+                    if foreground == 3 {
+                        layout.set_fullscreen(&7, true);
+                    }
+                    settle_system_layout(&mut layout);
+                }
+                Op::CompleteAnimations.apply(&mut layout);
+                let before: Vec<_> = layout
+                    .windows()
+                    .map(|(_, win)| (*win.id(), win.size(), win.requested_size()))
+                    .collect();
+                assert!(layout.open_overview());
+                Op::CompleteAnimations.apply(&mut layout);
+                let mon = layout.monitor_for_output(&output).unwrap();
+                let (ws, geo) = mon
+                    .workspaces_with_render_geo()
+                    .find(|(ws, _)| ws.sink_count() == 6)
+                    .unwrap();
+                let zoom = mon.overview_zoom();
+                let requested = depth as f64 * 24. + 12.;
+                let fraction = (ws.view_size().h * zoom * 0.4 / requested).min(1.);
+                let mut h = 24. * fraction;
+                for id in (7 - depth..=6).rev() {
+                    let tile = ws.tiles().find(|tile| tile.window().id() == &id).unwrap();
+                    let source = tile.animated_tile_size();
+                    let fit = (ws.view_size().w / source.w)
+                        .min(ws.view_size().h / source.h)
+                        .min(1.);
+                    h = h.min(source.h * fit * zoom);
+                }
+                let extent =
+                    depth as f64 * h + 12. * fraction * (1. - 0.5f64.powi((6 - depth) as i32));
+                assert_abs_diff_eq!(
+                    ws.sink_overview_foreground_offset() * zoom,
+                    extent / 2.,
+                    epsilon = 1e-8
+                );
+                for d in 0..6 {
+                    let id = 6 - d;
+                    let tile = ws.tiles().find(|tile| tile.window().id() == &id).unwrap();
+                    let pose = ws.sink_render_pose(d, tile);
+                    assert_eq!(pose.is_some(), d < depth || d == 5);
+                    if let Some(pose) = pose {
+                        assert_eq!(pose.alpha, 1.);
+                        let rect = pose.rectangle(tile.animated_tile_size());
+                        assert_abs_diff_eq!(
+                            rect.loc.x + rect.size.w / 2.,
+                            ws.view_size().w / 2.,
+                            epsilon = 1e-8
+                        );
+                        if d < depth {
+                            assert_abs_diff_eq!(
+                                rect.loc.y * zoom,
+                                -((d + 1) as f64) * h,
+                                epsilon = 1e-8
+                            );
+                            let point = geo.loc
+                                + Point::from((
+                                    rect.loc.x + rect.size.w / 2.,
+                                    rect.loc.y + h / zoom / 2.,
+                                ))
+                                .upscale(zoom);
+                            assert_eq!(
+                                layout
+                                    .window_under(&output, point)
+                                    .map(|(win, hit)| (*win.id(), hit)),
+                                Some((
+                                    id,
+                                    HitType::Activate {
+                                        is_tab_indicator: false
+                                    }
+                                ))
+                            );
+                            assert_eq!(
+                                mon.workspace_under(point).map(|(ws, _)| ws.id()),
+                                Some(ws.id())
+                            );
+                            assert_eq!(
+                                mon.workspace_under_narrow(point).map(Workspace::id),
+                                Some(ws.id())
+                            );
+                        } else {
+                            // The aggregated tail is a visible hint, never an arbitrary-depth recall.
+                            let point = geo.loc
+                                + Point::from((
+                                    rect.loc.x + rect.size.w / 2.,
+                                    rect.loc.y + 0.1 / zoom,
+                                ))
+                                .upscale(zoom);
+                            assert!(layout.window_under(&output, point).is_none());
+                        }
+                    }
+                }
+                let after: Vec<_> = layout
+                    .windows()
+                    .map(|(_, win)| (*win.id(), win.size(), win.requested_size()))
+                    .collect();
+                assert_eq!(before, after);
+                assert!(layout.window_under(&output, (-1., 20.).into()).is_none());
+                layout.verify_invariants();
+            }
+        }
+    }
+}
+
+#[test]
+fn overview_capacity_covers_empty_workspaces_and_does_not_collapse_on_local_changes() {
+    let mut options = Options::default();
+    options.sink.enabled = true;
+    let mut layout = Layout::with_options(Clock::with_time(Duration::ZERO), options);
+    Op::AddOutput(1).apply(&mut layout);
+    Op::AddWindow {
+        params: TestWindowParams::new(1),
+    }
+    .apply(&mut layout);
+    settle_system_layout(&mut layout);
+    layout.open_overview();
+    Op::CompleteAnimations.apply(&mut layout);
+    let output = layout.outputs().next().unwrap().clone();
+    let geos_before: Vec<_> = layout
+        .monitor_for_output(&output)
+        .unwrap()
+        .workspaces_render_geo()
+        .collect();
+    assert!(layout.sink_window());
+    let mon = layout.monitor_for_output(&output).unwrap();
+    let geos_after: Vec<_> = mon.workspaces_render_geo().collect();
+    assert_eq!(geos_before.len(), geos_after.len());
+    // The first Sink changes only that card's foreground displacement. Other origins stay put.
+    for (idx, ws) in mon.workspaces.iter().enumerate() {
+        if ws.sink_count() == 0 {
+            assert_eq!(geos_before[idx], geos_after[idx]);
+        }
+    }
+    let (ws, geo) = mon
+        .workspaces_with_render_geo()
+        .find(|(ws, _)| ws.sink_count() != 0)
+        .unwrap();
+    let bounds = mon.workspace_bounds(ws, geo);
+    let id = ws.id();
+    assert!(layout.pull_window().is_some());
+    assert!(layout.is_overview_open());
+    let mon = layout.monitor_for_output(&output).unwrap();
+    let (ws, geo) = mon
+        .workspaces_with_render_geo()
+        .find(|(ws, _)| ws.id() == id)
+        .unwrap();
+    let empty_bounds = mon.workspace_bounds(ws, geo);
+    assert_abs_diff_eq!(empty_bounds.loc.y, bounds.loc.y, epsilon = 1e-8);
+    assert_eq!(empty_bounds.size, bounds.size);
+    layout.verify_invariants();
+}
+
+#[test]
+fn overview_small_mixed_outputs_share_allocations_with_navigation_and_drop() {
+    use crate::layout::monitor::InsertWorkspace;
+
+    let mut options = Options::default();
+    options.sink.enabled = true;
+    options.sink.visible_depth = 4;
+    options.overview.sink.entry_height = 256.;
+    options.overview.sink.tail_height = 256.;
+    let mut layout = Layout::with_options(Clock::with_time(Duration::ZERO), options);
+    for out in 1..=2 {
+        Op::AddOutput(out).apply(&mut layout);
+        let output = layout
+            .outputs()
+            .find(|o| o.name() == format!("output{out}"))
+            .unwrap()
+            .clone();
+        output.change_current_state(
+            Some(smithay::output::Mode {
+                size: (320, 240).into(),
+                refresh: 60000,
+            }),
+            None,
+            Some(output::Scale::Fractional(if out == 1 { 1.25 } else { 1.5 })),
+            None,
+        );
+        layout.update_output_size(&output);
+        layout.focus_output(&output);
+        for group in 0..3 {
+            for n in 0..3 {
+                let id = out * 100 + group * 10 + n;
+                Op::AddWindow {
+                    params: TestWindowParams::new(id),
+                }
+                .apply(&mut layout);
+                settle_system_layout(&mut layout);
+                if group % 2 == 0 {
+                    assert!(layout.sink_window());
+                }
+            }
+            layout.switch_workspace_down();
+            Op::CompleteAnimations.apply(&mut layout);
+        }
+    }
+    assert!(layout.open_overview());
+    Op::CompleteAnimations.apply(&mut layout);
+    let outputs: Vec<_> = layout.outputs().cloned().collect();
+    for output in &outputs {
+        layout.focus_output(output);
+        for selected in 0..3 {
+            layout.switch_workspace(selected);
+            Op::CompleteAnimations.apply(&mut layout);
+            let mon = layout.monitor_for_output(output).unwrap();
+            let cells: Vec<_> = mon
+                .workspaces_with_render_geo()
+                .map(|(ws, geo)| (ws.id(), geo, mon.workspace_bounds(ws, geo)))
+                .collect();
+            for (id, geo, bounds) in &cells {
+                let point = bounds.loc + bounds.size.to_point().downscale(2.);
+                let (target, drop_geo) = mon.insert_position(point);
+                assert!(matches!(target, InsertWorkspace::Existing(ws) if ws == *id));
+                assert_eq!(drop_geo, *geo);
+                if Rectangle::from_size(mon.workspaces[0].view_size()).contains(point) {
+                    assert_eq!(mon.workspace_under(point).map(|(ws, _)| ws.id()), Some(*id));
+                    assert_eq!(
+                        mon.workspace_under_narrow(point).map(Workspace::id),
+                        Some(*id)
+                    );
+                }
+            }
+            for pair in cells.windows(2) {
+                let bottom = pair[0].2.loc.y + pair[0].2.size.h;
+                let top = pair[1].2.loc.y;
+                assert!(top > bottom, "allocated Sink cells overlap: {cells:?}");
+                let point =
+                    Point::from((pair[0].1.loc.x + pair[0].1.size.w / 2., (bottom + top) / 2.));
+                let next_idx = mon
+                    .workspaces
+                    .iter()
+                    .position(|ws| ws.id() == pair[1].0)
+                    .unwrap();
+                assert_eq!(
+                    mon.insert_position(point).0,
+                    InsertWorkspace::NewAt(next_idx)
+                );
+            }
+            layout.verify_invariants();
+        }
+    }
+}
+
+#[test]
+fn overview_tail_keeps_native_animation_live_only_while_visible() {
+    let mut options = Options::default();
+    options.sink.enabled = true;
+    let mut layout = Layout::with_options(Clock::with_time(Duration::ZERO), options);
+    Op::AddOutput(1).apply(&mut layout);
+    for id in 1..=4 {
+        let mut params = TestWindowParams::new(id);
+        if id == 1 {
+            params.rules = Some(ResolvedWindowRules {
+                baba_is_float: Some(true),
+                ..Default::default()
+            });
+        }
+        Op::AddWindow { params }.apply(&mut layout);
+        settle_system_layout(&mut layout);
+        assert!(layout.sink_window());
+    }
+    Op::CompleteAnimations.apply(&mut layout);
+    assert!(!layout.active_workspace().unwrap().are_animations_ongoing());
+    layout.open_overview();
+    Op::CompleteAnimations.apply(&mut layout);
+    assert!(layout.active_workspace().unwrap().are_animations_ongoing());
+    layout.close_overview();
+    Op::CompleteAnimations.apply(&mut layout);
+    assert!(!layout.active_workspace().unwrap().are_animations_ongoing());
 }
 
 #[test]

@@ -490,6 +490,26 @@ impl<W: LayoutElement> Tile<W> {
         self.projection_buffer.borrow_mut().take();
     }
 
+    /// Native decoration extent used to reserve Overview space before the first frame.
+    pub(super) fn sink_chrome_padding(&self) -> f64 {
+        let shadow = self
+            .options
+            .layout
+            .shadow
+            .merged_with(&self.window.rules().shadow);
+        let shadow_extent = if shadow.on {
+            shadow.softness * 1.5
+                + shadow.spread.abs()
+                + shadow.offset.x.0.abs().max(shadow.offset.y.0.abs())
+        } else {
+            0.
+        };
+        let buffer = self.window.buf_loc();
+        shadow_extent
+            .max(self.visual_border_width().unwrap_or(0.))
+            .max(buffer.x.unsigned_abs().max(buffer.y.unsigned_abs()) as f64)
+    }
+
     pub fn are_animations_ongoing(&self) -> bool {
         self.are_transitions_ongoing() || self.window.rules().baba_is_float == Some(true)
     }

@@ -335,6 +335,12 @@ impl Animation {
             Kind::Spring(spring) => {
                 // Damping cannot add mechanical energy. This also handles a reversal and a
                 // gesture release; [0, 2] only bounds a unit spring starting from rest.
+                if spring.initial_velocity == 0.
+                    && spring.params.damping
+                        >= 2. * (spring.params.mass * spring.params.stiffness).sqrt()
+                {
+                    return endpoints;
+                }
                 let displacement = spring.from - spring.to;
                 let radius = (displacement * displacement
                     + spring.initial_velocity.powi(2) * spring.params.mass

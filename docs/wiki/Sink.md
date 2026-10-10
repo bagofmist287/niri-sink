@@ -2,8 +2,8 @@
 
 This feature is specific to the personal `niri-sink` fork. It is disabled by default.
 The implementation keeps the original live window and projects it behind normal windows.
-It is an experimental basic MVP. The expanded Sink Overview, native hardware qualification and
-personal daily-use confirmation remain later stages.
+It remains experimental. Overview now expands the background stack; local transition refinement,
+native hardware qualification and personal daily-use confirmation are still in progress.
 
 Enable it explicitly:
 
@@ -32,8 +32,12 @@ through that window and closes Overview onto its workspace. Hover and press rema
 confirmation happens on release and still waits for the normal Pull input barrier. Moving beyond
 the tap threshold, cancelling a touch, adding another touch or losing the selection context cancels
 confirmation. Background projections do not receive normal client pointer or touch input.
-Fully covered or hidden members remain accessible through MRU or explicit window ID; the complete
-expanded Overview is a later stage.
+Overview centers previews horizontally and shifts the foreground down with the stack. The first
+`visible-depth` members expose top strips for selection. Older members have one bounded visual tail
+hint; that hint does not select an arbitrary hidden window. Hidden members remain accessible through
+MRU or explicit window ID. Normal, floating and fullscreen foreground windows keep their Z priority.
+Expansion fits each native source without resizing it. Space is reserved for empty workspaces too,
+so the first Sink does not change the other workspaces' spacing.
 
 Both actions do nothing when disabled, locked, grabbed, conflicting with another input owner or
 an interactive move/resize, or when their target is absent. Sink rejects windows already in transient families. When a newly mapped child or a changed parent
@@ -72,8 +76,7 @@ The projection fits inside the working area, stays centered and scales the compl
 Depth scale does not resize the client. Members beyond `visible-depth` stay owned by the workspace
 but release their projection resources after fading out. Pull reveals them again.
 
-The following Overview settings are parsed for the later expansion stage, and do not yet add
-Overview behavior:
+The additional Overview presentation can be configured separately:
 
 ```kdl
 overview {
@@ -86,8 +89,12 @@ overview {
 }
 ```
 
-`animate` is the sole switch for additional Sink animation. Entry height accepts 1–256, tail height
-0–256, and tail decay 0.01–0.99. There is no Self Blur or mode setting. Native opacity and background
+`animate` is the sole switch for additional Sink animation. When enabled, the additional geometry
+and depth opacity follow niri's existing Overview progress. When disabled, they switch immediately
+to the same endpoint; niri's own Overview animation still follows its normal settings. Entry height
+accepts 1–256, tail height 0–256, and tail decay 0.01–0.99. These heights are final Overview logical
+pixels. Small outputs limit the total budget; short sources can reduce the exposed strips together.
+Setting tail height to zero hides the tail hint. There is no Self Blur or mode setting. Native opacity and background
 effects are retained: native window and popup opacity, client alpha, blur (xray and non-xray),
 saturation, noise, effect regions, subsurfaces, borders, corners and shadows. Depth opacity is
 applied once to the combined object. Each capture target has its own cache and retains block-out rules.

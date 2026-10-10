@@ -12,6 +12,7 @@ use smithay::utils::{Logical, Point, Rectangle, Size};
 
 use super::insert_hint_element::{InsertHintElement, InsertHintRenderElement};
 use super::scrolling::{Column, ColumnWidth};
+use super::sink_overview::{SinkOverviewBudget, SinkOverviewFrame, SinkOverviewOutputSnapshot};
 use super::tile::Tile;
 use super::workspace::{
     compute_working_area, OutputId, Workspace, WorkspaceAddWindowTarget, WorkspaceId,
@@ -81,6 +82,7 @@ pub struct Monitor<W: LayoutElement> {
     pub(super) overview_open: bool,
     /// Progress of the overview zoom animation, 1 is fully in overview.
     overview_progress: Option<OverviewProgress>,
+    sink_overview_snapshot: Option<Rc<SinkOverviewOutputSnapshot>>,
     /// Clock for driving animations.
     pub(super) clock: Clock,
     /// Configurable properties of the layout as received from the parent layout.
@@ -342,6 +344,7 @@ impl<W: LayoutElement> Monitor<W> {
             insert_hint_render_loc: None,
             overview_open: false,
             overview_progress: None,
+            sink_overview_snapshot: None,
             workspace_switch: None,
             clock,
             base_options,
@@ -1147,18 +1150,27 @@ impl<W: LayoutElement> Monitor<W> {
                 InsertWorkspace::NewAt(ws_idx) => {
                     let scale = self.scale.fractional_scale();
                     let zoom = self.overview_zoom();
-                    let gap = self.workspace_gap(zoom);
+                    let gap = round_logical_in_physical_max1(scale, self.view_size.h * 0.1 * zoom);
 
                     let hint_gap = round_logical_in_physical(scale, gap * 0.1);
                     let hint_height = gap - hint_gap * 2.;
 
                     let next_ws_geo = self.workspaces_render_geo().nth(ws_idx).unwrap();
+                    let next_top = self.workspaces.get(ws_idx).map_or_else(
+                        || {
+                            next_ws_geo.loc.y
+                                - self.sink_overview_snapshot.as_ref().map_or(0., |snapshot| {
+                                    snapshot.reserved.top * zoom / snapshot.zoom
+                                })
+                        },
+                        |ws| self.workspace_bounds(ws, next_ws_geo).loc.y,
+                    );
                     let hint_width = round_logical_in_physical(scale, next_ws_geo.size.w * 0.75);
                     let hint_x =
                         round_logical_in_physical(scale, (next_ws_geo.size.w - hint_width) / 2.);
 
                     let hint_loc_diff = Point::from((-hint_x, hint_height + hint_gap));
-                    let hint_loc = next_ws_geo.loc - hint_loc_diff;
+                    let hint_loc = Point::from((next_ws_geo.loc.x, next_top)) - hint_loc_diff;
                     let hint_size = Size::from((hint_width, hint_height));
 
                     // Sometimes the hint ends up 1 px wider than necessary and/or 1 px
@@ -1209,6 +1221,7 @@ impl<W: LayoutElement> Monitor<W> {
 
         self.base_options = base_options;
         self.options = options;
+        self.update_sink_overview_frame();
     }
 
     pub fn update_layout_config(&mut self, layout_config: Option<niri_config::LayoutPart>) -> bool {
@@ -1238,6 +1251,7 @@ impl<W: LayoutElement> Monitor<W> {
         for ws in &mut self.workspaces {
             ws.update_output_size();
         }
+        self.update_sink_overview_frame();
     }
 
     pub fn move_workspace_down(&mut self) {
@@ -1362,7 +1376,10 @@ impl<W: LayoutElement> Monitor<W> {
 
     fn workspace_gap(&self, zoom: f64) -> f64 {
         let scale = self.scale.fractional_scale();
-        let gap = self.view_size.h * 0.1 * zoom;
+        let extra = self.sink_overview_snapshot.as_ref().map_or(0., |snapshot| {
+            (snapshot.reserved.top + snapshot.reserved.bottom) * zoom / snapshot.zoom
+        });
+        let gap = self.view_size.h * 0.1 * zoom + extra;
         round_logical_in_physical_max1(scale, gap)
     }
 
@@ -1379,6 +1396,7 @@ impl<W: LayoutElement> Monitor<W> {
     pub(super) fn set_overview_progress(&mut self, progress: Option<&super::OverviewProgress>) {
         let prev_render_idx = self.workspace_render_idx();
         self.overview_progress = progress.map(OverviewProgress::from);
+        self.update_sink_overview_frame();
         let new_render_idx = self.workspace_render_idx();
 
         // If the view jumped (can happen when going from corrected to uncorrected render_idx, for
@@ -1395,6 +1413,106 @@ impl<W: LayoutElement> Monitor<W> {
     #[cfg(test)]
     pub(super) fn overview_progress_value(&self) -> Option<f64> {
         self.overview_progress.as_ref().map(|p| p.value())
+    }
+
+    fn update_sink_overview_frame(&mut self) {
+        let Some(progress) = self
+            .overview_progress
+            .as_ref()
+            .filter(|_| self.options.sink.enabled)
+        else {
+            self.sink_overview_snapshot = None;
+            for ws in &mut self.workspaces {
+                ws.set_sink_overview_frame(None);
+            }
+            return;
+        };
+        let zoom = compute_overview_zoom(&self.options, Some(1.));
+        let preview = self.view_size.upscale(zoom);
+        let budget = SinkOverviewBudget::new(
+            self.options.overview.sink,
+            self.options.sink.visible_depth,
+            preview.h * 0.4,
+        );
+        let range = if self.options.overview.sink.animate && !self.options.animations.off {
+            match progress {
+                OverviewProgress::Animation(anim) => anim.value_range(),
+                OverviewProgress::Value(value) => (0f64.min(*value), 1f64.max(*value)),
+            }
+        } else {
+            (0., 1.)
+        };
+        let chrome = self
+            .workspaces
+            .iter()
+            .flat_map(|ws| ws.tiles())
+            .map(Tile::sink_chrome_padding)
+            .fold(0f64, f64::max)
+            * zoom;
+        let mut snapshot = SinkOverviewOutputSnapshot {
+            view_size: self.view_size,
+            zoom,
+            scale: self.scale.fractional_scale(),
+            budget,
+            reserved: budget.reserve(preview, range, chrome),
+        };
+        if let Some(previous) = self.sink_overview_snapshot.as_ref().filter(|previous| {
+            previous.view_size == snapshot.view_size
+                && previous.zoom == snapshot.zoom
+                && previous.scale == snapshot.scale
+                && previous.budget == snapshot.budget
+        }) {
+            // Keep capacity for the whole round, including when an opening spring completes,
+            // a local stack empties, or a smaller source closes. These cannot collapse spacing.
+            snapshot.reserved.top = snapshot.reserved.top.max(previous.reserved.top);
+            snapshot.reserved.bottom = snapshot.reserved.bottom.max(previous.reserved.bottom);
+            snapshot.reserved.left = snapshot.reserved.left.max(previous.reserved.left);
+            snapshot.reserved.right = snapshot.reserved.right.max(previous.reserved.right);
+        }
+        if self
+            .sink_overview_snapshot
+            .as_ref()
+            .is_none_or(|previous| **previous != snapshot)
+        {
+            self.sink_overview_snapshot = Some(Rc::new(snapshot));
+        }
+        let progress = if !self.options.overview.sink.animate || self.options.animations.off {
+            f64::from(self.overview_open)
+        } else {
+            progress.value()
+        };
+        let frame = SinkOverviewFrame {
+            output: self.sink_overview_snapshot.as_ref().unwrap().clone(),
+            progress,
+        };
+        for ws in &mut self.workspaces {
+            ws.set_sink_overview_frame(Some(frame.clone()));
+        }
+    }
+
+    /// Allocated cell including Sink/chrome area. `geo` retains the common foreground origin.
+    pub(super) fn workspace_bounds(
+        &self,
+        ws: &Workspace<W>,
+        geo: Rectangle<f64, Logical>,
+    ) -> Rectangle<f64, Logical> {
+        let Some(snapshot) = self.sink_overview_snapshot.as_ref() else {
+            return geo;
+        };
+        let zoom = self.overview_zoom();
+        let factor = zoom / snapshot.zoom;
+        Rectangle::new(
+            geo.loc
+                - Point::from((
+                    snapshot.reserved.left * factor,
+                    snapshot.reserved.top * factor + ws.sink_overview_foreground_offset() * zoom,
+                )),
+            geo.size
+                + Size::from((
+                    (snapshot.reserved.left + snapshot.reserved.right) * factor,
+                    (snapshot.reserved.top + snapshot.reserved.bottom) * factor,
+                )),
+        )
     }
 
     pub fn workspace_render_idx(&self) -> f64 {
@@ -1472,7 +1590,7 @@ impl<W: LayoutElement> Monitor<W> {
         }
     }
 
-    pub fn workspaces_render_geo(&self) -> impl Iterator<Item = Rectangle<f64, Logical>> {
+    pub fn workspaces_render_geo(&self) -> impl Iterator<Item = Rectangle<f64, Logical>> + '_ {
         let scale = self.scale.fractional_scale();
         let zoom = self.overview_zoom();
 
@@ -1491,7 +1609,11 @@ impl<W: LayoutElement> Monitor<W> {
         // Return position for one-past-last workspace too.
         (0..=self.workspaces.len()).map(move |idx| {
             let y = first_ws_y + idx as f64 * ws_height_with_gap;
-            let loc = Point::from((0., y)) + static_offset;
+            let offset = self
+                .workspaces
+                .get(idx)
+                .map_or(0., |ws| ws.sink_overview_foreground_offset() * zoom);
+            let loc = Point::from((0., y + offset)) + static_offset;
 
             // Even though all components that go into loc are rounded to physical pixels, the
             // floating point addition may lose precision. This can result for example in the
@@ -1512,7 +1634,13 @@ impl<W: LayoutElement> Monitor<W> {
         let geo = self.workspaces_render_geo();
         zip(self.workspaces.iter(), geo)
             // Cull out workspaces outside the output.
-            .filter(move |(_ws, geo)| !cull || geo.intersection(output_geo).is_some())
+            .filter(move |(ws, geo)| {
+                !cull
+                    || self
+                        .workspace_bounds(ws, *geo)
+                        .intersection(output_geo)
+                        .is_some()
+            })
     }
 
     pub fn workspaces_with_render_geo(
@@ -1529,7 +1657,11 @@ impl<W: LayoutElement> Monitor<W> {
         let geo = self.workspaces_render_geo();
         zip(self.workspaces.iter().enumerate(), geo)
             // Cull out workspaces outside the output.
-            .filter(move |(_ws, geo)| geo.intersection(output_geo).is_some())
+            .filter(move |((_, ws), geo)| {
+                self.workspace_bounds(ws, *geo)
+                    .intersection(output_geo)
+                    .is_some()
+            })
     }
 
     pub fn workspaces_with_render_geo_mut(
@@ -1538,20 +1670,28 @@ impl<W: LayoutElement> Monitor<W> {
     ) -> impl Iterator<Item = (&mut Workspace<W>, Rectangle<f64, Logical>)> {
         let output_geo = Rectangle::from_size(self.view_size);
 
-        let geo = self.workspaces_render_geo();
-        zip(self.workspaces.iter_mut(), geo)
+        let geos: Vec<_> = self.workspaces_render_geo().collect();
+        let bounds: Vec<_> = zip(self.workspaces.iter(), &geos)
+            .map(|(ws, geo)| self.workspace_bounds(ws, *geo))
+            .collect();
+        zip(zip(self.workspaces.iter_mut(), geos), bounds)
             // Cull out workspaces outside the output.
-            .filter(move |(_ws, geo)| !cull || geo.intersection(output_geo).is_some())
+            .filter(move |(_, bounds)| !cull || bounds.intersection(output_geo).is_some())
+            .map(|(pair, _)| pair)
     }
 
     pub fn workspace_under(
         &self,
         pos_within_output: Point<f64, Logical>,
     ) -> Option<(&Workspace<W>, Rectangle<f64, Logical>)> {
+        if !Rectangle::from_size(self.view_size).contains(pos_within_output) {
+            return None;
+        }
         let (ws, geo) = self.workspaces_with_render_geo().find_map(|(ws, geo)| {
             // Extend width to entire output.
-            let loc = Point::from((0., geo.loc.y));
-            let size = Size::from((self.view_size.w, geo.size.h));
+            let bounds = self.workspace_bounds(ws, geo);
+            let loc = Point::from((0., bounds.loc.y));
+            let size = Size::from((self.view_size.w, bounds.size.h));
             let bounds = Rectangle::new(loc, size);
 
             bounds.contains(pos_within_output).then_some((ws, geo))
@@ -1563,8 +1703,14 @@ impl<W: LayoutElement> Monitor<W> {
         &self,
         pos_within_output: Point<f64, Logical>,
     ) -> Option<&Workspace<W>> {
-        self.workspaces_with_render_geo()
-            .find_map(|(ws, geo)| geo.contains(pos_within_output).then_some(ws))
+        if !Rectangle::from_size(self.view_size).contains(pos_within_output) {
+            return None;
+        }
+        self.workspaces_with_render_geo().find_map(|(ws, geo)| {
+            self.workspace_bounds(ws, geo)
+                .contains(pos_within_output)
+                .then_some(ws)
+        })
     }
 
     pub fn window_under(&self, pos_within_output: Point<f64, Logical>) -> Option<(&W, HitType)> {
@@ -1608,7 +1754,8 @@ impl<W: LayoutElement> Monitor<W> {
         let ((idx, ws), geo) = iter.next().unwrap();
 
         // Check if above first.
-        if pos_within_output.y < geo.loc.y {
+        let first_bounds = self.workspace_bounds(ws, geo);
+        if pos_within_output.y < first_bounds.loc.y {
             return (InsertWorkspace::NewAt(idx), dummy);
         }
 
@@ -1617,27 +1764,30 @@ impl<W: LayoutElement> Monitor<W> {
         };
 
         // Check first.
-        if contains(geo) {
+        if contains(first_bounds) {
             return (InsertWorkspace::Existing(ws.id()), geo);
         }
 
         let mut last_geo = geo;
+        let mut last_bounds = first_bounds;
         let mut last_idx = idx;
         for ((idx, ws), geo) in iter {
+            let bounds = self.workspace_bounds(ws, geo);
             // Check gap above.
-            let gap_loc = Point::from((last_geo.loc.x, last_geo.loc.y + last_geo.size.h));
-            let gap_size = Size::from((geo.size.w, geo.loc.y - gap_loc.y));
+            let gap_loc = Point::from((last_geo.loc.x, last_bounds.loc.y + last_bounds.size.h));
+            let gap_size = Size::from((geo.size.w, bounds.loc.y - gap_loc.y));
             let gap_geo = Rectangle::new(gap_loc, gap_size);
             if contains(gap_geo) {
                 return (InsertWorkspace::NewAt(idx), dummy);
             }
 
             // Check workspace itself.
-            if contains(geo) {
+            if contains(bounds) {
                 return (InsertWorkspace::Existing(ws.id()), geo);
             }
 
             last_geo = geo;
+            last_bounds = bounds;
             last_idx = idx;
         }
 
@@ -1750,6 +1900,19 @@ impl<W: LayoutElement> Monitor<W> {
                 };
 
             for (ws, geo) in self.workspaces_with_render_geo_cull(cull) {
+                let crop_bounds = if cull && self.sink_overview_snapshot.is_some() {
+                    let bounds = self.workspace_bounds(ws, geo);
+                    // Crop precedes monitor zoom/relocation; use workspace coordinates.
+                    let top = (bounds.loc.y - geo.loc.y) / zoom;
+                    let crop_top = (top * scale).floor() as i32;
+                    let crop_bottom = ((top + bounds.size.h / zoom) * scale).ceil() as i32;
+                    Rectangle::new(
+                        Point::from((-i32::MAX / 2, crop_top)),
+                        Size::from((i32::MAX, crop_bottom.saturating_sub(crop_top))),
+                    )
+                } else {
+                    crop_bounds
+                };
                 // Macro instead of closure because ws and insert hint have different elem types.
                 macro_rules! push {
                     () => {{

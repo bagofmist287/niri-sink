@@ -3,6 +3,7 @@
 //! The same rectangles must feed rendering and passive input. Converting the resulting poses
 //! back to workspace coordinates is the only place that divides by the Overview zoom.
 use smithay::utils::{Logical, Point, Rectangle, Size};
+use std::rc::Rc;
 
 use super::sink_presentation::SinkPose;
 
@@ -27,12 +28,31 @@ impl Overhang {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct SinkOverviewBudget {
     pub visible_depth: usize,
     pub entry_height: f64,
     pub tail_height: f64,
     tail_decay: f64,
+}
+
+/// A capacity snapshot shared by all workspaces on one output, including empty workspaces.
+/// It stays independent of stack counts. Output/config/curve changes replace this object.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SinkOverviewOutputSnapshot {
+    pub view_size: Size<f64, Logical>,
+    pub zoom: f64,
+    pub scale: f64,
+    pub budget: SinkOverviewBudget,
+    /// In final Overview pixels. Rendering and input use the same allocation.
+    pub reserved: Overhang,
+}
+
+#[derive(Debug, Clone)]
+pub struct SinkOverviewFrame {
+    pub output: Rc<SinkOverviewOutputSnapshot>,
+    /// Existing Overview progress; no additional opening clock.
+    pub progress: f64,
 }
 
 impl SinkOverviewBudget {
