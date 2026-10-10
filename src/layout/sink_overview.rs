@@ -48,6 +48,16 @@ pub struct SinkOverviewOutputSnapshot {
     pub reserved: Overhang,
 }
 
+impl SinkOverviewOutputSnapshot {
+    /// Chrome/curve reservations can grow without changing the native coordinate basis.
+    pub fn same_geometry_basis(&self, other: &Self) -> bool {
+        self.view_size == other.view_size
+            && self.zoom == other.zoom
+            && self.scale == other.scale
+            && self.budget == other.budget
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct SinkOverviewFrame {
     pub output: Rc<SinkOverviewOutputSnapshot>,

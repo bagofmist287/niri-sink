@@ -607,14 +607,22 @@ impl<W: LayoutElement> Workspace<W> {
     }
 
     pub(super) fn set_sink_overview_frame(&mut self, frame: Option<SinkOverviewFrame>) {
-        self.sink_overview_frame = frame;
-        if self.sink_overview_frame.is_none() {
+        let changed_basis = match (&self.sink_overview_frame, &frame) {
+            (Some(old), Some(new)) => !old.output.same_geometry_basis(&new.output),
+            _ => true,
+        };
+        if changed_basis {
+            // Old local endpoints cannot be interpolated inside a new, potentially smaller
+            // allocation. Rebuild only the local geometry; keep native restore/commit state and
+            // the existing global Overview progress.
             self.sink_overview_snapshot.borrow_mut().take();
             self.sink_overview_foreground = None;
             for tile in self.tiles_mut() {
                 tile.sink_overview_presentation = None;
             }
-        } else {
+        }
+        self.sink_overview_frame = frame;
+        if self.sink_overview_frame.is_some() {
             self.retarget_sink_overview_presentations();
         }
     }

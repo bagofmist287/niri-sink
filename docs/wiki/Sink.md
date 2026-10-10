@@ -38,6 +38,9 @@ hint; that hint does not select an arbitrary hidden window. Hidden members remai
 MRU or explicit window ID. Normal, floating and fullscreen foreground windows keep their Z priority.
 Expansion fits each native source without resizing it. Space is reserved for empty workspaces too,
 so the first Sink does not change the other workspaces' spacing.
+Dragging an ordinary window to another workspace, output or the gap for a new workspace keeps
+the original Sink stacks in place. Drag-and-drop hold over a background entry may select its
+workspace and close Overview, but never recalls that entry.
 
 Sink and Pull keep Overview open. They start from the current displayed pose, including when
 reversing an unfinished restore, and move only that workspace's stack and foreground. Local
@@ -46,6 +49,9 @@ reflow uses the configured `window-movement` animation with its additional progr
 Overview progress, including its spring/gesture behavior. Turning the additional animation off
 finishes the local properties immediately; the native restore animation and processed-commit input
 barrier remain in force. Clicking a background entry still starts closing Overview immediately.
+Changing output size, scale or the expansion budget rebuilds the additional local coordinates
+inside the new allocation, without replaying Overview opening or restarting the native restore
+and processed-commit barrier.
 
 Both actions do nothing when disabled, locked, grabbed, conflicting with another input owner or
 an interactive move/resize, or when their target is absent. Sink rejects windows already in transient families. When a newly mapped child or a changed parent

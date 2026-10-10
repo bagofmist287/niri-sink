@@ -718,6 +718,313 @@ fn overview_disabling_additional_animation_finishes_local_tracks_without_changin
 }
 
 #[test]
+fn overview_drag_moves_original_owner_to_existing_and_new_allocations_without_touching_stacks() {
+    use crate::layout::monitor::InsertWorkspace;
+
+    fn focus_named(layout: &mut Layout<TestWindow>, name: &str) {
+        let mon = layout.monitor_for_workspace(name).unwrap();
+        let output = mon.output().clone();
+        let idx = mon
+            .workspaces
+            .iter()
+            .position(|ws| ws.name().map(String::as_str) == Some(name))
+            .unwrap();
+        layout.focus_output(&output);
+        layout.switch_workspace(idx);
+        Op::CompleteAnimations.apply(layout);
+    }
+    for floating in [false, true] {
+        for mode_size in [(320, 240), (1280, 720)] {
+            for scale in [1.25, 1.5] {
+                for destination in 0..3 {
+                    let mut config = Config::parse_mem(
+                        r#"
+                        sink { enabled true; visible-depth 4; }
+                        overview { sink { entry-height 256; tail-height 256; }; }
+                        workspace "source" { open-on-output "output1"; }
+                        workspace "empty" { open-on-output "output1"; }
+                        workspace "target" { open-on-output "output2"; }
+                    "#,
+                    )
+                    .unwrap();
+                    config.layout.gaps = 0.;
+                    let mut layout =
+                        Layout::<TestWindow>::new(Clock::with_time(Duration::ZERO), &config);
+                    for id in 1..=2 {
+                        Op::AddOutput(id).apply(&mut layout);
+                        let output = layout
+                            .outputs()
+                            .find(|o| o.name() == format!("output{id}"))
+                            .unwrap()
+                            .clone();
+                        output.change_current_state(
+                            Some(Mode {
+                                size: mode_size.into(),
+                                refresh: 60000,
+                            }),
+                            Some(if id == 1 {
+                                Transform::Normal
+                            } else {
+                                Transform::_90
+                            }),
+                            Some(output::Scale::Fractional(scale)),
+                            None,
+                        );
+                        layout.update_output_size(&output);
+                    }
+                    for (name, ids) in [("source", [1, 2]), ("target", [9, 10])] {
+                        focus_named(&mut layout, name);
+                        for id in ids {
+                            Op::AddWindow {
+                                params: TestWindowParams::new(id),
+                            }
+                            .apply(&mut layout);
+                            settle_system_layout(&mut layout);
+                            assert!(layout.sink_window());
+                        }
+                    }
+                    focus_named(&mut layout, "source");
+                    let source_id = layout.active_workspace().unwrap().id();
+                    let mut params = TestWindowParams::new(7);
+                    params.is_floating = floating;
+                    params.bbox = Rectangle::from_size((4096, 600).into());
+                    Op::AddWindow { params }.apply(&mut layout);
+                    Op::SetForcedSize {
+                        id: 7,
+                        size: Some((4096, 600).into()),
+                    }
+                    .apply(&mut layout);
+                    settle_system_layout(&mut layout);
+                    layout.open_overview();
+                    Op::CompleteAnimations.apply(&mut layout);
+                    let source_output = layout.active_output().unwrap().clone();
+                    let source_mon = layout.monitor_for_output(&source_output).unwrap();
+                    let source_ws = layout.active_workspace().unwrap();
+                    let before = source_ws
+                        .tiles()
+                        .find(|t| t.window().id() == &7)
+                        .unwrap()
+                        .window()
+                        .clone();
+                    let view = source_ws.view_size();
+                    let start = (0..view.h as i32)
+                        .step_by(2)
+                        .find_map(|y| {
+                            (0..view.w as i32)
+                                .step_by(2)
+                                .map(|x| Point::from((x as f64, y as f64)))
+                                .find(|p| {
+                                    layout
+                                        .window_under(&source_output, *p)
+                                        .is_some_and(|(w, _)| w.id() == &7)
+                                })
+                        })
+                        .expect("overflowing foreground must have a visible drag point");
+                    let existing_ids: Vec<_> =
+                        layout.workspaces().map(|(_, _, ws)| ws.id()).collect();
+                    let (target_output, target, target_id) = if destination == 2 {
+                        let mon = layout.monitor_for_workspace("target").unwrap();
+                        let (ws, geo) = mon
+                            .workspaces_with_render_geo_cull(false)
+                            .find(|(ws, _)| ws.name().map(String::as_str) == Some("target"))
+                            .unwrap();
+                        let bounds = mon
+                            .workspace_bounds(ws, geo)
+                            .intersection(Rectangle::from_size(ws.view_size()))
+                            .unwrap();
+                        (
+                            mon.output().clone(),
+                            bounds.loc + bounds.size.to_point().downscale(2.),
+                            Some(ws.id()),
+                        )
+                    } else if destination == 0 {
+                        let (ws, geo) = source_mon
+                            .workspaces_with_render_geo_cull(false)
+                            .find(|(ws, _)| ws.name().map(String::as_str) == Some("empty"))
+                            .unwrap();
+                        let bounds = source_mon
+                            .workspace_bounds(ws, geo)
+                            .intersection(Rectangle::from_size(view))
+                            .unwrap();
+                        (
+                            source_output.clone(),
+                            bounds.loc + bounds.size.to_point().downscale(2.),
+                            Some(ws.id()),
+                        )
+                    } else {
+                        let idx = source_mon
+                            .workspaces
+                            .iter()
+                            .position(|ws| ws.id() == source_id)
+                            .unwrap();
+                        let geos: Vec<_> = source_mon.workspaces_render_geo().collect();
+                        let first =
+                            source_mon.workspace_bounds(&source_mon.workspaces[idx], geos[idx]);
+                        let next = source_mon
+                            .workspace_bounds(&source_mon.workspaces[idx + 1], geos[idx + 1]);
+                        let point = Point::from((
+                            view.w / 2.,
+                            (first.loc.y + first.size.h + next.loc.y) / 2.,
+                        ));
+                        assert!(Rectangle::from_size(view).contains(point));
+                        assert_eq!(
+                            source_mon.insert_position(point).0,
+                            InsertWorkspace::NewAt(idx + 1)
+                        );
+                        (source_output.clone(), point, None)
+                    };
+                    assert!(layout.interactive_move_begin(7, &source_output, start));
+                    assert!(layout.interactive_move_update(
+                        &7,
+                        (300., 300.).into(),
+                        target_output.clone(),
+                        target
+                    ));
+                    layout.update_render_elements(None);
+                    let mon = layout.monitor_for_output(&target_output).unwrap();
+                    let hint = mon
+                        .insert_hint
+                        .as_ref()
+                        .expect("actual interactive move must publish an insert hint");
+                    if let Some(id) = target_id {
+                        assert_eq!(hint.workspace, InsertWorkspace::Existing(id));
+                    } else {
+                        assert!(matches!(hint.workspace, InsertWorkspace::NewAt(_)));
+                    }
+                    assert!(!layout.sink_window());
+                    assert!(layout.pull_window().is_none());
+                    assert!(!layout.unwind_sink_to(&1));
+                    layout.verify_invariants();
+                    layout.interactive_move_end(&7);
+                    settle_system_layout(&mut layout);
+                    Op::CompleteAnimations.apply(&mut layout);
+                    assert!(layout.is_overview_open());
+                    let (_, _, ws) = layout
+                        .workspaces()
+                        .find(|(_, _, ws)| ws.windows().any(|w| w.id() == &7))
+                        .unwrap();
+                    if let Some(id) = target_id {
+                        assert_eq!(ws.id(), id);
+                    } else {
+                        assert!(!existing_ids.contains(&ws.id()));
+                    }
+                    let owner = ws.windows().find(|w| w.id() == &7).unwrap();
+                    assert!(Rc::ptr_eq(&before.0, &owner.0));
+                    assert_eq!(owner.size(), (4096, 600).into());
+                    for (id, depth) in [(1, 1), (2, 0), (9, 1), (10, 0)] {
+                        assert_eq!(layout.sink_depth(&id), Some(depth));
+                    }
+                    assert_eq!(layout.windows().count(), 5);
+                    layout.verify_invariants();
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn overview_dnd_hold_on_sink_activates_workspace_without_recalling_a_member() {
+    let mut config = Config::default();
+    config.sink.enabled = true;
+    let mut layout = Layout::<TestWindow>::new(Clock::with_time(Duration::ZERO), &config);
+    Op::AddOutput(1).apply(&mut layout);
+    Op::AddWindow {
+        params: TestWindowParams::new(1),
+    }
+    .apply(&mut layout);
+    settle_system_layout(&mut layout);
+    assert!(layout.sink_window());
+    layout.open_overview();
+    Op::CompleteAnimations.apply(&mut layout);
+    let output = layout.active_output().unwrap().clone();
+    let workspace_id = layout.active_workspace().unwrap().id();
+    let view = layout.active_workspace().unwrap().view_size();
+    let point = (0..view.h as i32)
+        .step_by(2)
+        .find_map(|y| {
+            (0..view.w as i32)
+                .step_by(2)
+                .map(|x| Point::from((x as f64, y as f64)))
+                .find(|p| {
+                    layout
+                        .window_under(&output, *p)
+                        .is_some_and(|(w, _)| w.id() == &1)
+                })
+        })
+        .expect("expanded entry must have a passive hit");
+    layout.dnd_update(output, point);
+    layout.advance_animations();
+    Op::AdvanceAnimations { msec_delta: 800 }.apply(&mut layout);
+    assert_eq!(layout.sink_depth(&1), Some(0));
+    assert_eq!(layout.active_workspace().unwrap().id(), workspace_id);
+    assert!(!layout.is_overview_open());
+    assert!(layout.active_workspace().unwrap().active_window().is_none());
+    layout.dnd_end();
+    Op::CompleteAnimations.apply(&mut layout);
+    layout.verify_invariants();
+}
+
+#[test]
+fn overview_output_and_budget_change_rebuilds_local_basis_without_replaying_opening() {
+    let mut config = Config::default();
+    config.sink.enabled = true;
+    config.overview.sink.entry_height = 256.;
+    config.overview.sink.tail_height = 256.;
+    let mut layout = Layout::<TestWindow>::new(Clock::with_time(Duration::ZERO), &config);
+    Op::AddOutput(1).apply(&mut layout);
+    for id in 1..=3 {
+        Op::AddWindow {
+            params: TestWindowParams::new(id),
+        }
+        .apply(&mut layout);
+        settle_system_layout(&mut layout);
+        assert!(layout.sink_window());
+    }
+    layout.open_overview();
+    Op::CompleteAnimations.apply(&mut layout);
+    assert_eq!(layout.pull_window(), Some(3));
+    Op::AdvanceAnimations { msec_delta: 16 }.apply(&mut layout);
+    let output = layout.active_output().unwrap().clone();
+    output.change_current_state(
+        Some(Mode {
+            size: (320, 240).into(),
+            refresh: 60000,
+        }),
+        None,
+        Some(output::Scale::Fractional(1.5)),
+        None,
+    );
+    layout.update_output_size(&output);
+    assert!(layout.is_overview_open());
+    assert!(matches!(
+        layout.overview_progress,
+        Some(OverviewProgress::Open)
+    ));
+    config.overview.sink.entry_height = 8.;
+    config.overview.sink.tail_height = 0.;
+    layout.update_config(&config);
+    let ws = layout.active_workspace().unwrap();
+    assert!(ws.sink_overview_foreground_offset() <= ws.view_size().h * 0.2);
+    for id in 1..=2 {
+        let tile = ws.tiles().find(|t| t.window().id() == &id).unwrap();
+        assert!(tile.sink_overview_presentation.as_ref().unwrap().is_done());
+        let pose = ws
+            .sink_render_pose(ws.sink_depth(&id).unwrap(), tile)
+            .unwrap();
+        assert_abs_diff_eq!(
+            pose.position.x + tile.animated_tile_size().w * pose.scale / 2.,
+            ws.view_size().w / 2.,
+            epsilon = 1e-8
+        );
+    }
+    let restoring = ws.tiles().find(|t| t.window().id() == &3).unwrap();
+    assert!(restoring.sink_overview_presentation.is_none());
+    assert!(restoring.sink_input_blocked());
+    assert!(restoring.sink_presentation.as_ref().unwrap().restoring);
+    layout.verify_invariants();
+}
+
+#[test]
 fn workspace_lifo_unwind_and_arbitrary_close_preserve_other_owners() {
     let mut workspace = Workspace::new_no_outputs(Clock::with_time(Duration::ZERO), Rc::default());
     for id in 1..=4 {

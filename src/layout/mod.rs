@@ -2748,6 +2748,13 @@ impl<W: LayoutElement> Layout<W> {
                 } else if is_dnd {
                     let target = mon
                         .window_under(pos_within_output)
+                        // Sink entries are passive Overview selectors. DnD hold activates their
+                        // workspace; it must neither recall them nor try ordinary activation.
+                        .filter(|(win, _)| {
+                            mon.workspaces
+                                .iter()
+                                .all(|ws| ws.sink_depth(win.id()).is_none())
+                        })
                         .map(|(win, _)| DndHoldTarget::Window(win.id().clone()))
                         .or_else(|| {
                             mon.workspace_under_narrow(pos_within_output)
