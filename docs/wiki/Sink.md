@@ -40,6 +40,12 @@ from floating returns to its stored floating placement when those states are uns
 initially fullscreen window has no known normal size, unfullscreen sends a zero size hint for the
 client to choose; Pull then applies the saved normal layout policy.
 
+Visible sunk windows do not activate per-window on-demand VRR or application idle inhibitors,
+including inhibitors on their subsurfaces and tracked popups. Pull restores normal eligibility;
+the existing visibility and window-rule requirements still apply. System-level FDO idle inhibition
+and always-on output VRR keep their usual behavior. Render visibility and presentation/frame
+callbacks remain available to live projections. Native TTY/DRM behavior is still awaiting validation.
+
 Reloading with `enabled false` restores all stacks in LIFO order, including workspaces without
 outputs, preserving any existing normal focus. Changing styles retains membership. `visible-depth`
 accepts 1–4. Level indices accept 0–3, with no duplicates; scale accepts `(0,1]` and opacity accepts

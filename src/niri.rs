@@ -4319,11 +4319,27 @@ impl Niri {
 
         let is_inhibited = self.is_fdo_idle_inhibited.load(Ordering::SeqCst)
             || self.idle_inhibiting_surfaces.iter().any(|surface| {
-                with_states(surface, |states| {
-                    surface_primary_scanout_output(surface, states).is_some()
-                })
+                !self.is_sunk_surface(surface)
+                    && with_states(surface, |states| {
+                        surface_primary_scanout_output(surface, states).is_some()
+                    })
             });
         self.idle_notifier_state.set_is_inhibited(is_inhibited);
+    }
+
+    fn is_sunk_surface(&self, surface: &WlSurface) -> bool {
+        self.layout.windows().any(|(_, mapped)| {
+            if self.layout.sink_depth(&mapped.window).is_none() {
+                return false;
+            }
+            let mut owned = false;
+            // Include subsurfaces and tracked popups. Render visibility must remain intact for
+            // callbacks and presentation; only foreground policy eligibility changes here.
+            mapped.window.with_surfaces(|candidate, _| {
+                owned |= candidate == surface;
+            });
+            owned
+        })
     }
 
     pub fn refresh_window_states(&mut self) {
@@ -5042,21 +5058,28 @@ impl Niri {
             return;
         }
 
-        let current = self.layout.windows_for_output(output).any(|mapped| {
-            mapped.rules().variable_refresh_rate == Some(true) && {
-                let mut visible = false;
-                mapped.window.with_surfaces(|surface, states| {
-                    if !visible
-                        && surface_primary_scanout_output(surface, states).as_ref() == Some(output)
-                    {
-                        visible = true;
-                    }
-                });
-                visible
-            }
-        });
+        let current = self.has_visible_vrr_window(output);
 
         backend.set_output_on_demand_vrr(self, output, current);
+    }
+
+    pub(crate) fn has_visible_vrr_window(&self, output: &Output) -> bool {
+        self.layout.windows_for_output(output).any(|mapped| {
+            self.layout.sink_depth(&mapped.window).is_none()
+                && mapped.rules().variable_refresh_rate == Some(true)
+                && {
+                    let mut visible = false;
+                    mapped.window.with_surfaces(|surface, states| {
+                        if !visible
+                            && surface_primary_scanout_output(surface, states).as_ref()
+                                == Some(output)
+                        {
+                            visible = true;
+                        }
+                    });
+                    visible
+                }
+        })
     }
 
     pub fn update_primary_scanout_output(

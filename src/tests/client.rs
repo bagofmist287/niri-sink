@@ -879,6 +879,8 @@ impl Dispatch<ZwlrLayerShellV1, ()> for State {
 
 wayland_client::delegate_noop!(State: ZwlrVirtualPointerManagerV1);
 wayland_client::delegate_noop!(State: ZwlrVirtualPointerV1);
+wayland_client::delegate_noop!(State: wayland_client::protocol::wl_subcompositor::WlSubcompositor);
+wayland_client::delegate_noop!(State: wayland_client::protocol::wl_subsurface::WlSubsurface);
 
 impl Dispatch<WlSurface, ()> for State {
     fn event(

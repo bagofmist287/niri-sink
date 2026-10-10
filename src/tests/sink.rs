@@ -10,6 +10,164 @@ use super::*;
 use crate::layout::{LayoutElement as _, SizingMode};
 use crate::niri::KeyboardFocus;
 
+// Fixtures do not render. Publish a renderer's visibility decision without changing role or
+// exercising hardware scanout, so policy tests can distinguish a visible projection from a
+// foreground window.
+fn publish_surface_visibility(
+    surface: &WlSurface,
+    output: &smithay::output::Output,
+    visible: bool,
+) {
+    use std::sync::Mutex;
+
+    use smithay::backend::renderer::element::{
+        Id, PrimaryScanoutOutput, RenderElementPresentationState, RenderElementState,
+        RenderElementStates,
+    };
+    use smithay::wayland::compositor::with_states;
+
+    let id = Id::from_wayland_resource(surface);
+    let mut rendered = RenderElementStates::default();
+    if visible {
+        rendered.states.insert(
+            id.clone(),
+            RenderElementState {
+                visible_area: 100,
+                presentation_state: RenderElementPresentationState::Rendering { reason: None },
+                needs_capture: false,
+            },
+        );
+    }
+    with_states(surface, |states| {
+        states
+            .data_map
+            .get_or_insert_threadsafe(Mutex::<PrimaryScanoutOutput>::default)
+            .lock()
+            .unwrap()
+            .update_from_render_element_states(id, output, None, &rendered, |_, _, next, _| next);
+    });
+}
+
+#[test]
+fn idle_policy_excludes_visible_sunk_root_subsurface_and_popup() {
+    use std::sync::atomic::Ordering;
+
+    use smithay::desktop::utils::surface_primary_scanout_output;
+    use smithay::wayland::compositor::with_states;
+    use smithay::wayland::idle_inhibit::IdleInhibitHandler;
+    use wayland_client::protocol::wl_subcompositor::WlSubcompositor;
+
+    let mut config = Config::default();
+    config.sink.enabled = true;
+    let (mut fixture, client, windows) = setup(config);
+    fixture.niri_state().do_action(Action::PullWindow, false);
+    settle(&mut fixture, client);
+    let subcompositor = fixture.client(client).bind::<WlSubcompositor>();
+    let state = &mut fixture.client(client).state;
+    let parent_surface = state.windows[2].surface.clone();
+    let parent_xdg = state.windows[2].xdg_surface.clone();
+    let child = state.create_surface();
+    let subsurface = subcompositor.get_subsurface(&child, &parent_surface, &state.qh, ());
+    child.commit();
+    parent_surface.commit();
+    let popup_surface = state.create_surface();
+    let base = state.xdg_wm_base.as_ref().unwrap();
+    let positioner = base.create_positioner(&state.qh, ());
+    positioner.set_size(20, 20);
+    positioner.set_anchor_rect(0, 0, 10, 10);
+    let xdg = base.get_xdg_surface(&popup_surface, &state.qh, ());
+    let popup = xdg.get_popup(Some(&parent_xdg), &positioner, &state.qh, ());
+    state.popup_surfaces.push(xdg.clone());
+    popup_surface.commit();
+    fixture.double_roundtrip(client);
+    let mut owned = Vec::new();
+    windows[2]
+        .1
+        .with_surfaces(|surface, _| owned.push(surface.clone()));
+    assert_eq!(owned.len(), 3);
+    let output = fixture.niri_output(1);
+
+    for surface in &owned {
+        publish_surface_visibility(surface, &output, true);
+        IdleInhibitHandler::inhibit(fixture.niri_state(), surface.clone());
+        fixture.niri().refresh_idle_inhibit();
+        assert!(fixture.niri().idle_notifier_state.is_inhibited());
+        IdleInhibitHandler::uninhibit(fixture.niri_state(), surface.clone());
+    }
+    fixture.niri_state().do_action(Action::SinkWindow, false);
+    assert_eq!(fixture.niri().layout.sink_depth(&windows[2].1), Some(0));
+    for surface in &owned {
+        publish_surface_visibility(surface, &output, true);
+        IdleInhibitHandler::inhibit(fixture.niri_state(), surface.clone());
+        fixture.niri().refresh_idle_inhibit();
+        assert!(!fixture.niri().idle_notifier_state.is_inhibited());
+        assert_eq!(
+            with_states(surface, |states| surface_primary_scanout_output(
+                surface, states
+            )),
+            Some(output.clone()),
+            "policy filtering must preserve render visibility for callbacks"
+        );
+        fixture
+            .niri()
+            .is_fdo_idle_inhibited
+            .store(true, Ordering::SeqCst);
+        fixture.niri().refresh_idle_inhibit();
+        assert!(fixture.niri().idle_notifier_state.is_inhibited());
+        fixture
+            .niri()
+            .is_fdo_idle_inhibited
+            .store(false, Ordering::SeqCst);
+        IdleInhibitHandler::uninhibit(fixture.niri_state(), surface.clone());
+    }
+    fixture.niri_state().do_action(Action::PullWindow, false);
+    settle(&mut fixture, client);
+    for surface in &owned {
+        publish_surface_visibility(surface, &output, true);
+        IdleInhibitHandler::inhibit(fixture.niri_state(), surface.clone());
+        fixture.niri().refresh_idle_inhibit();
+        assert!(fixture.niri().idle_notifier_state.is_inhibited());
+        publish_surface_visibility(surface, &output, false);
+        fixture.niri().refresh_idle_inhibit();
+        assert!(!fixture.niri().idle_notifier_state.is_inhibited());
+        IdleInhibitHandler::uninhibit(fixture.niri_state(), surface.clone());
+    }
+    popup.destroy();
+    xdg.destroy();
+    popup_surface.destroy();
+    subsurface.destroy();
+    child.destroy();
+    fixture.double_roundtrip(client);
+}
+
+#[test]
+fn vrr_policy_requires_visible_normal_window_on_matching_output() {
+    for rule in [false, true] {
+        let config = Config::parse_mem(&format!(
+            "sink {{ enabled true; }}\nwindow-rule {{ variable-refresh-rate {rule}; }}"
+        ))
+        .unwrap();
+        let (mut fixture, client, windows) = setup(config);
+        fixture.add_output(2, (1280, 720));
+        let output = fixture.niri_output(1);
+        let other_output = fixture.niri_output(2);
+        for (surface, _, _) in &windows {
+            publish_surface_visibility(surface, &output, true);
+        }
+        assert!(!fixture.niri().has_visible_vrr_window(&output));
+        fixture.niri_state().do_action(Action::PullWindow, false);
+        settle(&mut fixture, client);
+        publish_surface_visibility(&windows[2].0, &output, true);
+        assert_eq!(fixture.niri().has_visible_vrr_window(&output), rule);
+        assert!(!fixture.niri().has_visible_vrr_window(&other_output));
+        publish_surface_visibility(&windows[2].0, &output, false);
+        assert!(!fixture.niri().has_visible_vrr_window(&output));
+        publish_surface_visibility(&windows[2].0, &output, true);
+        fixture.niri_state().do_action(Action::SinkWindow, false);
+        assert!(!fixture.niri().has_visible_vrr_window(&output));
+    }
+}
+
 fn setup(config: Config) -> (Fixture, ClientId, Vec<(WlSurface, Window, u64)>) {
     let mut fixture = Fixture::with_config(config);
     fixture.add_output(1, (1280, 720));
