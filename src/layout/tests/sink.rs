@@ -678,6 +678,296 @@ fn overview_local_sink_pull_reverses_from_current_frame_and_only_moves_its_works
 }
 
 #[test]
+fn overview_restoring_window_workspace_move_keeps_the_displayed_frame() {
+    use crate::layout::sink_presentation::SinkPose;
+
+    fn displayed(layout: &Layout<TestWindow>, id: usize) -> SinkPose {
+        let output = layout.outputs().next().unwrap();
+        let mon = layout.monitor_for_output(output).unwrap();
+        let (ws, geo) = mon
+            .workspaces_with_render_geo_cull(false)
+            .find(|(ws, _)| ws.has_window(&id))
+            .unwrap();
+        let (tile, pos, _) = ws
+            .tiles_with_render_positions()
+            .find(|(tile, _, _)| tile.window().id() == &id)
+            .unwrap();
+        let mut pose = ws
+            .sink_restore_pose(tile, pos)
+            .unwrap_or(SinkPose::normal(pos));
+        pose.position = geo.loc + pose.position.upscale(mon.overview_zoom());
+        pose.scale *= mon.overview_zoom();
+        pose
+    }
+
+    for (floating, column, output_path) in [
+        (false, false, false),
+        (true, false, false),
+        (false, true, false),
+        (false, false, true),
+        (true, false, true),
+    ] {
+        for animate in [false, true] {
+            for phase in 0..4 {
+                for scale in [1.25, 1.5] {
+                    for activate in [false, true] {
+                        let mut config = Config::parse_mem(
+                            r#"
+            sink { enabled true; }
+            workspace "source" { open-on-output "output1"; }
+            workspace "destination" { open-on-output "output1"; }
+        "#,
+                        )
+                        .unwrap();
+                        config.layout.gaps = 0.;
+                        config.overview.sink.animate = animate;
+                        let mut layout =
+                            Layout::<TestWindow>::new(Clock::with_time(Duration::ZERO), &config);
+                        Op::AddOutput(1).apply(&mut layout);
+                        let output = layout.outputs().next().unwrap().clone();
+                        output.change_current_state(
+                            None,
+                            None,
+                            Some(output::Scale::Fractional(scale)),
+                            None,
+                        );
+                        layout.update_output_size(&output);
+                        for (name, id) in [("destination", 9), ("source", 1)] {
+                            let idx = layout
+                                .monitor_for_output(&output)
+                                .unwrap()
+                                .workspaces
+                                .iter()
+                                .position(|ws| ws.name().map(String::as_str) == Some(name))
+                                .unwrap();
+                            layout.switch_workspace(idx);
+                            Op::CompleteAnimations.apply(&mut layout);
+                            let mut params = TestWindowParams::new(id);
+                            params.is_floating = floating;
+                            Op::AddWindow { params }.apply(&mut layout);
+                            Op::SetForcedSize {
+                                id,
+                                size: Some((300, 200).into()),
+                            }
+                            .apply(&mut layout);
+                            settle_system_layout(&mut layout);
+                            assert!(layout.sink_window());
+                            settle_system_layout(&mut layout);
+                        }
+                        if phase != 3 {
+                            layout.open_overview();
+                        }
+                        if phase != 0 {
+                            Op::CompleteAnimations.apply(&mut layout);
+                        } else {
+                            Op::AdvanceAnimations { msec_delta: 32 }.apply(&mut layout);
+                        }
+                        if phase == 2 {
+                            layout.close_overview();
+                            Op::AdvanceAnimations { msec_delta: 32 }.apply(&mut layout);
+                        }
+                        assert_eq!(layout.pull_window(), Some(1));
+                        Op::AdvanceAnimations { msec_delta: 32 }.apply(&mut layout);
+                        let before = displayed(&layout, 1);
+                        let owner = layout
+                            .windows()
+                            .find(|(_, w)| w.id() == &1)
+                            .unwrap()
+                            .1
+                            .clone();
+                        let idx = layout
+                            .monitor_for_output(&output)
+                            .unwrap()
+                            .workspaces
+                            .iter()
+                            .position(|ws| ws.name().map(String::as_str) == Some("destination"))
+                            .unwrap();
+                        let tile = layout
+                            .active_workspace()
+                            .unwrap()
+                            .tiles()
+                            .find(|t| t.window().id() == &1)
+                            .unwrap();
+                        let generation = tile.sink_generation();
+                        assert!(tile.sink_input_blocked());
+                        if column {
+                            layout.move_column_to_workspace(idx, activate);
+                        } else if output_path {
+                            layout.move_to_output(
+                                Some(&1),
+                                &output,
+                                Some(idx),
+                                if activate {
+                                    ActivateWindow::Yes
+                                } else {
+                                    ActivateWindow::No
+                                },
+                            );
+                        } else {
+                            layout.move_to_workspace(
+                                Some(&1),
+                                idx,
+                                if activate {
+                                    ActivateWindow::Yes
+                                } else {
+                                    ActivateWindow::No
+                                },
+                            );
+                        }
+                        layout.verify_invariants();
+                        let after = displayed(&layout, 1);
+                        // Native card origins and tile offsets round in physical pixels.
+                        for delta in [
+                            after.position.x - before.position.x,
+                            after.position.y - before.position.y,
+                        ] {
+                            assert!(delta.abs() <= 1. / scale,
+                                "position changed by {delta}: floating={floating}, column={column}, animate={animate}, phase={phase}, scale={scale}, activate={activate}, output_path={output_path}");
+                        }
+                        assert_abs_diff_eq!(after.scale, before.scale, epsilon = 1e-8);
+                        assert_abs_diff_eq!(after.alpha, before.alpha, epsilon = 1e-8);
+                        assert!(Rc::ptr_eq(
+                            &owner.0,
+                            &layout.windows().find(|(_, w)| w.id() == &1).unwrap().1 .0
+                        ));
+                        let (_, _, moved_ws) = layout
+                            .workspaces()
+                            .find(|(_, _, ws)| ws.has_window(&1))
+                            .unwrap();
+                        assert_eq!(moved_ws.name().map(String::as_str), Some("destination"));
+                        let tile = moved_ws.tiles().find(|t| t.window().id() == &1).unwrap();
+                        assert_eq!(tile.sink_generation(), generation);
+                        assert!(tile.sink_input_blocked());
+                        for millis in [16, 32, 200, 1000] {
+                            Op::AdvanceAnimations { msec_delta: millis }.apply(&mut layout);
+                            layout.verify_invariants();
+                        }
+                        settle_system_layout(&mut layout);
+                        Op::CompleteAnimations.apply(&mut layout);
+                        assert_eq!(layout.sink_depth(&9), Some(0));
+                        assert_eq!(layout.sink_depth(&1), None);
+                        assert_eq!(layout.is_overview_open(), phase < 2);
+                        let (_, _, moved_ws) = layout
+                            .workspaces()
+                            .find(|(_, _, ws)| ws.has_window(&1))
+                            .unwrap();
+                        let tile = moved_ws.tiles().find(|t| t.window().id() == &1).unwrap();
+                        assert!(
+                            tile.sink_presentation.is_none()
+                                && tile.sink_overview_presentation.is_none()
+                        );
+                        assert!(!tile.sink_input_blocked());
+                        layout.verify_invariants();
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn overview_lifecycle_interruptions_keep_surviving_owners_and_release_restore_tracks() {
+    for animate in [false, true] {
+        for closing in [false, true] {
+            for disable in [false, true] {
+                let mut config = Config::default();
+                config.sink.enabled = true;
+                config.overview.sink.animate = animate;
+                let mut layout =
+                    Layout::<TestWindow>::new(Clock::with_time(Duration::ZERO), &config);
+                Op::AddOutput(1).apply(&mut layout);
+                for id in 1..=3 {
+                    let mut params = TestWindowParams::new(id);
+                    params.is_floating = id % 2 == 1;
+                    Op::AddWindow { params }.apply(&mut layout);
+                    Op::SetForcedSize {
+                        id,
+                        size: Some((300, 200).into()),
+                    }
+                    .apply(&mut layout);
+                    settle_system_layout(&mut layout);
+                    assert!(layout.sink_window());
+                    settle_system_layout(&mut layout);
+                }
+                let workspace = layout.active_workspace().unwrap().id();
+                let owners: Vec<_> = layout.windows().map(|(_, w)| w.clone()).collect();
+                layout.open_overview();
+                Op::AdvanceAnimations { msec_delta: 32 }.apply(&mut layout);
+                assert_eq!(layout.pull_window(), Some(3));
+                Op::AdvanceAnimations { msec_delta: 16 }.apply(&mut layout);
+                if closing {
+                    layout.close_overview();
+                    Op::AdvanceAnimations { msec_delta: 16 }.apply(&mut layout);
+                }
+                // A middle owner closes while a different tile is restoring.
+                Op::CloseWindow(2).apply(&mut layout);
+                layout.verify_invariants();
+                assert_eq!(layout.sink_depth(&1), Some(0));
+                Op::RemoveOutput(1).apply(&mut layout);
+                layout.verify_invariants();
+                assert_eq!(layout.outputs().count(), 0);
+                assert_eq!(
+                    layout
+                        .find_workspace_by_id(workspace)
+                        .unwrap()
+                        .1
+                        .sink_count(),
+                    1
+                );
+                // Exercise disable either with no output or after reconnecting a new basis.
+                if disable {
+                    config.sink.enabled = false;
+                    layout.update_config(&config);
+                    layout.verify_invariants();
+                }
+                Op::AddOutput(2).apply(&mut layout);
+                let output = layout.outputs().next().unwrap().clone();
+                output.change_current_state(
+                    Some(Mode {
+                        size: (320, 240).into(),
+                        refresh: 60000,
+                    }),
+                    Some(smithay::utils::Transform::_90),
+                    Some(output::Scale::Fractional(1.5)),
+                    None,
+                );
+                layout.update_output_size(&output);
+                settle_system_layout(&mut layout);
+                for owner in owners.iter().filter(|w| w.id() != &2) {
+                    let current = layout
+                        .windows()
+                        .find(|(_, w)| w.id() == owner.id())
+                        .unwrap()
+                        .1;
+                    assert!(Rc::ptr_eq(&owner.0, &current.0));
+                    assert_eq!(current.size(), (300, 200).into());
+                }
+                let ws = layout.find_workspace_by_id(workspace).unwrap().1;
+                assert_eq!(ws.sink_count(), usize::from(!disable));
+                assert_eq!(layout.windows().count(), 2);
+                if !disable {
+                    assert!(layout.unwind_sink_to(&1));
+                }
+                layout.close_overview();
+                settle_system_layout(&mut layout);
+                Op::CompleteAnimations.apply(&mut layout);
+                assert!(layout.workspaces().all(|(_, _, ws)| ws.sink_count() == 0));
+                for (_, _, ws) in layout.workspaces() {
+                    for tile in ws.tiles() {
+                        assert!(
+                            tile.sink_presentation.is_none()
+                                && tile.sink_overview_presentation.is_none()
+                        );
+                        assert!(!tile.sink_input_blocked());
+                    }
+                }
+                layout.verify_invariants();
+            }
+        }
+    }
+}
+
+#[test]
 fn overview_disabling_additional_animation_finishes_local_tracks_without_changing_native_barrier() {
     let mut config = Config::default();
     config.sink.enabled = true;

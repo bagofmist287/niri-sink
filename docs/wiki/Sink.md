@@ -124,6 +124,9 @@ projection returns. Input waits for the visual transition and a processed commit
 required resize or native state change; an ack alone is insufficient. A matching already committed
 size and mode takes the fast path. Another native state/size change during restoration retargets
 the required commit while retaining the original deadline.
+Moving a restoring window or column to another workspace on the same output preserves its
+current displayed pose, including during Overview opening or closing. The move keeps the
+original restore animation progress and commit deadline; it does not acknowledge client commits.
 The original transaction deadline bounds an unresponsive client (normally 300 ms); after it expires,
 niri uses the existing degraded resize behavior. Changing focus, locking, unmapping or invalidating
 the restore context cancels the old focus plan, so a late commit cannot steal focus. Selecting the

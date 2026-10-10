@@ -3451,6 +3451,18 @@ impl<W: LayoutElement> Layout<W> {
                 return;
             }
 
+            if mon_idx == new_idx
+                && window.is_some_and(|id| {
+                    mon.workspaces[ws_idx].tiles().any(|tile| {
+                        tile.window().id() == id
+                            && tile.sink_presentation.as_ref().is_some_and(|p| p.restoring)
+                    })
+                })
+            {
+                monitors[mon_idx].move_to_workspace(window, workspace_idx, activate);
+                return;
+            }
+
             let ws_id = mon.workspaces[workspace_idx].id();
 
             let mon = &mut monitors[mon_idx];

@@ -1194,6 +1194,94 @@ fn overview_pull_keeps_original_commit_barrier_through_ack_only_and_closing() {
 }
 
 #[test]
+fn overview_pull_workspace_transfer_preserves_commit_deadline_and_cancels_old_focus() {
+    use crate::layout::ActivateWindow;
+
+    for closing in [false, true] {
+        let (mut fixture, client, windows) = resizing_pull_context(true);
+        let surface = fixture.client(client).state.windows[2].surface.clone();
+        let mapped = fixture
+            .niri()
+            .layout
+            .windows()
+            .find(|(_, w)| w.window == windows[2].1)
+            .unwrap()
+            .1;
+        let deadline = mapped.sink_input_deadline().unwrap();
+        let source_workspace = fixture.niri().layout.active_workspace().unwrap().id();
+        if closing {
+            fixture.niri_state().do_action(Action::CloseOverview, false);
+        }
+        fixture.niri_state().niri.layout.move_to_workspace(
+            Some(&windows[2].1),
+            1,
+            ActivateWindow::No,
+        );
+        fixture.double_roundtrip(client);
+        let destination = fixture
+            .niri()
+            .layout
+            .workspaces()
+            .find(|(_, _, ws)| ws.has_window(&windows[2].1))
+            .unwrap()
+            .2
+            .id();
+        assert_ne!(destination, source_workspace);
+        fixture.niri_complete_animations();
+        fixture.client(client).window(&surface).ack_last();
+        fixture.double_roundtrip(client);
+        let mapped = fixture
+            .niri()
+            .layout
+            .windows()
+            .find(|(_, w)| w.window == windows[2].1)
+            .unwrap()
+            .1;
+        assert_eq!(mapped.sink_input_deadline(), Some(deadline));
+        let ws = fixture
+            .niri()
+            .layout
+            .find_workspace_by_id(destination)
+            .unwrap()
+            .1;
+        assert!(ws
+            .tiles()
+            .find(|t| t.window().window == windows[2].1)
+            .unwrap()
+            .sink_input_blocked());
+        assert_ne!(fixture.niri().keyboard_focus.surface(), Some(&windows[2].0));
+        let window = fixture.client(client).window(&surface);
+        let size = window.configures_received.last().unwrap().1.size;
+        window.set_size(size.0.max(1) as u16, size.1.max(1) as u16);
+        window.commit();
+        fixture.double_roundtrip(client);
+        let ws = fixture
+            .niri()
+            .layout
+            .find_workspace_by_id(destination)
+            .unwrap()
+            .1;
+        assert!(!ws
+            .tiles()
+            .find(|t| t.window().window == windows[2].1)
+            .unwrap()
+            .sink_input_blocked());
+        assert_eq!(
+            fixture.niri().layout.active_workspace().unwrap().id(),
+            source_workspace
+        );
+        assert_ne!(fixture.niri().keyboard_focus.surface(), Some(&windows[2].0));
+        fixture
+            .niri_state()
+            .do_action(Action::FocusWindow(windows[2].2), false);
+        fixture.niri_state().do_action(Action::CloseOverview, false);
+        fixture.niri_complete_animations();
+        fixture.double_roundtrip(client);
+        assert_eq!(fixture.niri().keyboard_focus.surface(), Some(&windows[2].0));
+    }
+}
+
+#[test]
 fn pull_ack_only_withholds_keyboard_pointer_and_mru_until_processed_commit() {
     let (mut fixture, client, windows) = resizing_pull();
     let surface = fixture.client(client).state.windows[2].surface.clone();

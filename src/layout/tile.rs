@@ -478,6 +478,20 @@ impl<W: LayoutElement> Tile<W> {
     pub fn is_sink_restoring(&self) -> bool {
         self.sink_presentation.as_ref().is_some_and(|p| p.restoring)
     }
+    /// A restoring tile changes workspace coordinates, but keeps its animation and commit state.
+    pub(super) fn translate_sink_restore(
+        &mut self,
+        delta: Point<f64, Logical>,
+        foreground_delta: f64,
+    ) {
+        if let Some(presentation) = self.sink_presentation.as_mut().filter(|p| p.restoring) {
+            presentation.translate(delta);
+            if let Some(presentation) = &mut self.sink_overview_presentation {
+                presentation.translate(delta + Point::from((0., foreground_delta)));
+            }
+        }
+    }
+
     pub fn cancel_sink_focus(&mut self) {
         self.sink_focus_cancelled = true;
     }

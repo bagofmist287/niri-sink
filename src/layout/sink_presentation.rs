@@ -105,6 +105,12 @@ impl SinkPresentation {
         }
     }
 
+    /// Rebase an in-flight presentation without restarting its animation or restore barrier.
+    pub fn translate(&mut self, delta: Point<f64, Logical>) {
+        self.from.position += delta;
+        self.to.position += delta;
+    }
+
     pub fn finish(&mut self) {
         self.finished = true;
     }

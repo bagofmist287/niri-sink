@@ -671,7 +671,7 @@ impl<W: LayoutElement> Workspace<W> {
         self.sink_overview_foreground_value() * frame.progress
     }
 
-    fn sink_overview_foreground_value(&self) -> f64 {
+    pub(super) fn sink_overview_foreground_value(&self) -> f64 {
         self.sink_overview_foreground
             .as_ref()
             .map_or(0., |p| p.bounded_pose().position.y)

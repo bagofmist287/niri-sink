@@ -858,6 +858,18 @@ impl<W: LayoutElement> Monitor<W> {
             .find_map(|(tile, offset, _visible)| (tile.window().id() == &window).then_some(offset))
             .unwrap();
 
+        let restoring = workspace.tiles().any(|tile| {
+            tile.window().id() == &window
+                && tile.sink_presentation.as_ref().is_some_and(|p| p.restoring)
+        });
+        let source_foreground = workspace.sink_overview_foreground_value();
+        let source_geo = restoring.then(|| {
+            self.workspaces_render_geo()
+                .nth(source_workspace_idx)
+                .unwrap()
+        });
+        let workspace = &mut self.workspaces[source_workspace_idx];
+
         let transaction = Transaction::new();
         let removed = workspace.remove_tile(&window, transaction);
 
@@ -897,10 +909,17 @@ impl<W: LayoutElement> Monitor<W> {
         // Recompute the source idx in case some workspace was removed during clean-up. If the
         // source workspace itself was removed, don't bother animating this since the removal is
         // instant anyway.
-        if let Some(source_workspace_idx) = self.idx_of_ws(source_id) {
+        let restore_delta = source_geo.map(|source_geo| {
+            let target_geo = self.workspaces_render_geo().nth(new_idx).unwrap();
+            (source_geo.loc - target_geo.loc).downscale(self.overview_zoom())
+        });
+        if let Some(delta) = restore_delta {
+            old_render_pos += delta;
+        } else if let Some(source_workspace_idx) = self.idx_of_ws(source_id) {
             old_render_pos.y +=
                 self.workspace_size_with_gap(1.).h * (source_workspace_idx as f64 - new_idx as f64);
         }
+        let target_foreground = self.workspaces[new_idx].sink_overview_foreground_value();
 
         let (tile, new_render_pos) = self.workspaces[new_idx]
             .tiles_with_render_positions_mut(false)
@@ -908,6 +927,9 @@ impl<W: LayoutElement> Monitor<W> {
             .unwrap();
         tile.animate_move_from_with_config(old_render_pos - new_render_pos, config);
         tile.set_anim_y_between_workspaces();
+        if let Some(delta) = restore_delta {
+            tile.translate_sink_restore(delta, target_foreground - source_foreground);
+        }
     }
 
     pub fn move_column_to_workspace_up(&mut self, activate: bool) {
@@ -948,11 +970,29 @@ impl<W: LayoutElement> Monitor<W> {
             .find_map(|(col, pos)| (col.id() == id).then_some(pos))
             .unwrap();
 
-        let column = workspace.remove_active_column().unwrap();
+        let restoring_ids: Vec<_> = workspace
+            .scrolling()
+            .active_column()
+            .unwrap()
+            .tiles()
+            .filter(|(tile, _)| tile.sink_presentation.as_ref().is_some_and(|p| p.restoring))
+            .map(|(tile, _)| tile.window().id().clone())
+            .collect();
+        let source_foreground = workspace.sink_overview_foreground_value();
+        let source_geo = (!restoring_ids.is_empty()).then(|| {
+            self.workspaces_render_geo()
+                .nth(source_workspace_idx)
+                .unwrap()
+        });
+        let column = self.workspaces[source_workspace_idx]
+            .remove_active_column()
+            .unwrap();
 
-        // Animate vertical movement between workspaces.
-        old_render_pos.y +=
-            self.workspace_size_with_gap(1.).h * (source_workspace_idx as f64 - new_idx as f64);
+        // Ordinary columns retain their native path; restoring tiles need the actual card origins.
+        if source_geo.is_none() {
+            old_render_pos.y +=
+                self.workspace_size_with_gap(1.).h * (source_workspace_idx as f64 - new_idx as f64);
+        }
 
         // If the view is following the column, match the animation.
         let config = if activate {
@@ -965,6 +1005,14 @@ impl<W: LayoutElement> Monitor<W> {
         self.add_column(new_idx, column, activate, Some(config));
 
         let new_idx = self.idx_of_ws(new_id).unwrap();
+        let restore_delta = source_geo.map(|source_geo| {
+            let target_geo = self.workspaces_render_geo().nth(new_idx).unwrap();
+            (source_geo.loc - target_geo.loc).downscale(self.overview_zoom())
+        });
+        if let Some(delta) = restore_delta {
+            old_render_pos += delta;
+        }
+        let target_foreground = self.workspaces[new_idx].sink_overview_foreground_value();
         let (column, new_render_pos) = self.workspaces[new_idx]
             .scrolling_mut()
             .columns_with_render_positions_mut()
@@ -972,6 +1020,14 @@ impl<W: LayoutElement> Monitor<W> {
             .unwrap();
         column.animate_move_from_with_config(old_render_pos - new_render_pos, config);
         column.set_anim_y_between_workspaces();
+        if let Some(delta) = restore_delta {
+            for tile in self.workspaces[new_idx]
+                .tiles_mut()
+                .filter(|tile| restoring_ids.contains(tile.window().id()))
+            {
+                tile.translate_sink_restore(delta, target_foreground - source_foreground);
+            }
+        }
     }
 
     pub fn switch_workspace_up(&mut self) {
