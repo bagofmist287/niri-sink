@@ -54,7 +54,7 @@ Changing output size, scale or the expansion budget rebuilds the additional loca
 inside the new allocation, without replaying Overview opening or restarting the native restore
 and processed-commit barrier.
 
-Both actions do nothing when disabled, locked, grabbed, conflicting with another input owner or
+Both actions do nothing when disabled, locked, under an interaction grab, conflicting with another input owner or
 an interactive move/resize, or when their target is absent. Sink rejects windows already in transient families. When a newly mapped child or a changed parent
 relationship refers to a sunk parent, niri restores through that parent when input ownership permits.
 The child cannot receive input until its ancestor chain has completed restoration, including any
@@ -62,6 +62,9 @@ required processed resize commit. Locks and grabs defer restoration; reparenting
 parent clears obsolete blocking. A late relationship also revokes an interaction already held
 by the blocked child: pointer presses remain owned until release without client delivery, touch
 is cancelled, and tablet tools leave proximity. Grabs held by unrelated windows are preserved. This does not sink a whole transient group.
+Input-method keyboard grabs (for example, Fcitx5 with Kitty) do not block Sink/Pull or
+explicit recall. They remain active while the normal focus change is processed; this does not
+disable the input method. Popup, pointer, touch and other keyboard grabs retain their protections.
 Direct layout edits targeting a sunk ID do nothing. Closing and inventory queries still work.
 
 Fullscreen, maximized and windowed-fullscreen windows retain their native state while sunk.

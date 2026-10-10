@@ -971,6 +971,47 @@ fn sink_actions_are_opt_in_and_reload_restores_without_stealing_focus() {
 }
 
 #[test]
+fn input_method_keyboard_grab_allows_sink_pull_and_recall_without_ending_grab() {
+    use smithay::utils::Serial;
+    use smithay::wayland::input_method::InputMethodKeyboardGrab;
+
+    let mut config = Config::default();
+    config.sink.enabled = true;
+    let (mut fixture, client, windows) = setup(config);
+    fixture.niri_state().do_action(Action::PullWindow, false);
+    settle(&mut fixture, client);
+    let keyboard = fixture.niri().seat.get_keyboard().unwrap();
+    // This is Smithay's actual IME grab type, with no input-method client needed
+    // since this test exercises compositor actions and focus, not text entry.
+    keyboard.set_grab(
+        fixture.niri_state(),
+        InputMethodKeyboardGrab::default(),
+        Serial::from(601),
+    );
+    assert!(keyboard.is_grabbed());
+    assert!(fixture.niri_state().can_recall_sink(false));
+
+    fixture.niri_state().do_action(Action::SinkWindow, false);
+    assert_eq!(fixture.niri().layout.sink_depth(&windows[2].1), Some(0));
+    settle(&mut fixture, client);
+    assert!(keyboard.is_grabbed());
+
+    fixture.niri_state().do_action(Action::PullWindow, false);
+    settle(&mut fixture, client);
+    assert_eq!(fixture.niri().layout.sink_depth(&windows[2].1), None);
+    assert_eq!(fixture.niri().layout.focus().unwrap().window, windows[2].1);
+    assert!(keyboard.is_grabbed());
+
+    fixture
+        .niri_state()
+        .do_action(Action::FocusWindow(windows[0].2), false);
+    settle(&mut fixture, client);
+    assert_eq!(fixture.niri().layout.sink_depth(&windows[0].1), None);
+    assert_eq!(fixture.niri().layout.focus().unwrap().window, windows[0].1);
+    assert!(keyboard.is_grabbed());
+}
+
+#[test]
 fn real_pointer_grab_rejects_transfers_and_recall_without_ending_grab() {
     use crate::input::click_grab::ClickGrab;
     use smithay::input::pointer::{Focus, GrabStartData};

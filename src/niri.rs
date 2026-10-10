@@ -87,7 +87,7 @@ use smithay::wayland::image_capture_source::{
     ImageCaptureSource, ImageCaptureSourceState, OutputCaptureSourceState,
 };
 use smithay::wayland::image_copy_capture::{CaptureFailureReason, ImageCopyCaptureState};
-use smithay::wayland::input_method::InputMethodManagerState;
+use smithay::wayland::input_method::{InputMethodKeyboardGrab, InputMethodManagerState};
 use smithay::wayland::keyboard_shortcuts_inhibit::{
     KeyboardShortcutsInhibitState, KeyboardShortcutsInhibitor,
 };
@@ -1397,11 +1397,15 @@ impl State {
                 self.niri.keyboard_focus,
                 KeyboardFocus::Layout { .. } | KeyboardFocus::Overview | KeyboardFocus::Mru
             )
-            || self
-                .niri
-                .seat
-                .get_keyboard()
-                .is_some_and(|keyboard| keyboard.is_grabbed())
+            || self.niri.seat.get_keyboard().is_some_and(|keyboard| {
+                // An IME grab forwards text input rather than owning a compositor
+                // interaction. Keep it intact while allowing normal window actions.
+                // Other grabs (including a temporarily borrowed grab) still block recall.
+                keyboard.is_grabbed()
+                    && !keyboard
+                        .with_grab(|_, grab| grab.is::<InputMethodKeyboardGrab>())
+                        .unwrap_or(false)
+            })
             || self
                 .niri
                 .seat
