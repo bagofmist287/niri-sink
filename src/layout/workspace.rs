@@ -61,6 +61,7 @@ pub struct Workspace<W: LayoutElement> {
 
     sink_overview_frame: Option<SinkOverviewFrame>,
     sink_overview_snapshot: RefCell<Option<Rc<SinkOverviewWorkspaceSnapshot<W::Id>>>>,
+    sink_overview_foreground: Option<SinkPresentation>,
 
     /// Whether the floating layout is active instead of the scrolling layout.
     floating_is_active: FloatingActive,
@@ -284,6 +285,7 @@ impl<W: LayoutElement> Workspace<W> {
             sink: SinkSpace::default(),
             sink_overview_frame: None,
             sink_overview_snapshot: RefCell::new(None),
+            sink_overview_foreground: None,
             floating_is_active: FloatingActive::No,
             original_outputs,
             scale,
@@ -349,6 +351,7 @@ impl<W: LayoutElement> Workspace<W> {
             sink: SinkSpace::default(),
             sink_overview_frame: None,
             sink_overview_snapshot: RefCell::new(None),
+            sink_overview_foreground: None,
             floating_is_active: FloatingActive::No,
             output: None,
             scale,
@@ -395,6 +398,9 @@ impl<W: LayoutElement> Workspace<W> {
         self.scrolling.advance_animations();
         self.floating.advance_animations();
         self.retarget_sink_presentations();
+        if let Some(foreground) = &mut self.sink_overview_foreground {
+            foreground.advance();
+        }
         let visible: Vec<_> = self
             .sink
             .entries()
@@ -410,6 +416,10 @@ impl<W: LayoutElement> Workspace<W> {
                 .sink_presentation
                 .as_ref()
                 .is_some_and(|p| p.is_done() && !visible[depth])
+                && tile
+                    .sink_overview_presentation
+                    .as_ref()
+                    .is_none_or(|p| p.is_done())
             {
                 tile.release_sink_projection();
                 tile.window().set_offscreen_data(None);
@@ -420,10 +430,15 @@ impl<W: LayoutElement> Workspace<W> {
                 .sink_presentation
                 .as_ref()
                 .is_some_and(|p| p.restoring && p.is_done())
+                && tile
+                    .sink_overview_presentation
+                    .as_ref()
+                    .is_none_or(|p| p.is_done())
                 && tile.window().sink_input_ready()
             {
                 tile.window_mut().finish_sink_restore();
                 tile.sink_presentation = None;
+                tile.sink_overview_presentation = None;
                 tile.release_sink_projection();
             }
         }
@@ -432,9 +447,17 @@ impl<W: LayoutElement> Workspace<W> {
     pub fn are_animations_ongoing(&self) -> bool {
         self.scrolling.are_animations_ongoing()
             || self.floating.are_animations_ongoing()
+            || self
+                .sink_overview_foreground
+                .as_ref()
+                .is_some_and(|p| !p.is_done())
             || self.sink.entries().any(|(depth, entry)| {
                 let tile = entry.tile();
                 (tile.sink_presentation.as_ref().is_none_or(|p| !p.is_done())
+                    || tile
+                        .sink_overview_presentation
+                        .as_ref()
+                        .is_some_and(|p| !p.is_done())
                     || self
                         .sink_render_pose(depth, tile)
                         .is_some_and(|pose| pose.alpha > 0.))
@@ -445,6 +468,10 @@ impl<W: LayoutElement> Workspace<W> {
     pub fn are_transitions_ongoing(&self) -> bool {
         self.scrolling.are_transitions_ongoing()
             || self.floating.are_transitions_ongoing()
+            || self
+                .sink_overview_foreground
+                .as_ref()
+                .is_some_and(|p| !p.is_done())
             || self.sink.tiles().any(Tile::are_transitions_ongoing)
     }
 
@@ -583,6 +610,12 @@ impl<W: LayoutElement> Workspace<W> {
         self.sink_overview_frame = frame;
         if self.sink_overview_frame.is_none() {
             self.sink_overview_snapshot.borrow_mut().take();
+            self.sink_overview_foreground = None;
+            for tile in self.tiles_mut() {
+                tile.sink_overview_presentation = None;
+            }
+        } else {
+            self.retarget_sink_overview_presentations();
         }
     }
 
@@ -627,9 +660,61 @@ impl<W: LayoutElement> Workspace<W> {
         let Some(frame) = self.sink_overview_frame.as_ref() else {
             return 0.;
         };
-        self.sink_overview_geometry().map_or(0., |snapshot| {
-            snapshot.geometry.foreground_offset / frame.output.zoom * frame.progress
-        })
+        self.sink_overview_foreground_value() * frame.progress
+    }
+
+    fn sink_overview_foreground_value(&self) -> f64 {
+        self.sink_overview_foreground
+            .as_ref()
+            .map_or(0., |p| p.bounded_pose().position.y)
+    }
+
+    fn retarget_sink_overview_presentations(&mut self) {
+        let Some(snapshot) = self.sink_overview_geometry() else {
+            return;
+        };
+        let zoom = snapshot.output.zoom;
+        let config = self.options.animations.window_movement.0;
+        let animate = self.options.overview.sink.animate && !self.options.animations.off;
+        let to = SinkPose::normal((0., snapshot.geometry.foreground_offset / zoom).into());
+        if let Some(presentation) = &mut self.sink_overview_foreground {
+            presentation.retarget_bounded(to, config);
+        } else {
+            let mut presentation = SinkPresentation::new(self.clock.clone(), to, to, false, config);
+            presentation.finish();
+            self.sink_overview_foreground = Some(presentation);
+        }
+        if !animate {
+            self.sink_overview_foreground.as_mut().unwrap().finish();
+        }
+        let count = self.sink.len();
+        for (depth, entry) in self.sink.entries_mut() {
+            let mut to = snapshot.geometry.pose(depth, zoom);
+            if depth >= snapshot.output.budget.visible_depth
+                && (depth + 1 != count || snapshot.output.budget.tail_height == 0.)
+            {
+                to.alpha = 0.;
+            }
+            let tile = entry.tile_mut();
+            if let Some(presentation) = &mut tile.sink_overview_presentation {
+                presentation.retarget_bounded(to, config);
+            } else {
+                let mut presentation =
+                    SinkPresentation::new(self.clock.clone(), to, to, false, config);
+                presentation.finish();
+                tile.sink_overview_presentation = Some(presentation);
+            }
+            if !animate {
+                tile.sink_overview_presentation.as_mut().unwrap().finish();
+            }
+        }
+        if !animate {
+            for tile in self.tiles_mut() {
+                if let Some(presentation) = &mut tile.sink_overview_presentation {
+                    presentation.finish();
+                }
+            }
+        }
     }
 
     pub(super) fn sink_render_pose(&self, depth: usize, tile: &Tile<W>) -> Option<SinkPose> {
@@ -640,17 +725,43 @@ impl<W: LayoutElement> Workspace<W> {
         if frame.progress == 0. {
             return Some(desktop);
         }
-        // At most D full entries and one aggregated tail source are rendered. No deep browser.
+        // At rest, D full entries and one aggregated tail source. Outgoing entries can fade out.
         if depth >= frame.output.budget.visible_depth
             && (depth + 1 != self.sink.len() || frame.output.budget.tail_height == 0.)
+            && tile
+                .sink_overview_presentation
+                .as_ref()
+                .is_none_or(|p| p.is_done())
         {
             return None;
         }
-        let snapshot = self.sink_overview_geometry()?;
-        let mut expanded = snapshot.geometry.pose(depth, frame.output.zoom);
+        let expanded = tile.sink_overview_presentation.as_ref()?.bounded_pose();
+        let mut pose = desktop.interpolate(expanded, frame.progress);
         // Monitor already moves the foreground origin. Subtract the same shift here exactly once.
-        expanded.position.y -= snapshot.geometry.foreground_offset / frame.output.zoom;
-        Some(desktop.interpolate(expanded, frame.progress))
+        pose.position.y -= self.sink_overview_foreground_offset();
+        Some(pose)
+    }
+
+    pub(super) fn sink_restore_pose(
+        &self,
+        tile: &Tile<W>,
+        pos: Point<f64, Logical>,
+    ) -> Option<SinkPose> {
+        let desktop = tile
+            .sink_presentation
+            .as_ref()?
+            .pose_toward(SinkPose::normal(pos));
+        let Some(frame) = &self.sink_overview_frame else {
+            return Some(desktop);
+        };
+        let Some(presentation) = &tile.sink_overview_presentation else {
+            return Some(desktop);
+        };
+        let to = SinkPose::normal(pos + Point::from((0., self.sink_overview_foreground_value())));
+        let expanded = presentation.bounded_pose_toward(to);
+        let mut pose = desktop.interpolate(expanded, frame.progress);
+        pose.position.y -= self.sink_overview_foreground_offset();
+        Some(pose)
     }
 
     pub fn current_output(&self) -> Option<&Output> {
@@ -1079,6 +1190,14 @@ impl<W: LayoutElement> Workspace<W> {
             .map_or(SinkPose::normal(source_pos), |p| {
                 p.pose_toward(SinkPose::normal(source_pos))
             });
+        let overview_from = self.sink_overview_frame.as_ref().map(|_| {
+            let normal = SinkPose::normal(
+                source_pos + Point::from((0., self.sink_overview_foreground_value())),
+            );
+            tile.sink_overview_presentation
+                .as_ref()
+                .map_or(normal, |p| p.bounded_pose_toward(normal))
+        });
         let mut removed = self.detach_tile(id, Transaction::new());
         removed.tile.sink_generation = removed.tile.sink_generation.wrapping_add(1);
         removed.tile.sink_focus_cancelled = false;
@@ -1097,6 +1216,15 @@ impl<W: LayoutElement> Workspace<W> {
                 false,
                 self.options.animations.window_movement.0,
             ));
+            removed.tile.sink_overview_presentation = overview_from.map(|from| {
+                SinkPresentation::new(
+                    self.clock.clone(),
+                    from,
+                    from,
+                    false,
+                    self.options.animations.window_movement.0,
+                )
+            });
         }
         let restore = if removed.is_floating || restore_floating {
             RestorePlacement::Floating {
@@ -1122,6 +1250,16 @@ impl<W: LayoutElement> Workspace<W> {
     /// Restores the top owner through normal insertion, without output notifications.
     /// N2 may pass false until its visual/client-commit input barrier completes.
     pub(super) fn pull_window(&mut self, activate: bool) -> Option<W::Id> {
+        // Capture both tracks before changing membership or the common foreground target.
+        self.retarget_sink_overview_presentations();
+        let overview_from = self.sink.entries().next().and_then(|(_, entry)| {
+            entry
+                .tile()
+                .sink_overview_presentation
+                .as_ref()
+                .map(SinkPresentation::bounded_pose)
+        });
+        let foreground = self.sink_overview_foreground_value();
         let entry = self.sink.pop()?;
         let maximized = entry.pending_maximized;
         let (tile, restore, source) = entry.into_parts();
@@ -1162,15 +1300,25 @@ impl<W: LayoutElement> Workspace<W> {
             if enabled {
                 tile.window_mut().begin_sink_restore();
                 tile.sink_presentation = Some(SinkPresentation::new(
-                    clock,
+                    clock.clone(),
                     from,
                     SinkPose::normal(pos),
                     true,
                     config,
                 ));
+                tile.sink_overview_presentation = overview_from.map(|from| {
+                    SinkPresentation::new(
+                        clock,
+                        from,
+                        SinkPose::normal(pos + Point::from((0., foreground))),
+                        true,
+                        config,
+                    )
+                });
             } else {
                 tile.window_mut().finish_sink_restore();
                 tile.sink_presentation = None;
+                tile.sink_overview_presentation = None;
                 tile.release_sink_projection();
             }
         }
@@ -1190,6 +1338,7 @@ impl<W: LayoutElement> Workspace<W> {
                 presentation.retarget(to, self.options.animations.window_movement.0);
             }
         }
+        self.retarget_sink_overview_presentations();
     }
 
     /// Explicit confirmation path only; generic activation never unwinds a Sink stack.
@@ -2165,8 +2314,7 @@ impl<W: LayoutElement> Workspace<W> {
                 if !visible {
                     continue;
                 }
-                if let Some(presentation) = &tile.sink_presentation {
-                    let pose = presentation.pose_toward(SinkPose::normal(pos));
+                if let Some(pose) = self.sink_restore_pose(tile, pos) {
                     if let Some(element) = tile.render_projected(ctx.r(), pose, xray_pos, false) {
                         push(element.into());
                     }
@@ -2349,8 +2497,7 @@ impl<W: LayoutElement> Workspace<W> {
             .tiles_with_render_positions()
             .any(|(tile, position, visible)| {
                 visible
-                    && tile.sink_presentation.as_ref().is_some_and(|presentation| {
-                        let pose = presentation.pose_toward(SinkPose::normal(position));
+                    && self.sink_restore_pose(tile, position).is_some_and(|pose| {
                         pose.alpha > 0.
                             && tile
                                 .hit((pos - pose.position).downscale(pose.scale))

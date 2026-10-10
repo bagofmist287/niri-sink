@@ -44,6 +44,9 @@ pub struct Tile<W: LayoutElement> {
     pub(super) sink_generation: u64,
     pub(super) sink_focus_cancelled: bool,
     pub(super) sink_presentation: Option<SinkPresentation>,
+    /// Local expanded pose, relative to the workspace origin before its common F displacement.
+    /// It owns no source and does not drive the Overview opening/closing clock.
+    pub(super) sink_overview_presentation: Option<SinkPresentation>,
     projection_buffer: std::cell::RefCell<Option<Rc<ProjectionBuffer>>>,
 
     /// The toplevel window itself.
@@ -204,6 +207,7 @@ impl<W: LayoutElement> Tile<W> {
             sink_generation: 0,
             sink_focus_cancelled: false,
             sink_presentation: None,
+            sink_overview_presentation: None,
             projection_buffer: Default::default(),
             window,
             border: FocusRing::new(border_config.into()),
@@ -241,6 +245,7 @@ impl<W: LayoutElement> Tile<W> {
             self.sink_generation = self.sink_generation.wrapping_add(1);
             self.sink_focus_cancelled = false;
             self.sink_presentation = None;
+            self.sink_overview_presentation = None;
             self.release_sink_projection();
             self.window.finish_sink_restore();
         }
@@ -434,6 +439,9 @@ impl<W: LayoutElement> Tile<W> {
     }
 
     pub fn advance_animations(&mut self) {
+        if let Some(presentation) = &mut self.sink_overview_presentation {
+            presentation.advance();
+        }
         if let Some(presentation) = &mut self.sink_presentation {
             presentation.advance();
         }
@@ -484,6 +492,10 @@ impl<W: LayoutElement> Tile<W> {
                 .sink_presentation
                 .as_ref()
                 .is_some_and(|p| p.restoring && (!p.is_done() || !self.window.sink_input_ready()))
+            || self
+                .sink_overview_presentation
+                .as_ref()
+                .is_some_and(|p| p.restoring && !p.is_done())
     }
 
     pub(super) fn release_sink_projection(&self) {
@@ -515,9 +527,13 @@ impl<W: LayoutElement> Tile<W> {
     }
 
     pub fn are_transitions_ongoing(&self) -> bool {
-        self.sink_presentation
+        self.sink_overview_presentation
             .as_ref()
             .is_some_and(|p| !p.is_done())
+            || self
+                .sink_presentation
+                .as_ref()
+                .is_some_and(|p| !p.is_done())
             || self.open_animation.is_some()
             || self.resize_animation.is_some()
             || self.move_x_animation.is_some()

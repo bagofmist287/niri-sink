@@ -89,6 +89,25 @@ impl SinkPresentation {
             self.from.interpolate(to, self.animation.value())
         }
     }
+
+    /// Local Overview reflows stay in the convex hull of their endpoints. The native desktop
+    /// presentation and the shared Overview opening spring keep their usual overshoot.
+    pub fn bounded_pose(&self) -> SinkPose {
+        self.bounded_pose_toward(self.to)
+    }
+
+    pub fn bounded_pose_toward(&self, to: SinkPose) -> SinkPose {
+        if self.finished {
+            to
+        } else {
+            self.from
+                .interpolate(to, self.animation.clamped_value().clamp(0., 1.))
+        }
+    }
+
+    pub fn finish(&mut self) {
+        self.finished = true;
+    }
     pub fn is_done(&self) -> bool {
         self.finished || self.animation.is_done()
     }
@@ -99,10 +118,18 @@ impl SinkPresentation {
     }
 
     pub fn retarget(&mut self, to: SinkPose, config: niri_config::Animation) {
+        self.retarget_from(self.pose(), to, config);
+    }
+
+    pub fn retarget_bounded(&mut self, to: SinkPose, config: niri_config::Animation) {
+        self.retarget_from(self.bounded_pose(), to, config);
+    }
+
+    fn retarget_from(&mut self, from: SinkPose, to: SinkPose, config: niri_config::Animation) {
         if self.to == to {
             return;
         }
-        self.from = self.pose();
+        self.from = from;
         self.finished = false;
         self.to = to;
         self.animation = self.animation.restarted(0., 1., 0.);
@@ -183,6 +210,37 @@ mod tests {
         assert!((0. ..=1.).contains(&from.interpolate(to, 5.).alpha));
         assert!(to.interpolate(from, -5.).scale > 0.);
     }
+    #[test]
+    fn local_reflow_bounds_custom_overshoot_and_retargets_from_displayed_pose() {
+        let mut clock = Clock::with_time(Duration::ZERO);
+        let config = niri_config::Animation {
+            off: false,
+            kind: niri_config::animations::Kind::Easing(niri_config::animations::EasingParams {
+                duration_ms: 1000,
+                curve: niri_config::animations::Curve::CubicBezier(0.2, -4., 0.8, 5.),
+            }),
+        };
+        let from = SinkPose::normal((200., 300.).into());
+        let to = SinkPose {
+            position: (50., -60.).into(),
+            scale: 0.5,
+            alpha: 0.3,
+        };
+        let mut presentation = SinkPresentation::new(clock.clone(), from, to, false, config);
+        for millis in 0..=1000 {
+            clock.set_unadjusted(Duration::from_millis(millis));
+            let pose = presentation.bounded_pose();
+            assert!((50. ..=200.).contains(&pose.position.x));
+            assert!((-60. ..=300.).contains(&pose.position.y));
+            assert!((0.5..=1.).contains(&pose.scale));
+        }
+        clock.set_unadjusted(Duration::from_millis(200));
+        let before = presentation.bounded_pose();
+        let reversed = SinkPose::normal((250., 350.).into());
+        presentation.retarget_bounded(reversed, config);
+        assert_eq!(presentation.bounded_pose(), before);
+    }
+
     #[test]
     fn only_corresponding_commit_or_original_deadline_releases_input() {
         let now = Instant::now();

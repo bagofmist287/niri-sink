@@ -573,6 +573,151 @@ fn overview_tail_keeps_native_animation_live_only_while_visible() {
 }
 
 #[test]
+fn overview_local_sink_pull_reverses_from_current_frame_and_only_moves_its_workspace() {
+    use crate::layout::sink_presentation::SinkPose;
+
+    fn pose(ws: &Workspace<TestWindow>, id: usize) -> SinkPose {
+        let tile = ws.tiles().find(|tile| tile.window().id() == &id).unwrap();
+        let mut pose = if let Some(depth) = ws.sink_depth(&id) {
+            ws.sink_render_pose(depth, tile).unwrap()
+        } else {
+            let (_, position, _) = ws
+                .tiles_with_render_positions()
+                .find(|(tile, _, _)| tile.window().id() == &id)
+                .unwrap();
+            ws.sink_restore_pose(tile, position)
+                .unwrap_or(SinkPose::normal(position))
+        };
+        pose.position.y += ws.sink_overview_foreground_offset();
+        pose
+    }
+    fn same_frame(a: SinkPose, b: SinkPose) {
+        assert_abs_diff_eq!(a.position.x, b.position.x, epsilon = 1e-8);
+        assert_abs_diff_eq!(a.position.y, b.position.y, epsilon = 1e-8);
+        assert_abs_diff_eq!(a.scale, b.scale, epsilon = 1e-8);
+        assert_abs_diff_eq!(a.alpha, b.alpha, epsilon = 1e-8);
+    }
+
+    let mut config = Config::default();
+    config.sink.enabled = true;
+    let mut layout = Layout::<TestWindow>::new(Clock::with_time(Duration::ZERO), &config);
+    Op::AddOutput(1).apply(&mut layout);
+    for id in 1..=2 {
+        let mut params = TestWindowParams::new(id);
+        params.is_floating = true;
+        Op::AddWindow { params }.apply(&mut layout);
+        Op::SetForcedSize {
+            id,
+            size: Some((300, 200).into()),
+        }
+        .apply(&mut layout);
+        settle_system_layout(&mut layout);
+        if id == 1 {
+            assert!(layout.sink_window());
+        }
+    }
+    layout.open_overview();
+    Op::CompleteAnimations.apply(&mut layout);
+    let output = layout.outputs().next().unwrap().clone();
+    let other_geos: Vec<_> = layout
+        .monitor_for_output(&output)
+        .unwrap()
+        .workspaces_with_render_geo_cull(false)
+        .skip(1)
+        .map(|(ws, geo)| (ws.id(), geo))
+        .collect();
+    let ws = layout.active_workspace().unwrap();
+    let first = pose(ws, 1);
+    let second = pose(ws, 2);
+    let foreground = ws.sink_overview_foreground_offset();
+    assert!(layout.sink_window());
+    assert!(layout.is_overview_open());
+    let ws = layout.active_workspace().unwrap();
+    same_frame(first, pose(ws, 1));
+    same_frame(second, pose(ws, 2));
+    assert_eq!(foreground, ws.sink_overview_foreground_offset());
+    Op::AdvanceAnimations { msec_delta: 32 }.apply(&mut layout);
+    let ws = layout.active_workspace().unwrap();
+    let current = pose(ws, 2);
+    assert_ne!(current, second);
+    assert!(ws.sink_overview_foreground_offset() > foreground);
+    assert_eq!(layout.pull_window(), Some(2));
+    assert!(layout.is_overview_open());
+    same_frame(current, pose(layout.active_workspace().unwrap(), 2));
+    assert!(layout.active_workspace().unwrap().active_window().is_none());
+    Op::AdvanceAnimations { msec_delta: 16 }.apply(&mut layout);
+    let current = pose(layout.active_workspace().unwrap(), 2);
+    // Reverse Pull before either the original or local visual transition completes.
+    assert!(layout.sink_window());
+    same_frame(current, pose(layout.active_workspace().unwrap(), 2));
+    let after: Vec<_> = layout
+        .monitor_for_output(&output)
+        .unwrap()
+        .workspaces_with_render_geo_cull(false)
+        .skip(1)
+        .map(|(ws, geo)| (ws.id(), geo))
+        .collect();
+    assert_eq!(other_geos, after);
+    let first = pose(layout.active_workspace().unwrap(), 1);
+    let second = pose(layout.active_workspace().unwrap(), 2);
+    assert!(layout.unwind_sink_to(&1));
+    // The Overview confirmation handler follows Unwind with close_overview().
+    layout.close_overview();
+    assert!(!layout.is_overview_open());
+    same_frame(first, pose(layout.active_workspace().unwrap(), 1));
+    same_frame(second, pose(layout.active_workspace().unwrap(), 2));
+    settle_system_layout(&mut layout);
+    Op::CompleteAnimations.apply(&mut layout);
+    assert_eq!(layout.active_workspace().unwrap().sink_count(), 0);
+    assert!(layout
+        .active_workspace()
+        .unwrap()
+        .tiles()
+        .all(|tile| tile.sink_presentation.is_none() && tile.sink_overview_presentation.is_none()));
+    layout.verify_invariants();
+}
+
+#[test]
+fn overview_disabling_additional_animation_finishes_local_tracks_without_changing_native_barrier() {
+    let mut config = Config::default();
+    config.sink.enabled = true;
+    let mut layout = Layout::<TestWindow>::new(Clock::with_time(Duration::ZERO), &config);
+    Op::AddOutput(1).apply(&mut layout);
+    Op::AddWindow {
+        params: TestWindowParams::new(1),
+    }
+    .apply(&mut layout);
+    settle_system_layout(&mut layout);
+    layout.open_overview();
+    Op::CompleteAnimations.apply(&mut layout);
+    assert!(layout.sink_window());
+    Op::AdvanceAnimations { msec_delta: 16 }.apply(&mut layout);
+    config.overview.sink.animate = false;
+    layout.update_config(&config);
+    let ws = layout.active_workspace().unwrap();
+    let tile = ws.tiles().next().unwrap();
+    assert!(tile.sink_overview_presentation.as_ref().unwrap().is_done());
+    assert!(!tile.sink_presentation.as_ref().unwrap().is_done());
+    assert_eq!(layout.pull_window(), Some(1));
+    assert!(layout.is_overview_open());
+    let ws = layout.active_workspace().unwrap();
+    let (tile, pos, _) = ws.tiles_with_render_positions().next().unwrap();
+    assert_eq!(ws.sink_restore_pose(tile, pos).unwrap().position, pos);
+    assert!(tile.sink_input_blocked());
+    settle_system_layout(&mut layout);
+    Op::CompleteAnimations.apply(&mut layout);
+    assert_eq!(
+        layout
+            .active_workspace()
+            .unwrap()
+            .active_window()
+            .map(LayoutElement::id),
+        Some(&1)
+    );
+    layout.verify_invariants();
+}
+
+#[test]
 fn workspace_lifo_unwind_and_arbitrary_close_preserve_other_owners() {
     let mut workspace = Workspace::new_no_outputs(Clock::with_time(Duration::ZERO), Rc::default());
     for id in 1..=4 {

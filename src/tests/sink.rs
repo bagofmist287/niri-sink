@@ -3,9 +3,9 @@ use std::time::{Duration, Instant};
 use niri_config::{Action, Config};
 use smithay::desktop::Window;
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
-use wayland_client::Proxy as _;
 use smithay::reexports::wayland_server::Resource as _;
 use smithay::wayland::xdg_activation::{XdgActivationHandler, XdgActivationTokenData};
+use wayland_client::Proxy as _;
 
 use super::client::ClientId;
 use super::*;
@@ -1109,7 +1109,13 @@ fn actual_session_lock_rejects_even_allow_when_locked_sink_actions() {
 }
 
 fn resizing_pull() -> (Fixture, ClientId, Vec<(WlSurface, Window, u64)>) {
-    let config = Config::parse_mem("sink { enabled true; }; animations { off; }").unwrap();
+    resizing_pull_context(false)
+}
+
+fn resizing_pull_context(overview: bool) -> (Fixture, ClientId, Vec<(WlSurface, Window, u64)>) {
+    let mut config = Config::default();
+    config.sink.enabled = true;
+    config.animations.off = !overview;
     let (mut fixture, client, windows) = setup(config);
     fixture.niri_state().do_action(Action::PullWindow, false);
     settle(&mut fixture, client);
@@ -1124,9 +1130,67 @@ fn resizing_pull() -> (Fixture, ClientId, Vec<(WlSurface, Window, u64)>) {
     settle(&mut fixture, client);
     assert!(fixture.niri().layout.sink_window());
     settle(&mut fixture, client);
+    if overview {
+        fixture.niri_state().do_action(Action::OpenOverview, false);
+        fixture.niri_complete_animations();
+        fixture.double_roundtrip(client);
+    }
     fixture.niri_state().do_action(Action::PullWindow, false);
     fixture.double_roundtrip(client);
     (fixture, client, windows)
+}
+
+#[test]
+fn overview_pull_keeps_original_commit_barrier_through_ack_only_and_closing() {
+    let (mut fixture, client, windows) = resizing_pull_context(true);
+    assert!(fixture.niri().layout.is_overview_open());
+    let surface = fixture.client(client).state.windows[2].surface.clone();
+    let deadline = fixture
+        .niri()
+        .layout
+        .windows()
+        .find(|(_, w)| w.window == windows[2].1)
+        .unwrap()
+        .1
+        .sink_input_deadline()
+        .unwrap();
+    fixture.niri_complete_animations();
+    fixture.double_roundtrip(client);
+    // Finishing both visual tracks cannot turn an ack into a processed surface commit.
+    fixture.client(client).window(&surface).ack_last();
+    fixture.double_roundtrip(client);
+    assert!(fixture.niri().layout.focus().is_none());
+    let mapped = fixture
+        .niri()
+        .layout
+        .windows()
+        .find(|(_, w)| w.window == windows[2].1)
+        .unwrap()
+        .1;
+    assert_eq!(mapped.sink_input_deadline(), Some(deadline));
+    fixture.niri_state().do_action(Action::CloseOverview, false);
+    fixture.niri_complete_animations();
+    fixture.double_roundtrip(client);
+    assert!(fixture.niri().layout.focus().is_none());
+    assert_ne!(fixture.niri().keyboard_focus.surface(), Some(&windows[2].0));
+    assert_eq!(
+        fixture
+            .niri()
+            .layout
+            .windows()
+            .find(|(_, w)| w.window == windows[2].1)
+            .unwrap()
+            .1
+            .sink_input_deadline(),
+        Some(deadline)
+    );
+    let window = fixture.client(client).window(&surface);
+    let size = window.configures_received.last().unwrap().1.size;
+    window.set_size(size.0.max(1) as u16, size.1.max(1) as u16);
+    window.commit();
+    fixture.double_roundtrip(client);
+    assert_eq!(fixture.niri().layout.focus().unwrap().window, windows[2].1);
+    assert_eq!(fixture.niri().keyboard_focus.surface(), Some(&windows[2].0));
 }
 
 #[test]
@@ -1475,7 +1539,6 @@ fn pull_session_lock_cancels_old_restore_through_commit_and_unlock() {
     assert_eq!(fixture.niri().keyboard_focus.surface(), Some(&windows[2].0));
 }
 
-
 #[test]
 fn system_real_output_membership_ids_and_independent_stacks_survive_no_outputs() {
     let mut config = Config::default();
@@ -1567,7 +1630,6 @@ fn system_real_output_membership_ids_and_independent_stacks_survive_no_outputs()
     assert_eq!(fixture.niri().layout.sink_depth(&second), None);
     assert_eq!(fixture.niri().layout.windows().count(), 4);
 }
-
 
 #[test]
 fn system_late_parent_change_revokes_child_owned_pointer_and_touch_grabs() {

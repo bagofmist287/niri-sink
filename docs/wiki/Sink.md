@@ -2,8 +2,8 @@
 
 This feature is specific to the personal `niri-sink` fork. It is disabled by default.
 The implementation keeps the original live window and projects it behind normal windows.
-It remains experimental. Overview now expands the background stack; local transition refinement,
-native hardware qualification and personal daily-use confirmation are still in progress.
+It remains experimental. Overview expands the background stack and supports local Sink/Pull;
+gesture/effect qualification, native hardware and personal daily-use confirmation are in progress.
 
 Enable it explicitly:
 
@@ -38,6 +38,14 @@ hint; that hint does not select an arbitrary hidden window. Hidden members remai
 MRU or explicit window ID. Normal, floating and fullscreen foreground windows keep their Z priority.
 Expansion fits each native source without resizing it. Space is reserved for empty workspaces too,
 so the first Sink does not change the other workspaces' spacing.
+
+Sink and Pull keep Overview open. They start from the current displayed pose, including when
+reversing an unfinished restore, and move only that workspace's stack and foreground. Local
+reflow uses the configured `window-movement` animation with its additional progress bounded to
+`[0,1]`, so it stays inside the reserved space. Opening and closing still use niri's one existing
+Overview progress, including its spring/gesture behavior. Turning the additional animation off
+finishes the local properties immediately; the native restore animation and processed-commit input
+barrier remain in force. Clicking a background entry still starts closing Overview immediately.
 
 Both actions do nothing when disabled, locked, grabbed, conflicting with another input owner or
 an interactive move/resize, or when their target is absent. Sink rejects windows already in transient families. When a newly mapped child or a changed parent
