@@ -76,6 +76,7 @@ impl CompositorHandler for State {
         }
 
         if surface == &root_surface {
+            self.refresh_sink_transient_parents();
             // This is a root surface commit. It might have mapped a previously-unmapped toplevel.
             if let Entry::Occupied(entry) = self.niri.unmapped_windows.entry(surface.clone()) {
                 if is_mapped(surface) {
@@ -194,10 +195,11 @@ impl CompositorHandler for State {
                     // The mapped pre-commit hook deals with dma-bufs on its own.
                     self.remove_default_dmabuf_pre_commit_hook(surface);
                     let hook = add_mapped_toplevel_pre_commit_hook(toplevel);
-                    let mapped = {
+                    let mut mapped = {
                         let config = self.niri.config.borrow();
                         Mapped::new(window, rules, hook, &config)
                     };
+                    mapped.sink_parent_input_blocked = self.niri.sink_parent_blocks_input(&mapped);
                     let window = mapped.window.clone();
 
                     let target = if let Some(p) = &parent {

@@ -1,9 +1,9 @@
 # Sink / Pull (personal fork, experimental)
 
 This feature is specific to the personal `niri-sink` fork. It is disabled by default.
-The N2 implementation keeps the original live window and projects it behind normal windows.
-It is an experimental visual prototype; full system compatibility and the expanded Sink Overview
-remain later stages.
+The implementation keeps the original live window and projects it behind normal windows.
+It is an experimental basic MVP. The expanded Sink Overview, native hardware qualification and
+personal daily-use confirmation remain later stages.
 
 Enable it explicitly:
 
@@ -36,7 +36,13 @@ Fully covered or hidden members remain accessible through MRU or explicit window
 expanded Overview is a later stage.
 
 Both actions do nothing when disabled, locked, grabbed, conflicting with another input owner or
-an interactive move/resize, or when their target is absent. Sink currently rejects transient families.
+an interactive move/resize, or when their target is absent. Sink rejects windows already in transient families. When a newly mapped child or a changed parent
+relationship refers to a sunk parent, niri restores through that parent when input ownership permits.
+The child cannot receive input until its ancestor chain has completed restoration, including any
+required processed resize commit. Locks and grabs defer restoration; reparenting or closing the
+parent clears obsolete blocking. A late relationship also revokes an interaction already held
+by the blocked child: pointer presses remain owned until release without client delivery, touch
+is cancelled, and tablet tools leave proximity. Grabs held by unrelated windows are preserved. This does not sink a whole transient group.
 Direct layout edits targeting a sunk ID do nothing. Closing and inventory queries still work.
 
 Fullscreen, maximized and windowed-fullscreen windows retain their native state while sunk.
@@ -53,6 +59,10 @@ including inhibitors on their subsurfaces and tracked popups. Pull restores norm
 the existing visibility and window-rule requirements still apply. System-level FDO idle inhibition
 and always-on output VRR keep their usual behavior. Render visibility and presentation/frame
 callbacks remain available to live projections. Native TTY/DRM behavior is still awaiting validation.
+
+Workspace moves and output disconnection keep independent stacks attached to their workspace
+identities. Removing all outputs preserves the windows for reconnection; native output enter/leave
+notifications and size/scale changes still follow niri policy.
 
 Reloading with `enabled false` restores all stacks in LIFO order, including workspaces without
 outputs, preserving any existing normal focus. Changing styles retains membership. `visible-depth`
@@ -81,6 +91,9 @@ overview {
 effects are retained: native window and popup opacity, client alpha, blur (xray and non-xray),
 saturation, noise, effect regions, subsurfaces, borders, corners and shadows. Depth opacity is
 applied once to the combined object. Each capture target has its own cache and retains block-out rules.
+Output recording follows the composed desktop; single-window recording keeps the native source
+without the depth transform. While locked, window recordings clear their buffers and output
+recordings follow the lock screen. Unlocking resumes recording through the existing stream.
 
 Pull immediately schedules normal layout insertion and its native resize transaction while the
 projection returns. Input waits for the visual transition and a processed commit acknowledging the

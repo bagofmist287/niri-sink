@@ -249,6 +249,9 @@ pub trait LayoutElement {
     fn sink_input_ready(&self) -> bool {
         true
     }
+    fn sink_parent_input_blocked(&self) -> bool {
+        false
+    }
     fn sink_input_deadline(&self) -> Option<std::time::Instant> {
         None
     }

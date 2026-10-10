@@ -116,6 +116,7 @@ pub struct Seat {
 
 #[derive(Debug)]
 pub struct Surface {
+    pub output_events_received: Vec<(String, bool)>,
     pub keyboard_events_received: Vec<KeyboardEvent>,
     pub keyboard_events_looked_at: usize,
 }
@@ -368,6 +369,7 @@ impl State {
         self.surfaces.insert(
             surface.clone(),
             Surface {
+                output_events_received: Vec::new(),
                 keyboard_events_received: Vec::new(),
                 keyboard_events_looked_at: 0,
             },
@@ -884,16 +886,32 @@ wayland_client::delegate_noop!(State: wayland_client::protocol::wl_subsurface::W
 
 impl Dispatch<WlSurface, ()> for State {
     fn event(
-        _state: &mut Self,
-        _proxy: &WlSurface,
+        state: &mut Self,
+        proxy: &WlSurface,
         event: <WlSurface as wayland_client::Proxy>::Event,
         _data: &(),
         _conn: &Connection,
         _qhandle: &QueueHandle<Self>,
     ) {
         match event {
-            wl_surface::Event::Enter { .. } => (),
-            wl_surface::Event::Leave { .. } => (),
+            wl_surface::Event::Enter { output } => {
+                let name = state.outputs[&output].clone();
+                state
+                    .surfaces
+                    .get_mut(proxy)
+                    .unwrap()
+                    .output_events_received
+                    .push((name, true));
+            }
+            wl_surface::Event::Leave { output } => {
+                let name = state.outputs[&output].clone();
+                state
+                    .surfaces
+                    .get_mut(proxy)
+                    .unwrap()
+                    .output_events_received
+                    .push((name, false));
+            }
             wl_surface::Event::PreferredBufferScale { .. } => (),
             wl_surface::Event::PreferredBufferTransform { .. } => (),
             _ => unreachable!(),

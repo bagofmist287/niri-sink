@@ -959,6 +959,7 @@ impl XdgShellHandler for State {
     }
 
     fn parent_changed(&mut self, toplevel: ToplevelSurface) {
+        self.refresh_sink_transient_parents();
         let Some(parent) = toplevel.parent() else {
             return;
         };

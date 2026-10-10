@@ -370,3 +370,77 @@ impl ActionHandler for Handler {
         let _ = self.tx.send(Msg::Action(request));
     }
 }
+
+#[cfg(test)]
+mod sink_tests {
+    use super::*;
+    use crate::tests::Fixture;
+    use niri_config::{Action, Config, MruDirection};
+
+    #[test]
+    fn system_accessibility_mru_announces_sunk_title_without_passive_recall() {
+        let mut config = Config::default();
+        config.sink.enabled = true;
+        config.animations.off = true;
+        let mut fixture = Fixture::with_config(config);
+        fixture.add_output(1, (1280, 720));
+        let client = fixture.add_client();
+        for title in ["Sink Alpha", "Sink Beta"] {
+            let surface = fixture.client(client).create_window().surface.clone();
+            fixture
+                .client(client)
+                .window(&surface)
+                .xdg_toplevel
+                .set_title(title.to_owned());
+            fixture.client(client).window(&surface).commit();
+            fixture.double_roundtrip(client);
+            let window = fixture.client(client).window(&surface);
+            window.attach_new_buffer();
+            window.set_size(100, 100);
+            window.ack_last_and_commit();
+            fixture.double_roundtrip(client);
+            fixture.niri_state().do_action(Action::SinkWindow, false);
+            fixture.double_roundtrip(client);
+        }
+        let (tx, rx) = mpsc::sync_channel(16);
+        fixture.niri().a11y.to_accesskit = Some(tx);
+        fixture.niri_state().do_action(
+            Action::MruAdvance {
+                direction: MruDirection::Forward,
+                scope: None,
+                filter: None,
+            },
+            false,
+        );
+        fixture.double_roundtrip(client);
+        fixture.niri().refresh_a11y();
+        assert_eq!(
+            fixture
+                .niri()
+                .layout
+                .active_workspace()
+                .unwrap()
+                .sink_count(),
+            2
+        );
+        let updates = rx.try_iter().collect::<Vec<_>>();
+        assert!(updates.iter().any(|tree| tree.focus == ID_MRU));
+        assert!(updates
+            .iter()
+            .flat_map(|tree| &tree.nodes)
+            .any(|(id, node)| *id == ID_MRU
+                && node.label().is_some_and(|label| label.starts_with("Sink "))));
+        fixture.niri_state().do_action(Action::MruCancel, false);
+        fixture.double_roundtrip(client);
+        assert_eq!(
+            fixture
+                .niri()
+                .layout
+                .active_workspace()
+                .unwrap()
+                .sink_count(),
+            2
+        );
+        fixture.niri().a11y.to_accesskit = None;
+    }
+}

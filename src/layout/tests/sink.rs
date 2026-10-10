@@ -842,3 +842,173 @@ fn restore_pending_floating_role_change_preserves_selected_container() {
         assert_eq!(layout.windows().count(), 1);
     }
 }
+
+fn settle_system_layout(layout: &mut Layout<TestWindow>) {
+    for _ in 0..3 {
+        let ids = layout
+            .windows()
+            .map(|(_, win)| *win.id())
+            .collect::<Vec<_>>();
+        for id in ids {
+            Op::Communicate(id).apply(layout);
+        }
+        Op::Refresh { is_active: true }.apply(layout);
+        layout.verify_invariants();
+    }
+}
+
+#[test]
+fn system_independent_stacks_survive_workspace_moves_all_outputs_removed_and_reordered_reconnect() {
+    for remove_order in [[1, 2, 3], [3, 1, 2]] {
+        let mut options = Options::default();
+        options.sink.enabled = true;
+        let mut layout = Layout::with_options(Clock::with_time(Duration::ZERO), options);
+        for id in 1..=3 {
+            Op::AddOutput(id).apply(&mut layout);
+        }
+        let outputs = (1..=3)
+            .map(|id| {
+                layout
+                    .outputs()
+                    .find(|o| o.name() == format!("output{id}"))
+                    .unwrap()
+                    .clone()
+            })
+            .collect::<Vec<_>>();
+        outputs[1].change_current_state(
+            None,
+            Some(Transform::_90),
+            Some(output::Scale::Fractional(1.25)),
+            None,
+        );
+        outputs[2].change_current_state(
+            None,
+            Some(Transform::_270),
+            Some(output::Scale::Fractional(1.5)),
+            None,
+        );
+        layout.update_output_size(&outputs[1]);
+        layout.update_output_size(&outputs[2]);
+        let mut workspace_ids = Vec::new();
+        let mut owners = Vec::new();
+        for (group, output) in outputs[..2].iter().enumerate() {
+            layout.focus_output(output);
+            for id in (group * 3 + 1)..=(group * 3 + 3) {
+                let mut params = TestWindowParams::new(id);
+                params.is_floating = id % 2 == 0;
+                Op::AddWindow { params }.apply(&mut layout);
+                settle_system_layout(&mut layout);
+                owners.push(
+                    layout
+                        .windows()
+                        .find(|(_, w)| *w.id() == id)
+                        .unwrap()
+                        .1
+                        .clone(),
+                );
+                assert!(layout.sink_window());
+            }
+            workspace_ids.push(layout.active_workspace().unwrap().id());
+        }
+        layout.focus_output(&outputs[0]);
+        assert!(layout.move_workspace_to_output(&outputs[2]));
+        layout.move_workspace_to_idx(None, 0);
+        settle_system_layout(&mut layout);
+        for id in remove_order {
+            Op::RemoveOutput(id).apply(&mut layout);
+            settle_system_layout(&mut layout);
+        }
+        assert_eq!(layout.outputs().count(), 0);
+        assert_eq!(layout.windows().count(), 6);
+        for (group, workspace_id) in workspace_ids.iter().enumerate() {
+            let ws = layout.find_workspace_by_id(*workspace_id).unwrap().1;
+            for depth in 0..3 {
+                assert_eq!(ws.sink_depth(&(group * 3 + 3 - depth)), Some(depth));
+            }
+        }
+        // Close a middle entry without an output; the other workspace must not be affected.
+        Op::CloseWindow(2).apply(&mut layout);
+        for id in [2, 3, 1] {
+            Op::AddOutput(id).apply(&mut layout);
+            settle_system_layout(&mut layout);
+        }
+        for owner in owners.iter().filter(|w| *w.id() != 2) {
+            let current = layout
+                .windows()
+                .find(|(_, w)| w.id() == owner.id())
+                .unwrap()
+                .1;
+            assert!(Rc::ptr_eq(&current.0, &owner.0));
+        }
+        assert_eq!(
+            layout
+                .find_workspace_by_id(workspace_ids[0])
+                .unwrap()
+                .1
+                .sink_count(),
+            2
+        );
+        assert_eq!(
+            layout
+                .find_workspace_by_id(workspace_ids[1])
+                .unwrap()
+                .1
+                .sink_count(),
+            3
+        );
+        assert!(layout.unwind_sink_to(&4));
+        settle_system_layout(&mut layout);
+        assert_eq!(layout.sink_depth(&1), Some(1));
+        assert_eq!(layout.sink_depth(&3), Some(0));
+        assert!(layout
+            .windows()
+            .filter(|(_, w)| *w.id() >= 4)
+            .all(|(_, w)| layout.sink_depth(w.id()).is_none()));
+        assert!(layout.unwind_sink_to(&1));
+        settle_system_layout(&mut layout);
+        assert_eq!(layout.windows().count(), 5);
+        assert!(layout.workspaces().all(|(_, _, ws)| ws.sink_count() == 0));
+    }
+}
+
+#[test]
+fn system_feature_disable_without_outputs_restores_multiple_stacks_in_place() {
+    let mut options = Options::default();
+    options.sink.enabled = true;
+    let mut layout = Layout::with_options(Clock::with_time(Duration::ZERO), options);
+    for out in 1..=2 {
+        Op::AddOutput(out).apply(&mut layout);
+        let output = layout
+            .outputs()
+            .find(|o| o.name() == format!("output{out}"))
+            .unwrap()
+            .clone();
+        layout.focus_output(&output);
+        for id in (out * 3 - 2)..=(out * 3) {
+            Op::AddWindow {
+                params: TestWindowParams::new(id),
+            }
+            .apply(&mut layout);
+            settle_system_layout(&mut layout);
+            assert!(layout.sink_window());
+        }
+    }
+    let workspace_ids = layout
+        .workspaces()
+        .filter(|(_, _, ws)| ws.sink_count() > 0)
+        .map(|(_, _, ws)| ws.id())
+        .collect::<Vec<_>>();
+    Op::RemoveOutput(1).apply(&mut layout);
+    Op::RemoveOutput(2).apply(&mut layout);
+    Op::SetSinkEnabled(false).apply(&mut layout);
+    settle_system_layout(&mut layout);
+    assert_eq!(layout.windows().count(), 6);
+    for id in workspace_ids {
+        let ws = layout.find_workspace_by_id(id).unwrap().1;
+        assert_eq!(ws.sink_count(), 0);
+        assert_eq!(ws.windows().count(), 3);
+    }
+    Op::AddOutput(2).apply(&mut layout);
+    settle_system_layout(&mut layout);
+    assert_eq!(layout.windows().count(), 6);
+}

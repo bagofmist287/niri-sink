@@ -3,6 +3,8 @@ use std::time::{Duration, Instant};
 use niri_config::{Action, Config};
 use smithay::desktop::Window;
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
+use wayland_client::Proxy as _;
+use smithay::reexports::wayland_server::Resource as _;
 use smithay::wayland::xdg_activation::{XdgActivationHandler, XdgActivationTokenData};
 
 use super::client::ClientId;
@@ -469,6 +471,227 @@ fn overview_touch_tap_confirms_but_cancel_motion_and_second_contact_do_not() {
             assert_eq!(fixture.niri().layout.sink_depth(&windows[2].1), Some(0));
         }
     }
+}
+
+fn map_dialog(
+    fixture: &mut Fixture,
+    client: ClientId,
+    parent: &wayland_client::protocol::wl_surface::WlSurface,
+) -> WlSurface {
+    let surface = fixture.client(client).create_window().surface.clone();
+    let parent_top = fixture.client(client).window(parent).xdg_toplevel.clone();
+    fixture
+        .client(client)
+        .window(&surface)
+        .xdg_toplevel
+        .set_parent(Some(&parent_top));
+    fixture.client(client).window(&surface).commit();
+    fixture.double_roundtrip(client);
+    let dialog = fixture.client(client).window(&surface);
+    dialog.attach_new_buffer();
+    dialog.set_size(100, 100);
+    dialog.ack_last_and_commit();
+    fixture.double_roundtrip(client);
+    fixture
+        .niri()
+        .layout
+        .windows()
+        .find(|(_, m)| {
+            m.window.toplevel().unwrap().wl_surface().id().protocol_id()
+                == surface.id().protocol_id()
+        })
+        .unwrap()
+        .1
+        .toplevel()
+        .wl_surface()
+        .clone()
+}
+
+#[test]
+fn system_new_transient_unwinds_parent_and_child_waits_for_parent_commit() {
+    let mut config = Config::default();
+    config.sink.enabled = true;
+    config.animations.off = true;
+    let (mut fixture, client, windows) = setup(config);
+    let parent = fixture.client(client).state.windows[0].surface.clone();
+    fixture
+        .client(client)
+        .window(&parent)
+        .xdg_toplevel
+        .set_fullscreen(None);
+    fixture.double_roundtrip(client);
+    let dialog = map_dialog(&mut fixture, client, &parent);
+    assert!(windows
+        .iter()
+        .all(|(_, w, _)| fixture.niri().layout.sink_depth(w).is_none()));
+    assert_ne!(fixture.niri().keyboard_focus.surface(), Some(&dialog));
+    assert!(
+        fixture
+            .niri()
+            .layout
+            .find_window_and_output(&dialog)
+            .unwrap()
+            .0
+            .sink_parent_input_blocked
+    );
+    settle(&mut fixture, client);
+    assert!(
+        !fixture
+            .niri()
+            .layout
+            .find_window_and_output(&dialog)
+            .unwrap()
+            .0
+            .sink_parent_input_blocked
+    );
+    let id = fixture
+        .niri()
+        .layout
+        .find_window_and_output(&dialog)
+        .unwrap()
+        .0
+        .id()
+        .get();
+    fixture
+        .niri_state()
+        .do_action(Action::FocusWindow(id), false);
+    fixture.double_roundtrip(client);
+    assert_eq!(fixture.niri().keyboard_focus.surface(), Some(&dialog));
+    assert!(!fixture.niri().layout.sink_window());
+    fixture.niri().layout.activate_window(&windows[0].1);
+    assert!(!fixture.niri().layout.sink_window());
+    assert_eq!(fixture.niri().layout.windows().count(), 4);
+}
+
+#[test]
+fn system_transient_defers_during_input_owner_and_reparent_or_close_clears_block() {
+    use crate::input::click_grab::ClickGrab;
+    use smithay::input::pointer::{Focus, GrabStartData};
+    use smithay::utils::Serial;
+    for finish in ["permit", "reparent", "parent-close", "child-close"] {
+        let mut config = Config::default();
+        config.sink.enabled = true;
+        config.animations.off = true;
+        let (mut fixture, client, windows) = setup(config);
+        let pointer = fixture.niri().seat.get_pointer().unwrap();
+        pointer.set_grab(
+            fixture.niri_state(),
+            ClickGrab::new(GrabStartData {
+                focus: None,
+                button: 0x110,
+                location: (10., 10.).into(),
+            }),
+            Serial::from(980),
+            Focus::Keep,
+        );
+        let parent = fixture.client(client).state.windows[0].surface.clone();
+        let dialog = map_dialog(&mut fixture, client, &parent);
+        assert_eq!(fixture.niri().layout.sink_depth(&windows[0].1), Some(2));
+        assert!(
+            fixture
+                .niri()
+                .layout
+                .find_window_and_output(&dialog)
+                .unwrap()
+                .0
+                .sink_parent_input_blocked
+        );
+        assert_ne!(fixture.niri().keyboard_focus.surface(), Some(&dialog));
+        let cs = fixture.client(client).state.windows[3].surface.clone();
+        match finish {
+            "reparent" => fixture
+                .client(client)
+                .window(&cs)
+                .xdg_toplevel
+                .set_parent(None),
+            "parent-close" => {
+                fixture
+                    .client(client)
+                    .window(&parent)
+                    .surface
+                    .attach(None, 0, 0);
+                fixture.client(client).window(&parent).commit();
+            }
+            "child-close" => {
+                fixture
+                    .client(client)
+                    .window(&cs)
+                    .surface
+                    .attach(None, 0, 0);
+                fixture.client(client).window(&cs).commit();
+            }
+            _ => {}
+        }
+        fixture.double_roundtrip(client);
+        pointer.unset_grab(
+            fixture.niri_state(),
+            Serial::from(981),
+            smithay::backend::input::InputTime::now(),
+        );
+        fixture.double_roundtrip(client);
+        settle(&mut fixture, client);
+        if finish == "permit" {
+            assert_eq!(fixture.niri().layout.sink_depth(&windows[0].1), None);
+        } else {
+            assert_eq!(fixture.niri().layout.sink_depth(&windows[2].1), Some(0));
+        }
+        if finish != "child-close" {
+            assert!(
+                !fixture
+                    .niri()
+                    .layout
+                    .find_window_and_output(&dialog)
+                    .unwrap()
+                    .0
+                    .sink_parent_input_blocked
+            );
+        }
+        assert_eq!(
+            fixture.niri().layout.windows().count(),
+            if finish.ends_with("close") { 3 } else { 4 }
+        );
+    }
+}
+
+#[test]
+fn system_mapped_reparent_under_lock_defers_and_unlock_repairs_without_stale_focus() {
+    let mut config = Config::default();
+    config.sink.enabled = true;
+    config.animations.off = true;
+    let (mut fixture, client, windows) = setup(config);
+    fixture.niri_state().do_action(Action::PullWindow, false);
+    settle(&mut fixture, client);
+    let lock = lock_fixture(&mut fixture, client);
+    let parent = fixture.client(client).state.windows[0].xdg_toplevel.clone();
+    fixture.client(client).state.windows[2]
+        .xdg_toplevel
+        .set_parent(Some(&parent));
+    fixture.double_roundtrip(client);
+    assert_eq!(fixture.niri().layout.sink_depth(&windows[0].1), Some(1));
+    assert!(
+        fixture
+            .niri()
+            .layout
+            .find_window_and_output(&windows[2].0)
+            .unwrap()
+            .0
+            .sink_parent_input_blocked
+    );
+    assert_ne!(fixture.niri().keyboard_focus.surface(), Some(&windows[2].0));
+    lock.unlock_and_destroy();
+    fixture.double_roundtrip(client);
+    settle(&mut fixture, client);
+    assert_eq!(fixture.niri().layout.sink_depth(&windows[0].1), None);
+    assert!(
+        !fixture
+            .niri()
+            .layout
+            .find_window_and_output(&windows[2].0)
+            .unwrap()
+            .0
+            .sink_parent_input_blocked
+    );
+    assert_eq!(fixture.niri().layout.windows().count(), 3);
 }
 
 #[test]
@@ -1250,4 +1473,171 @@ fn pull_session_lock_cancels_old_restore_through_commit_and_unlock() {
         .do_action(Action::FocusColumnLast, false);
     fixture.double_roundtrip(client);
     assert_eq!(fixture.niri().keyboard_focus.surface(), Some(&windows[2].0));
+}
+
+
+#[test]
+fn system_real_output_membership_ids_and_independent_stacks_survive_no_outputs() {
+    let mut config = Config::default();
+    config.sink.enabled = true;
+    config.animations.off = true;
+    let (mut fixture, client, windows) = setup(config);
+    let ws1 = fixture.niri().layout.active_workspace().unwrap().id();
+    fixture.add_output(2, (1920, 1080));
+    fixture.double_roundtrip(client);
+    let out1 = fixture.niri_output(1);
+    let out2 = fixture.niri_output(2);
+    out2.change_current_state(
+        None,
+        Some(smithay::utils::Transform::_90),
+        Some(smithay::output::Scale::Fractional(1.5)),
+        None,
+    );
+    fixture.niri().layout.update_output_size(&out2);
+    fixture.niri_focus_output(2);
+    let surface = fixture.client(client).create_window().surface.clone();
+    fixture.client(client).window(&surface).commit();
+    fixture.double_roundtrip(client);
+    let win = fixture.client(client).window(&surface);
+    win.attach_new_buffer();
+    win.set_size(120, 120);
+    win.ack_last_and_commit();
+    fixture.double_roundtrip(client);
+    let second = fixture.niri().layout.focus().unwrap().window.clone();
+    let second_id = fixture.niri().layout.focus().unwrap().id().get();
+    let ws2 = fixture.niri().layout.active_workspace().unwrap().id();
+    assert!(fixture.niri().layout.sink_window());
+    fixture.double_roundtrip(client);
+    fixture.niri().remove_output(&out1);
+    fixture.double_roundtrip(client);
+    assert_eq!(
+        fixture
+            .niri()
+            .layout
+            .find_workspace_by_id(ws1)
+            .unwrap()
+            .1
+            .sink_count(),
+        3
+    );
+    for client_surface in fixture.client(client).state.windows[..3]
+        .iter()
+        .map(|w| w.surface.clone())
+        .collect::<Vec<_>>()
+    {
+        let events = &fixture.client(client).state.surfaces[&client_surface].output_events_received;
+        assert!(events.windows(2).any(|e| e
+            == [
+                ("headless-1".to_owned(), false),
+                ("headless-2".to_owned(), true)
+            ]));
+    }
+    fixture.niri().remove_output(&out2);
+    fixture.double_roundtrip(client);
+    assert_eq!(fixture.niri().layout.windows().count(), 4);
+    fixture.add_output(1, (1280, 720));
+    fixture.double_roundtrip(client);
+    for (_, window, id) in &windows {
+        let mapped = fixture
+            .niri()
+            .layout
+            .windows()
+            .find(|(_, w)| &w.window == window)
+            .unwrap()
+            .1;
+        assert_eq!(mapped.id().get(), *id);
+    }
+    assert_eq!(
+        fixture
+            .niri()
+            .layout
+            .find_workspace_by_id(ws2)
+            .unwrap()
+            .1
+            .sink_depth(&second),
+        Some(0)
+    );
+    assert!(fixture.niri_state().prepare_sink_recall(&windows[0].1));
+    assert_eq!(fixture.niri().layout.sink_depth(&second), Some(0));
+    settle(&mut fixture, client);
+    fixture
+        .niri_state()
+        .do_action(Action::FocusWindow(second_id), false);
+    settle(&mut fixture, client);
+    assert_eq!(fixture.niri().layout.sink_depth(&second), None);
+    assert_eq!(fixture.niri().layout.windows().count(), 4);
+}
+
+
+#[test]
+fn system_late_parent_change_revokes_child_owned_pointer_and_touch_grabs() {
+    use crate::input::click_grab::ClickGrab;
+    use smithay::input::pointer::{Focus, GrabStartData};
+    use smithay::utils::Serial;
+    for device in ["pointer", "touch"] {
+        let mut config = Config::default();
+        config.sink.enabled = true;
+        config.animations.off = true;
+        let (mut fixture, client, windows) = setup(config);
+        fixture.niri_state().do_action(Action::PullWindow, false);
+        settle(&mut fixture, client);
+        let pointer = fixture.niri().seat.get_pointer().unwrap();
+        let touch = fixture.niri().seat.add_touch();
+        if device == "pointer" {
+            pointer.set_grab(
+                fixture.niri_state(),
+                ClickGrab::new(GrabStartData {
+                    focus: Some((windows[2].0.clone(), (0., 0.).into())),
+                    button: 0x110,
+                    location: (10., 10.).into(),
+                }),
+                Serial::from(985),
+                Focus::Keep,
+            );
+        } else {
+            touch.down(
+                fixture.niri_state(),
+                Some((windows[2].0.clone(), (0., 0.).into())),
+                &smithay::input::touch::DownEvent {
+                    slot: Some(0).into(),
+                    location: (10., 10.).into(),
+                    serial: Serial::from(985),
+                    time: smithay::backend::input::InputTime::now(),
+                },
+            );
+            assert!(touch.is_grabbed());
+        }
+        let parent = fixture.client(client).state.windows[0].xdg_toplevel.clone();
+        fixture.client(client).state.windows[2]
+            .xdg_toplevel
+            .set_parent(Some(&parent));
+        fixture.double_roundtrip(client);
+        if device == "pointer" {
+            assert!(pointer.grab_start_data().unwrap().focus.is_none());
+            assert_eq!(fixture.niri().layout.sink_depth(&windows[0].1), Some(1));
+            assert_ne!(fixture.niri().keyboard_focus.surface(), Some(&windows[2].0));
+            pointer.unset_grab(
+                fixture.niri_state(),
+                Serial::from(986),
+                smithay::backend::input::InputTime::now(),
+            );
+        } else {
+            assert!(!touch.is_grabbed());
+        }
+        fixture.double_roundtrip(client);
+        settle(&mut fixture, client);
+        assert!(windows
+            .iter()
+            .all(|(_, w, _)| fixture.niri().layout.sink_depth(w).is_none()));
+        assert!(
+            !fixture
+                .niri()
+                .layout
+                .find_window_and_output(&windows[2].0)
+                .unwrap()
+                .0
+                .sink_parent_input_blocked
+        );
+        assert_eq!(fixture.niri().layout.windows().count(), 3);
+    }
 }

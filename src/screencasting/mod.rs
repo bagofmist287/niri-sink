@@ -175,6 +175,17 @@ impl State {
         // Use a loop {} so we can break instead of early-return.
         #[allow(clippy::never_loop)]
         loop {
+            // A window target bypasses the output's lock-screen render path. Clear
+            // its buffers as well, including redraws requested by PipeWire itself.
+            if self.niri.is_locked() {
+                self.backend.with_primary_renderer(|renderer| {
+                    if cast.dequeue_buffer_and_clear(renderer) {
+                        cast.record_frame_time(get_monotonic_time());
+                    }
+                });
+                break;
+            }
+
             let mut windows = self.niri.layout.windows();
             let Some((_, mapped)) = windows.find(|(_, mapped)| mapped.id().get() == id) else {
                 break;
@@ -642,6 +653,13 @@ impl Niri {
             let CastTarget::Window { id } = cast.target else {
                 continue;
             };
+
+            if self.is_locked() {
+                if cast.dequeue_buffer_and_clear(renderer) {
+                    cast.record_frame_time(target_presentation_time);
+                }
+                continue;
+            }
 
             let mut windows = self.layout.windows_for_output(output);
             let Some(mapped) = windows.find(|win| win.id().get() == id) else {

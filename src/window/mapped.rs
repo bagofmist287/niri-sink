@@ -88,6 +88,7 @@ pub struct Mapped {
     offscreen_data: crate::render_helpers::offscreen::OffscreenDataSlot,
     sink_input_barrier: Option<SinkInputBarrier>,
     sink_restoring: bool,
+    pub(crate) sink_parent_input_blocked: bool,
 
     /// Whether this has an urgent indicator.
     is_urgent: bool,
@@ -291,6 +292,7 @@ impl Mapped {
             offscreen_data: Rc::new(RefCell::new(None)),
             sink_input_barrier: None,
             sink_restoring: false,
+            sink_parent_input_blocked: false,
             is_urgent: false,
             is_focused: false,
             is_active_in_column: true,
@@ -1054,6 +1056,10 @@ impl LayoutElement for Mapped {
     fn sink_input_ready(&self) -> bool {
         self.sink_input_barrier
             .is_none_or(|barrier| barrier.ready(Instant::now()))
+    }
+
+    fn sink_parent_input_blocked(&self) -> bool {
+        self.sink_parent_input_blocked
     }
 
     fn sink_input_deadline(&self) -> Option<Instant> {

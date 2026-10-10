@@ -845,6 +845,7 @@ impl State {
         // These should be called periodically, before flushing the clients.
         self.niri.popups.cleanup();
         self.refresh_popup_grab();
+        self.refresh_sink_transient_parents();
         self.update_keyboard_focus();
 
         // Should be called before refresh_layout() because that one will refresh other window
@@ -1273,6 +1274,117 @@ impl State {
                 })
                 .unwrap();
             self.niri.sink_input_timer = Some((token, deadline));
+        }
+    }
+
+    /// Restore newly related parents without bypassing any existing input owner. Children remain
+    /// in the normal inventory, but cannot receive input until their whole ancestor chain is ready.
+    pub(crate) fn refresh_sink_transient_parents(&mut self) {
+        self.niri
+            .layout
+            .with_windows_mut(|mapped, _| mapped.sink_parent_input_blocked = false);
+        if !self.niri.layout.workspaces().any(|(_, _, ws)| {
+            ws.sink_count() > 0 || ws.tiles().any(|tile| tile.is_sink_restoring())
+        }) {
+            return;
+        }
+        if self.can_recall_sink(false) {
+            let parents: Vec<_> = self
+                .niri
+                .layout
+                .windows()
+                .map(|(_, mapped)| &mapped.window)
+                .chain(
+                    self.niri
+                        .unmapped_windows
+                        .values()
+                        .filter(|unmapped| {
+                            crate::utils::is_mapped(
+                                unmapped.window.toplevel().unwrap().wl_surface(),
+                            )
+                        })
+                        .map(|unmapped| &unmapped.window),
+                )
+                .filter_map(|window| window.toplevel()?.parent())
+                .filter_map(|surface| self.niri.layout.find_window_and_output(&surface))
+                .map(|(mapped, _)| mapped.window.clone())
+                .filter(|window| self.niri.layout.sink_depth(window).is_some())
+                .collect();
+            for parent in parents {
+                self.prepare_sink_recall(&parent);
+            }
+        }
+        let blocked: Vec<_> = self
+            .niri
+            .layout
+            .windows()
+            .filter(|(_, mapped)| self.niri.sink_parent_blocks_input(mapped))
+            .map(|(_, mapped)| mapped.window.clone())
+            .collect();
+        for window in &blocked {
+            if let Some((mapped, _)) = self
+                .niri
+                .layout
+                .find_window_and_output_mut(window.toplevel().unwrap().wl_surface())
+            {
+                mapped.sink_parent_input_blocked = true;
+            }
+        }
+
+        // A late parent change can invalidate an interaction already owned by the child.
+        // Hit testing alone cannot revoke the surface retained by an existing grab.
+        let blocked_surface = |surface: &WlSurface| {
+            blocked.iter().any(|window| {
+                let mut owned = false;
+                window.with_surfaces(|candidate, _| owned |= candidate == surface);
+                owned
+            })
+        };
+        if let Some(pointer) = self.niri.seat.get_pointer() {
+            if let Some(mut start) = pointer.grab_start_data().filter(|start| {
+                start
+                    .focus
+                    .as_ref()
+                    .is_some_and(|(surface, _)| blocked_surface(surface))
+            }) {
+                // Keep the physical press owned until release, but revoke client delivery.
+                start.focus = None;
+                pointer.set_grab(
+                    self,
+                    crate::input::click_grab::ClickGrab::new(start),
+                    SERIAL_COUNTER.next_serial(),
+                    Focus::Clear,
+                );
+            }
+        }
+        if let Some(touch) = self.niri.seat.get_touch() {
+            if touch.grab_start_data().is_some_and(|start| {
+                start
+                    .focus
+                    .as_ref()
+                    .is_some_and(|(surface, _)| blocked_surface(surface))
+            }) {
+                touch.cancel(self);
+                touch.unset_grab(self);
+            }
+        }
+        for tool in self.niri.seat.tablet_seat().get_tools().into_values() {
+            if tool.grab_start_data().is_some_and(|start| {
+                start
+                    .focus
+                    .as_ref()
+                    .is_some_and(|(surface, _)| blocked_surface(surface))
+            }) {
+                let time = InputTime::now();
+                tool.unset_grab(self, SERIAL_COUNTER.next_serial(), time);
+                tool.proximity_out(
+                    self,
+                    &smithay::input::tablet::tool::ProximityOutEvent {
+                        serial: SERIAL_COUNTER.next_serial(),
+                        time,
+                    },
+                );
+            }
         }
     }
 
@@ -3645,6 +3757,33 @@ impl Niri {
     pub fn window_under_cursor(&self) -> Option<&Mapped> {
         let pos = self.seat.get_pointer().unwrap().current_location();
         self.window_under(pos)
+    }
+
+    pub(crate) fn sink_parent_blocks_input(&self, child: &Mapped) -> bool {
+        let mut parent = child.toplevel().parent();
+        let mut seen = Vec::new();
+        while let Some(surface) = parent {
+            if seen.contains(&surface) {
+                return true;
+            }
+            seen.push(surface.clone());
+            let Some((mapped, _)) = self.layout.find_window_and_output(&surface) else {
+                return false;
+            };
+            if self.layout.sink_depth(&mapped.window).is_some()
+                || self.layout.workspaces().any(|(_, _, ws)| {
+                    ws.tiles().any(|tile| {
+                        tile.window().window == mapped.window
+                            && tile.is_sink_restoring()
+                            && tile.sink_input_blocked()
+                    })
+                })
+            {
+                return true;
+            }
+            parent = mapped.toplevel().parent();
+        }
+        false
     }
 
     pub(crate) fn sink_overview_selection(

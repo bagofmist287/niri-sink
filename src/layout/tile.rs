@@ -479,9 +479,11 @@ impl<W: LayoutElement> Tile<W> {
     }
 
     pub fn sink_input_blocked(&self) -> bool {
-        self.sink_presentation
-            .as_ref()
-            .is_some_and(|p| p.restoring && (!p.is_done() || !self.window.sink_input_ready()))
+        self.window.sink_parent_input_blocked()
+            || self
+                .sink_presentation
+                .as_ref()
+                .is_some_and(|p| p.restoring && (!p.is_done() || !self.window.sink_input_ready()))
     }
 
     pub(super) fn release_sink_projection(&self) {
