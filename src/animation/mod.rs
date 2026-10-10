@@ -316,6 +316,46 @@ impl Animation {
         self.from
     }
 
+    /// Conservative bounds, including spring release velocity and custom easing overshoot.
+    /// Overview uses these to reserve space before rendering a frame.
+    pub fn value_range(&self) -> (f64, f64) {
+        let endpoints = (self.from.min(self.to), self.from.max(self.to));
+        if self.is_off {
+            return endpoints;
+        }
+        match self.kind {
+            Kind::Easing {
+                curve: Curve::CubicBezier(curve),
+            } => {
+                let (low, high) = curve.value_range();
+                let first = self.from + (self.to - self.from) * low;
+                let last = self.from + (self.to - self.from) * high;
+                (first.min(last), first.max(last))
+            }
+            Kind::Spring(spring) => {
+                // Damping cannot add mechanical energy. This also handles a reversal and a
+                // gesture release; [0, 2] only bounds a unit spring starting from rest.
+                let displacement = spring.from - spring.to;
+                let radius = (displacement * displacement
+                    + spring.initial_velocity.powi(2) * spring.params.mass
+                        / spring.params.stiffness)
+                    .sqrt();
+                let guard = (self.to - self.from).abs() * 10.;
+                let fallback = (endpoints.0 - guard, endpoints.1 + guard);
+                if !radius.is_finite() {
+                    return fallback;
+                }
+                let radius = radius + 1e-9 * radius.max(1.);
+                (
+                    (spring.to - radius).max(fallback.0).min(endpoints.0),
+                    (spring.to + radius).min(fallback.1).max(endpoints.1),
+                )
+            }
+            // Built-in easing and deceleration are monotonic between their endpoints.
+            _ => endpoints,
+        }
+    }
+
     pub fn start_time(&self) -> Duration {
         self.start_time
     }

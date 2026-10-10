@@ -13,6 +13,14 @@ impl CubicBezier {
         Self { x1, y1, x2, y2 }
     }
 
+    pub(super) fn value_range(&self) -> (f64, f64) {
+        // The curve remains in the convex hull of its control points.
+        (
+            0f64.min(self.y1).min(self.y2),
+            1f64.max(self.y1).max(self.y2),
+        )
+    }
+
     // Based on libadwaita (LGPL-2.1-or-later):
     // https://gitlab.gnome.org/GNOME/libadwaita/-/blob/1.7.6/src/adw-easing.c?ref_type=tags#L469-531
 
