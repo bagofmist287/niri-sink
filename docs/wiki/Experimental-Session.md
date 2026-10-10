@@ -32,11 +32,54 @@ the internal desktop name allows the installed niri portal configuration to sele
 its existing backends. The login entry is still displayed as `niri-experimental`.
 Portal UI and screen sharing must be checked in the real experimental session.
 
+On first login, the user manager may not have loaded the experimental service
+yet. The launcher's `reset-failed` step is best-effort housekeeping; an unloaded
+unit must not prevent `start` from loading it. A launcher that exits with
+`Unit niri-experimental.service not loaded` before any compositor log needs this
+script fix, rather than a configuration change or a compositor rebuild.
+
 Keep niri's native automatic xwayland-satellite integration. Do not add a second
 satellite daemon or an experimental satellite service. Personal startup programs
-and theme generators also need review for hard-coded paths into the original
-configuration. Copy the required includes and scripts into the independent tree;
-do not symlink the whole configuration back to `~/.config/niri`.
+and theme generators also need review for hard-coded configuration paths.
+
+The experimental entry point can share the regular configuration through an
+include, followed by experimental overrides:
+
+```kdl
+include "../niri/config.kdl"
+
+sink {
+    enabled true
+    visible-depth 2
+    level 0 scale=0.93 opacity=0.82
+    level 1 scale=0.85 opacity=0.45
+}
+
+overview {
+    sink { animate true; }
+}
+
+binds {
+    Mod+S repeat=false { sink-window; }
+    Mod+P repeat=false { pull-window; }
+}
+```
+
+Place this in `~/.config/niri-experimental/config.kdl`. Includes resolve relative
+to the file containing them, so the regular configuration's nested includes
+continue to use `~/.config/niri/`. Settings merge in file order and later bindings
+replace matching keys. Included files are watched for changes. Themes, generated
+colors, regular bindings and window rules are shared; experimental Sink settings
+stay in the final override. Keep Sink-only options out of the regular config so
+the distribution's niri can still parse it. Use `niri-experimental validate` to
+check the complete merged experimental configuration.
+
+Shared theme and ordinary-action helpers can keep using `niri msg` with the
+current session's `NIRI_SOCKET`; they operate on the common configuration.
+Experimental Sink/Pull CLI actions still require `niri-experimental msg`.
+An independent copied configuration is also possible when separate themes or
+rules are desired; use one scheme consistently rather than maintaining unused
+copies alongside the shared overlay.
 
 Installing these files must preserve `/usr/bin/niri`, the original login entries
 and their services. Reloading unit definitions must not start or stop a session or

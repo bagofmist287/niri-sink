@@ -40,7 +40,10 @@ fi
 
 # Validate before importing any environment or starting user targets.
 /usr/local/bin/niri-experimental validate
-systemctl --user reset-failed niri-experimental.service
+# A fresh user manager may not have loaded this unit yet. reset-failed then
+# returns an error, even though start can load the installed service normally.
+# This housekeeping step must not prevent the first login from reaching start.
+systemctl --user reset-failed niri-experimental.service 2>/dev/null || :
 systemctl --user import-environment
 if command -v dbus-update-activation-environment >/dev/null 2>&1; then
     dbus-update-activation-environment --all
