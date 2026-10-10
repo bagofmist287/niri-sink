@@ -1,0 +1,6 @@
+[Desktop Entry]
+Name=niri-experimental
+Comment=Personal niri Sink / Pull session
+Exec=/usr/local/bin/niri-experimental-session
+Type=Application
+DesktopNames=niri

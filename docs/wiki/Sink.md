@@ -3,7 +3,8 @@
 This feature is specific to the personal `niri-sink` fork. It is disabled by default.
 The implementation keeps the original live window and projects it behind normal windows.
 It remains experimental. Overview expands the background stack and supports local Sink/Pull;
-gesture/effect qualification, native hardware and personal daily-use confirmation are in progress.
+native hardware and personal daily-use confirmation are in progress. Independent login
+resources are described in [niri-experimental session](./Experimental-Session.md).
 
 Enable it explicitly:
 

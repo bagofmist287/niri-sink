@@ -1,0 +1,58 @@
+#!/bin/sh
+
+set -eu
+
+# This entry is for the login manager or a fresh TTY. Starting it from a live
+# desktop would import that desktop's environment and affect shared user targets.
+if [ -n "${WAYLAND_DISPLAY:-}" ]; then
+    echo 'Log out of the current desktop before starting niri-experimental.' >&2
+    exit 1
+fi
+
+if [ "${1:-}" = '--login-shell' ]; then
+    shift
+elif [ "$#" -ne 0 ]; then
+    echo 'niri-experimental-session does not accept compositor arguments.' >&2
+    exit 1
+elif [ -n "${SHELL:-}" ] && [ -x "$SHELL" ] &&
+     grep -Fxq "$SHELL" /etc/shells; then
+    case "$SHELL" in
+        */false|*/nologin) ;;
+        *) exec "$SHELL" -l -c 'exec /usr/local/bin/niri-experimental-session --login-shell' ;;
+    esac
+fi
+
+if [ "$#" -ne 0 ]; then
+    echo 'niri-experimental-session does not accept compositor arguments.' >&2
+    exit 1
+fi
+
+if ! command -v systemctl >/dev/null 2>&1; then
+    echo 'This experimental session entry requires systemd user services.' >&2
+    exit 1
+fi
+
+if systemctl --user -q is-active graphical-session.target ||
+   systemctl --user -q is-active niri-experimental.service; then
+    echo 'A graphical session is already running.' >&2
+    exit 1
+fi
+
+# Validate before importing any environment or starting user targets.
+/usr/local/bin/niri-experimental validate
+systemctl --user reset-failed niri-experimental.service
+systemctl --user import-environment
+if command -v dbus-update-activation-environment >/dev/null 2>&1; then
+    dbus-update-activation-environment --all
+fi
+
+cleanup() {
+    trap - EXIT HUP INT TERM
+    systemctl --user stop niri-experimental.service || :
+    systemctl --user start --job-mode=replace-irreversibly niri-experimental-shutdown.target || :
+    systemctl --user unset-environment WAYLAND_DISPLAY DISPLAY XDG_SESSION_TYPE XDG_CURRENT_DESKTOP NIRI_SOCKET || :
+}
+trap cleanup EXIT
+trap 'exit 1' HUP INT TERM
+
+systemctl --user --wait start niri-experimental.service

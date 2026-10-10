@@ -1,0 +1,6 @@
+#!/bin/sh
+
+# Keep this fork's configuration independent of the distribution's niri.
+# An explicit -c/--config still takes precedence in niri itself.
+export NIRI_CONFIG="${XDG_CONFIG_HOME:-$HOME/.config}/niri-experimental/config.kdl"
+exec /usr/local/libexec/niri-experimental/niri "$@"
