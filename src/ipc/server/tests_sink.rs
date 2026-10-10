@@ -70,7 +70,7 @@ fn sink_ipc_depth_updates_keep_real_wayland_owners_in_inventory() {
     assert!(sunk.is_floating);
     assert!(sunk.layout.pos_in_scrolling_layout.is_none());
 
-    // Unsupported protocol size-state requests receive a legal unchanged configure while sunk.
+    // Native size-state requests receive a real configure without changing Sink ownership.
     // Start after acknowledging Sink's native activation change, excluding mapping history.
     fixture.client(client).window(&first).ack_last_and_commit();
     fixture.double_roundtrip(client);
@@ -91,13 +91,39 @@ fn sink_ipc_depth_updates_keep_real_wayland_owners_in_inventory() {
         .collect::<Vec<_>>();
     assert!(!configures.is_empty());
     for configure in &configures {
-        assert!(!configure.states.contains(&smithay::reexports::wayland_protocols::xdg::shell::client::xdg_toplevel::State::Fullscreen));
+        assert!(configure.states.contains(&smithay::reexports::wayland_protocols::xdg::shell::client::xdg_toplevel::State::Fullscreen));
         assert!(!configure.states.contains(&smithay::reexports::wayland_protocols::xdg::shell::client::xdg_toplevel::State::Maximized));
-        assert_eq!(configure.size, initial.layout.window_size);
+        assert_eq!(configure.size, (1280, 720));
     }
-    fixture.client(client).window(&first).ack_last_and_commit();
+    let window = fixture.client(client).window(&first);
+    window.set_size(1280, 720);
+    window.ack_last_and_commit();
     fixture.double_roundtrip(client);
-    drain(&events);
+    let native_events = drain(&events);
+    let changes = changed_windows(&native_events);
+    assert!(changes[&first_id].is_sunk);
+    assert_eq!(changes[&first_id].sink_depth, Some(0));
+    assert!(!changes[&first_id].is_floating);
+    // Mode metadata may arrive before the commit. Native geometry then uses the existing
+    // batched layout event, rather than opening/changing the same owner a second time.
+    assert!(native_events.iter().any(|event| matches!(event,
+        Event::WindowLayoutsChanged { changes } if changes.iter().any(|(id, layout)|
+            *id == first_id && layout.window_size == (1280, 720)))));
+    assert_eq!(
+        fixture
+            .niri()
+            .ipc_server
+            .as_ref()
+            .unwrap()
+            .event_stream_state
+            .borrow()
+            .windows
+            .windows[&first_id]
+            .layout
+            .window_size,
+        (1280, 720)
+    );
+    assert!(fixture.niri().layout.focus().is_none());
 
     let second = fixture.client(client).create_window().surface.clone();
     fixture.client(client).window(&second).commit();

@@ -2673,6 +2673,11 @@ impl<W: LayoutElement> ScrollingSpace<W> {
         cancel_resize_for_column(&mut self.interactive_resize, col);
     }
 
+    /// Uses the same native maximized area for stored windows and normal columns.
+    pub(super) fn maximized_size(&self) -> Size<f64, Logical> {
+        self.parent_area.size
+    }
+
     /// Captures the native height policy before an internal role transfer removes its column data.
     pub(super) fn window_height(&self, window: &W::Id) -> Option<WindowHeight> {
         self.columns.iter().find_map(|col| {

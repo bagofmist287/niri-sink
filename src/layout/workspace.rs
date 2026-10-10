@@ -491,6 +491,9 @@ impl<W: LayoutElement> Workspace<W> {
                 self.scale.fractional_scale(),
                 options.clone(),
             );
+            if !entry.pending_sizing_mode().is_normal() {
+                entry.request_native_size(self.view_size, self.scrolling.maximized_size());
+            }
             entry.update_source_size();
         }
     }
@@ -536,7 +539,7 @@ impl<W: LayoutElement> Workspace<W> {
     pub fn is_floating(&self, id: &W::Id) -> bool {
         self.sink.get(id).map_or_else(
             || self.floating.has_window(id),
-            |entry| entry.restore.is_floating(),
+            |entry| entry.restore.is_floating() && entry.pending_sizing_mode().is_normal(),
         )
     }
 
@@ -955,15 +958,17 @@ impl<W: LayoutElement> Workspace<W> {
         else {
             return false;
         };
-        if !tile.window().sizing_mode().is_normal()
-            || !tile.window().pending_sizing_mode().is_normal()
-            || tile.window().is_windowed_fullscreen()
-            || tile.window().is_pending_windowed_fullscreen()
-            || tile.window().interactive_resize_data().is_some()
-        {
+        if tile.window().interactive_resize_data().is_some() {
             return false;
         }
         let height = self.scrolling.window_height(id);
+        let maximized = self
+            .scrolling
+            .columns()
+            .find(|col| col.contains(id))
+            .is_some_and(Column::is_pending_maximized);
+        let restore_floating =
+            !tile.window().pending_sizing_mode().is_normal() && tile.restore_to_floating;
         let from = tile
             .sink_presentation
             .as_ref()
@@ -989,7 +994,7 @@ impl<W: LayoutElement> Workspace<W> {
                 self.options.animations.window_movement.0,
             ));
         }
-        let restore = if removed.is_floating {
+        let restore = if removed.is_floating || restore_floating {
             RestorePlacement::Floating {
                 width: removed.width,
             }
@@ -1000,7 +1005,8 @@ impl<W: LayoutElement> Workspace<W> {
                 height: height.expect("scrolling tile must have a height policy"),
             }
         };
-        let entry = SinkEntry::new(removed.tile, restore, source_pos);
+        let mut entry = SinkEntry::new(removed.tile, restore, source_pos);
+        entry.pending_maximized = maximized;
         assert!(
             self.sink.push(entry).is_ok(),
             "normal and Sink owners must have distinct IDs"
@@ -1013,6 +1019,7 @@ impl<W: LayoutElement> Workspace<W> {
     /// N2 may pass false until its visual/client-commit input barrier completes.
     pub(super) fn pull_window(&mut self, activate: bool) -> Option<W::Id> {
         let entry = self.sink.pop()?;
+        let maximized = entry.pending_maximized;
         let (tile, restore, source) = entry.into_parts();
         let from = tile
             .sink_presentation
@@ -1034,6 +1041,10 @@ impl<W: LayoutElement> Workspace<W> {
         );
         if let RestorePlacement::Scrolling { height, .. } = restore {
             self.scrolling.restore_window_height(&id, height);
+        }
+        // A fullscreen tile's native mode alone cannot express its maximized fallback.
+        if maximized && self.scrolling.tiles().any(|tile| tile.window().id() == &id) {
+            self.scrolling.set_maximized(&id, true);
         }
         let enabled = self.options.sink.enabled;
         let clock = self.clock.clone();
@@ -1628,7 +1639,11 @@ impl<W: LayoutElement> Workspace<W> {
     }
 
     pub fn set_fullscreen(&mut self, window: &W::Id, is_fullscreen: bool) {
-        if self.sink.depth(window).is_some() {
+        if let Some(entry) = self.sink.get_mut(window) {
+            if entry.pending_fullscreen != is_fullscreen {
+                entry.pending_fullscreen = is_fullscreen;
+                entry.request_native_size(self.view_size, self.scrolling.maximized_size());
+            }
             return;
         }
         let mut restore_to_floating = false;
@@ -1699,7 +1714,11 @@ impl<W: LayoutElement> Workspace<W> {
     }
 
     pub fn set_maximized(&mut self, window: &W::Id, maximize: bool) {
-        if self.sink.depth(window).is_some() {
+        if let Some(entry) = self.sink.get_mut(window) {
+            if entry.pending_maximized != maximize {
+                entry.pending_maximized = maximize;
+                entry.request_native_size(self.view_size, self.scrolling.maximized_size());
+            }
             return;
         }
         let mut restore_to_floating = false;
@@ -2271,7 +2290,8 @@ impl<W: LayoutElement> Workspace<W> {
 
     pub fn refresh(&mut self, is_active: bool, is_focused: bool) {
         for (_, entry) in self.sink.entries_mut() {
-            let is_floating = entry.restore.is_floating();
+            let is_floating =
+                entry.restore.is_floating() && entry.pending_sizing_mode().is_normal();
             let win = entry.tile_mut().window_mut();
             win.set_activated(false);
             win.set_active_in_column(false);

@@ -7,7 +7,7 @@ use smithay::wayland::xdg_activation::{XdgActivationHandler, XdgActivationTokenD
 
 use super::client::ClientId;
 use super::*;
-use crate::layout::LayoutElement as _;
+use crate::layout::{LayoutElement as _, SizingMode};
 use crate::niri::KeyboardFocus;
 
 fn setup(config: Config) -> (Fixture, ClientId, Vec<(WlSurface, Window, u64)>) {
@@ -603,6 +603,149 @@ fn pull_matching_committed_native_size_needs_no_new_resize_commit() {
         .1;
     assert!(mapped.sink_input_deadline().is_none());
     assert_eq!(fixture.niri().keyboard_focus.surface(), Some(&windows[2].0));
+}
+
+#[test]
+fn sunk_native_fullscreen_and_maximize_requests_reply_without_recalling() {
+    let config = Config::parse_mem("sink { enabled true; }; animations { off; }").unwrap();
+    let (mut fixture, client, windows) = setup(config);
+    let surface = fixture.client(client).state.windows[2].surface.clone();
+    fixture.client(client).window(&surface).set_maximized();
+    fixture.double_roundtrip(client);
+    settle(&mut fixture, client);
+    fixture.client(client).window(&surface).set_fullscreen(None);
+    fixture.double_roundtrip(client);
+    settle(&mut fixture, client);
+    for mode in [SizingMode::Maximized, SizingMode::Normal] {
+        let before = fixture
+            .client(client)
+            .window(&surface)
+            .configures_received
+            .len();
+        if mode.is_maximized() {
+            fixture.client(client).window(&surface).unset_fullscreen();
+        } else {
+            fixture.client(client).window(&surface).unset_maximized();
+        }
+        fixture.double_roundtrip(client);
+        assert!(
+            fixture
+                .client(client)
+                .window(&surface)
+                .configures_received
+                .len()
+                > before
+        );
+        settle(&mut fixture, client);
+        let mapped = fixture
+            .niri()
+            .layout
+            .windows()
+            .find(|(_, w)| w.window == windows[2].1)
+            .unwrap()
+            .1;
+        assert_eq!(mapped.sizing_mode(), mode);
+        assert_eq!(fixture.niri().layout.sink_depth(&windows[2].1), Some(0));
+        assert!(fixture.niri().layout.focus().is_none());
+        assert_ne!(fixture.niri().keyboard_focus.surface(), Some(&windows[2].0));
+        assert_eq!(fixture.niri().layout.windows().count(), 3);
+    }
+}
+
+#[test]
+fn pull_same_size_fullscreen_state_still_waits_for_processed_commit() {
+    let config = Config::parse_mem("sink { enabled true; }; animations { off; }").unwrap();
+    let (mut fixture, client, windows) = setup(config);
+    let surface = fixture.client(client).state.windows[2].surface.clone();
+    let window = fixture.client(client).window(&surface);
+    window.set_size(1280, 720);
+    window.ack_last_and_commit();
+    fixture.double_roundtrip(client);
+    fixture.client(client).window(&surface).set_fullscreen(None);
+    fixture.double_roundtrip(client);
+    fixture.niri_state().do_action(Action::PullWindow, false);
+    fixture.double_roundtrip(client);
+    fixture.niri_complete_animations();
+    fixture.double_roundtrip(client);
+    let mapped = fixture
+        .niri()
+        .layout
+        .windows()
+        .find(|(_, w)| w.window == windows[2].1)
+        .unwrap()
+        .1;
+    assert_eq!(mapped.size(), (1280, 720).into());
+    assert_eq!(mapped.requested_size(), Some((1280, 720).into()));
+    assert_eq!(mapped.sizing_mode(), SizingMode::Normal);
+    assert_eq!(mapped.pending_sizing_mode(), SizingMode::Fullscreen);
+    assert!(!mapped.sink_input_ready());
+    fixture.client(client).window(&surface).ack_last();
+    fixture.double_roundtrip(client);
+    assert!(fixture.niri().layout.focus().is_none());
+    fixture.client(client).window(&surface).commit();
+    fixture.double_roundtrip(client);
+    assert_eq!(fixture.niri().keyboard_focus.surface(), Some(&windows[2].0));
+    assert_eq!(
+        fixture.niri().layout.focus().unwrap().sizing_mode(),
+        SizingMode::Fullscreen
+    );
+    assert_eq!(fixture.niri().layout.windows().count(), 3);
+}
+
+#[test]
+fn pull_new_native_state_retargets_commit_without_extending_deadline() {
+    let (mut fixture, client, windows) = resizing_pull();
+    let surface = fixture.client(client).state.windows[2].surface.clone();
+    let (old_serial, old_configure) = fixture
+        .client(client)
+        .window(&surface)
+        .configures_received
+        .last()
+        .unwrap()
+        .clone();
+    let original_deadline = fixture
+        .niri()
+        .layout
+        .windows()
+        .find(|(_, w)| w.window == windows[2].1)
+        .unwrap()
+        .1
+        .sink_input_deadline()
+        .unwrap();
+    fixture.client(client).window(&surface).set_fullscreen(None);
+    fixture.double_roundtrip(client);
+    assert_eq!(
+        fixture
+            .niri()
+            .layout
+            .windows()
+            .find(|(_, w)| w.window == windows[2].1)
+            .unwrap()
+            .1
+            .sink_input_deadline(),
+        Some(original_deadline)
+    );
+    let window = fixture.client(client).window(&surface);
+    window.xdg_surface.ack_configure(old_serial);
+    window.set_size(
+        old_configure.size.0.max(1) as u16,
+        old_configure.size.1.max(1) as u16,
+    );
+    window.commit();
+    fixture.double_roundtrip(client);
+    fixture.niri_complete_animations();
+    fixture.double_roundtrip(client);
+    assert!(fixture.niri().layout.focus().is_none());
+    let window = fixture.client(client).window(&surface);
+    let size = window.configures_received.last().unwrap().1.size;
+    window.set_size(size.0.max(1) as u16, size.1.max(1) as u16);
+    window.ack_last_and_commit();
+    fixture.double_roundtrip(client);
+    assert_eq!(fixture.niri().keyboard_focus.surface(), Some(&windows[2].0));
+    assert_eq!(
+        fixture.niri().layout.focus().unwrap().sizing_mode(),
+        SizingMode::Fullscreen
+    );
 }
 
 #[test]

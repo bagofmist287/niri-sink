@@ -263,26 +263,102 @@ fn workspace_restores_native_height_policy_after_reload_and_output_resize() {
 }
 
 #[test]
-fn workspace_rejects_non_normal_state_before_mutation() {
+fn workspace_accepts_native_sizing_states_without_foreground_ownership() {
     for case in 0..6 {
         let mut workspace =
             Workspace::new_no_outputs(Clock::with_time(Duration::ZERO), Rc::default());
-        let win = add_window(&mut workspace, 1, false);
+        let mut win = add_window(&mut workspace, 1, false);
         match case {
-            0 => win.0.pending_sizing_mode.set(SizingMode::Fullscreen),
-            1 => win.0.pending_sizing_mode.set(SizingMode::Maximized),
-            2 => win.0.sizing_mode.set(SizingMode::Fullscreen),
-            3 => win.0.sizing_mode.set(SizingMode::Maximized),
-            4 => win.0.is_pending_windowed_fullscreen.set(true),
-            _ => win.0.is_windowed_fullscreen.set(true),
+            0 => workspace.set_fullscreen(&1, true),
+            1 => workspace.set_maximized(&1, true),
+            2 => {
+                workspace.set_maximized(&1, true);
+                workspace.set_fullscreen(&1, true);
+            }
+            3 => {
+                workspace.set_fullscreen(&1, true);
+                settle(&mut workspace);
+                workspace.set_fullscreen(&1, false);
+            }
+            4 => win.request_windowed_fullscreen(true),
+            _ => {
+                win.request_windowed_fullscreen(true);
+                settle(&mut workspace);
+            }
         }
         let requested = win.requested_size();
-        assert!(!workspace.sink_window(&1));
-        assert_eq!(workspace.sink_count(), 0);
-        assert_eq!(workspace.active_window().map(LayoutElement::id), Some(&1));
+        let mode = win.pending_sizing_mode();
+        assert!(workspace.sink_window(&1));
+        assert_eq!(workspace.sink_count(), 1);
+        assert!(workspace.active_window().is_none());
         assert_eq!(win.requested_size(), requested);
-        assert_eq!(workspace.tiles_with_render_positions().count(), 1);
+        assert_eq!(win.pending_sizing_mode(), mode);
+        assert_eq!(workspace.tiles_with_render_positions().count(), 0);
+        assert!(!workspace.render_above_top_layer());
+        settle(&mut workspace);
+        assert_eq!(workspace.pull_window(true), Some(1));
+        settle(&mut workspace);
+        assert_eq!(win.pending_sizing_mode(), mode);
+        if case == 2 {
+            workspace.set_fullscreen(&1, false);
+            assert_eq!(win.pending_sizing_mode(), SizingMode::Maximized);
+        }
+        workspace.verify_invariants(None);
     }
+}
+
+#[test]
+fn sunk_native_requests_keep_background_role_and_floating_restore() {
+    for floating in [false, true] {
+        let mut workspace =
+            Workspace::new_no_outputs(Clock::with_time(Duration::ZERO), Rc::default());
+        let win = add_window(&mut workspace, 1, floating);
+        let native_size = win.size();
+        add_window(&mut workspace, 2, false);
+        workspace.set_maximized(&1, true);
+        workspace.set_fullscreen(&1, true);
+        settle(&mut workspace);
+        assert!(workspace.sink_window(&1));
+        settle(&mut workspace);
+        assert_eq!(workspace.active_window().map(LayoutElement::id), Some(&2));
+        assert!(!workspace.render_above_top_layer());
+        assert!(!workspace.is_floating(&1));
+        workspace.set_fullscreen(&1, false);
+        assert_eq!(win.pending_sizing_mode(), SizingMode::Maximized);
+        settle(&mut workspace);
+        workspace.set_maximized(&1, false);
+        assert_eq!(win.pending_sizing_mode(), SizingMode::Normal);
+        settle(&mut workspace);
+        assert_eq!(workspace.sink_depth(&1), Some(0));
+        assert_eq!(workspace.active_window().map(LayoutElement::id), Some(&2));
+        assert_eq!(workspace.pull_window(false), Some(1));
+        settle(&mut workspace);
+        assert_eq!(workspace.is_floating(&1), floating);
+        if floating {
+            assert_eq!(win.size(), native_size);
+        }
+        assert_eq!(workspace.active_window().map(LayoutElement::id), Some(&2));
+        workspace.verify_invariants(None);
+    }
+}
+
+#[test]
+fn sunk_fullscreen_request_does_not_revive_a_stale_floating_origin() {
+    let mut workspace = Workspace::new_no_outputs(Clock::with_time(Duration::ZERO), Rc::default());
+    let win = add_window(&mut workspace, 1, true);
+    workspace.toggle_window_floating(Some(&1));
+    settle(&mut workspace);
+    assert!(!workspace.is_floating(&1));
+    assert!(workspace.sink_window(&1));
+    workspace.set_fullscreen(&1, true);
+    settle(&mut workspace);
+    assert_eq!(workspace.pull_window(true), Some(1));
+    settle(&mut workspace);
+    workspace.set_fullscreen(&1, false);
+    settle(&mut workspace);
+    assert!(!workspace.is_floating(&1));
+    assert_eq!(win.pending_sizing_mode(), SizingMode::Normal);
+    workspace.verify_invariants(None);
 }
 
 #[test]
@@ -308,9 +384,7 @@ fn sunk_direct_layout_edits_are_noops_and_child_insertion_is_normal() {
         PositionChange::SetFixed(10.),
         false,
     );
-    workspace.set_fullscreen(&1, true);
     workspace.toggle_fullscreen(&1);
-    workspace.set_maximized(&1, true);
     workspace.toggle_maximized(&1);
     assert!(!workspace.interactive_resize_begin(1, ResizeEdge::RIGHT));
     assert!(!workspace.interactive_resize_update(&1, (20., 0.).into()));
@@ -695,7 +769,8 @@ fn restore_pending_floating_role_change_preserves_selected_container() {
             .active_workspace()
             .unwrap()
             .scrolling()
-            .tiles().any(|tile| tile.window().id() == &5));
+            .tiles()
+            .any(|tile| tile.window().id() == &5));
         assert_eq!(layout.windows().count(), 1);
     }
 }

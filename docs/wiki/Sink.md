@@ -20,7 +20,7 @@ binds {
 }
 ```
 
-`sink-window` moves the active normal window into the current workspace's background stack.
+`sink-window` moves the active window into the current workspace's background stack.
 `pull-window` restores its most recent member. Scrolling windows return through normal insertion
 into a new column; floating windows retain their original placement. The client and window ID stay
 the same. Explicit focus by ID, focus-previous, MRU confirmation and permitted activation restore
@@ -28,9 +28,17 @@ the stack from the top through the requested window. Intermediate members do not
 MRU browsing, ordinary directional focus and pointer focus do not restore background members.
 
 Both actions do nothing when disabled, locked, grabbed, conflicting with another input owner or
-an interactive move/resize, or when their target is absent. Sink currently rejects fullscreen,
-maximized, windowed-fullscreen and transient families. Direct layout edits targeting a sunk ID
-do nothing. Closing and inventory queries still work.
+an interactive move/resize, or when their target is absent. Sink currently rejects transient families.
+Direct layout edits targeting a sunk ID do nothing. Closing and inventory queries still work.
+
+Fullscreen, maximized and windowed-fullscreen windows retain their native state while sunk.
+Client fullscreen/maximize requests still receive native configures without pulling the window or
+giving it focus. The projection remains behind normal foreground windows. Fullscreen's native
+backdrop is part of the projected object, rather than a separate foreground backdrop.
+Pull preserves the maximized fallback underneath fullscreen. A window that entered these states
+from floating returns to its stored floating placement when those states are unset. When an
+initially fullscreen window has no known normal size, unfullscreen sends a zero size hint for the
+client to choose; Pull then applies the saved normal layout policy.
 
 Reloading with `enabled false` restores all stacks in LIFO order, including workspaces without
 outputs, preserving any existing normal focus. Changing styles retains membership. `visible-depth`
@@ -62,7 +70,9 @@ applied once to the combined object. Each capture target has its own cache and r
 
 Pull immediately schedules normal layout insertion and its native resize transaction while the
 projection returns. Input waits for the visual transition and a processed commit acknowledging the
-required resize; an ack alone is insufficient. A matching already committed size takes the fast path.
+required resize or native state change; an ack alone is insufficient. A matching already committed
+size and mode takes the fast path. Another native state/size change during restoration retargets
+the required commit while retaining the original deadline.
 The original transaction deadline bounds an unresponsive client (normally 300 ms); after it expires,
 niri uses the existing degraded resize behavior. Changing focus, locking, unmapping or invalidating
 the restore context cancels the old focus plan, so a late commit cannot steal focus. Selecting the

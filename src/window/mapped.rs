@@ -87,6 +87,7 @@ pub struct Mapped {
     /// If `None`, then the window is not offscreened.
     offscreen_data: crate::render_helpers::offscreen::OffscreenDataSlot,
     sink_input_barrier: Option<SinkInputBarrier>,
+    sink_restoring: bool,
 
     /// Whether this has an urgent indicator.
     is_urgent: bool,
@@ -289,6 +290,7 @@ impl Mapped {
             needs_frame_callback: false,
             offscreen_data: Rc::new(RefCell::new(None)),
             sink_input_barrier: None,
+            sink_restoring: false,
             is_urgent: false,
             is_focused: false,
             is_active_in_column: true,
@@ -778,6 +780,8 @@ impl LayoutElement for Mapped {
         animate: bool,
         transaction: Option<Transaction>,
     ) {
+        let previous_mode = self.pending_sizing_mode();
+        let previous_windowed = self.is_pending_windowed_fullscreen;
         // Going into real fullscreen resets windowed fullscreen.
         if mode == SizingMode::Fullscreen {
             self.is_pending_windowed_fullscreen = false;
@@ -826,6 +830,13 @@ impl LayoutElement for Mapped {
         // by 2.
         if let Some(transaction) = transaction {
             self.transaction_for_next_configure = Some(transaction);
+        }
+        if self.sink_restoring
+            && (changed
+                || previous_mode != mode
+                || previous_windowed != self.is_pending_windowed_fullscreen)
+        {
+            self.begin_sink_restore();
         }
     }
 
@@ -881,6 +892,9 @@ impl LayoutElement for Mapped {
                 warn!("no current serial; did the surface not ack the initial configure?");
                 self.request_size_once = Some(RequestSizeOnce::UseWindowSize);
             };
+            if self.sink_restoring {
+                self.begin_sink_restore();
+            }
             return;
         }
 
@@ -899,6 +913,9 @@ impl LayoutElement for Mapped {
         }
 
         self.request_size_once = Some(RequestSizeOnce::WaitingForConfigure);
+        if self.sink_restoring {
+            self.begin_sink_restore();
+        }
     }
 
     fn min_size(&self) -> Size<i32, Logical> {
@@ -963,6 +980,7 @@ impl LayoutElement for Mapped {
     }
 
     fn begin_sink_restore(&mut self) {
+        self.sink_restoring = true;
         let Some(target) = self.requested_size() else {
             return;
         };
@@ -972,21 +990,46 @@ impl LayoutElement for Mapped {
         let matching_commit = self
             .toplevel()
             .with_committed_state(|state| state.and_then(|s| s.size) == Some(target));
-        if matching_pixels || matching_commit {
+        let matching_mode = self.sizing_mode() == self.pending_sizing_mode()
+            && self.is_windowed_fullscreen == self.is_pending_windowed_fullscreen;
+        if matching_mode && (matching_pixels || matching_commit) {
             self.sink_input_barrier = None;
             return;
         }
         let deadline = self
-            .transaction_for_next_configure
-            .as_ref()
-            .map(Transaction::deadline)
-            .or_else(|| self.pending_transactions.last().map(|(_, t)| t.deadline()))
-            .unwrap_or_else(|| Transaction::new().deadline());
+            .sink_input_barrier
+            .map(|b| b.deadline)
+            .unwrap_or_else(|| {
+                self.transaction_for_next_configure
+                    .as_ref()
+                    .map(Transaction::deadline)
+                    .or_else(|| self.pending_transactions.last().map(|(_, t)| t.deadline()))
+                    .unwrap_or_else(|| Transaction::new().deadline())
+            });
         let mut barrier = SinkInputBarrier::new(deadline);
+        let wanted_states = self.toplevel().with_pending_state(|state| {
+            (
+                state.states.contains(xdg_toplevel::State::Fullscreen),
+                state.states.contains(xdg_toplevel::State::Maximized),
+            )
+        });
         if let Some(serial) =
             with_toplevel_last_uncommitted_configure(self.toplevel(), |configure| {
                 let configure = configure?;
-                (configure.state.size == Some(target)).then_some(configure.serial)
+                let states = (
+                    configure
+                        .state
+                        .states
+                        .contains(xdg_toplevel::State::Fullscreen),
+                    configure
+                        .state
+                        .states
+                        .contains(xdg_toplevel::State::Maximized),
+                );
+                (configure.state.size == Some(target)
+                    && states == wanted_states
+                    && self.is_windowed_fullscreen == self.is_pending_windowed_fullscreen)
+                    .then_some(configure.serial)
             })
         {
             barrier.on_configure(serial);
@@ -995,6 +1038,7 @@ impl LayoutElement for Mapped {
     }
 
     fn finish_sink_restore(&mut self) {
+        self.sink_restoring = false;
         if self
             .sink_input_barrier
             .is_some_and(|b| b.degraded(Instant::now()))
@@ -1409,6 +1453,9 @@ impl LayoutElement for Mapped {
 
         // Make sure we receive a commit later to update self.is_windowed_fullscreen.
         self.needs_configure = true;
+        if self.sink_restoring {
+            self.begin_sink_restore();
+        }
     }
 
     fn is_child_of(&self, parent: &Self) -> bool {
