@@ -51,6 +51,246 @@ fn settle(space: &mut ScrollingSpace<TestWindow>) {
     space.verify_invariants();
 }
 
+fn non_normal_space(
+    scale: f64,
+    mode: SizingMode,
+    display: ColumnDisplay,
+) -> ScrollingSpace<TestWindow> {
+    let mut options = Options::default();
+    options.layout.default_column_display = display;
+    options.layout.struts.top = niri_config::FloatOrInt(13.);
+    options.layout.struts.bottom = niri_config::FloatOrInt(11.);
+    let options = Rc::new(options);
+    let mut space = ScrollingSpace::new(
+        (1280., 720.).into(),
+        Rectangle::new((0., 24.).into(), (1280., 664.).into()),
+        scale,
+        Clock::with_time(Duration::ZERO),
+        options.clone(),
+    );
+    let first = scrolling_tile(1, &space, options);
+    space.add_tile(None, first, true, ColumnWidth::Fixed(800.), false, None);
+    match mode {
+        SizingMode::Fullscreen => assert!(space.set_fullscreen(&1, true)),
+        SizingMode::Maximized => assert!(space.set_maximized(&1, true)),
+        SizingMode::Normal => unreachable!(),
+    }
+    settle(&mut space);
+    space
+}
+
+#[test]
+fn passive_spine_insertion_into_fullscreen_or_maximized_tabs_keeps_client_normal() {
+    for scale in [1., 1.25] {
+        for mode in [SizingMode::Fullscreen, SizingMode::Maximized] {
+            for axis in [ShrinkAxis::Horizontal, ShrinkAxis::Vertical] {
+                for activate in [false, true] {
+                    let mut space = non_normal_space(scale, mode, ColumnDisplay::Tabbed);
+                    let normal = space.tiles().next().unwrap().window().clone();
+                    let normal_request = normal.requested_size();
+                    let options = space.tiles().next().unwrap().options().clone();
+                    let mut incoming = scrolling_tile(2, &space, options);
+                    let client = incoming.window().clone();
+                    assert!(incoming.set_spine(axis, 40.1));
+                    let client_size = client.size();
+                    let plans = space.spine_in_column_plans(0, 0, &incoming, 40.1).unwrap();
+                    assert_eq!(client.requested_size(), None);
+                    assert_eq!(normal.requested_size(), normal_request);
+                    assert!(plans.get(axis).fits);
+                    assert_eq!(plans.for_move(axis).geometry.axis, axis);
+                    let extent = if mode.is_fullscreen() { 720. } else { 664. };
+                    let thickness = (40.1_f64 * scale).ceil() / scale;
+                    let expected = match axis {
+                        ShrinkAxis::Horizontal => (thickness, extent),
+                        ShrinkAxis::Vertical => (1280., thickness),
+                    };
+                    assert_eq!(plans.get(axis).geometry.outer_size(), expected.into());
+                    space.add_tile_to_column(0, Some(0), incoming, activate);
+                    settle(&mut space);
+                    assert_eq!(space.columns().count(), 1);
+                    assert_eq!(
+                        space.tiles().map(|t| *t.window().id()).collect::<Vec<_>>(),
+                        [2, 1]
+                    );
+                    let col = space.columns().next().unwrap();
+                    assert_eq!(col.pending_sizing_mode(), mode);
+                    assert_eq!(
+                        space.active_window().unwrap().id(),
+                        if activate { &2 } else { &1 }
+                    );
+                    let book = space.tiles().find(|t| t.window().id() == &2).unwrap();
+                    assert_eq!(book.form(), WindowForm::Spine(axis));
+                    assert_eq!(book.tile_size(), expected.into());
+                    assert_eq!(book.tile_size(), plans.get(axis).geometry.outer_size());
+                    assert_eq!(book.sizing_mode(), SizingMode::Normal);
+                    assert_eq!(client.pending_sizing_mode(), SizingMode::Normal);
+                    assert_eq!(client.sizing_mode(), SizingMode::Normal);
+                    assert_eq!(client.requested_size(), None);
+                    assert_eq!(client.size(), client_size);
+                    assert_eq!(normal.pending_sizing_mode(), mode);
+                    assert_eq!(normal.requested_size(), normal_request);
+                    assert!(space.spine_plans(&1, 40.1).is_none());
+                    assert_eq!(
+                        space
+                            .spine_plans(&2, 40.1)
+                            .unwrap()
+                            .get(axis)
+                            .geometry
+                            .outer_size(),
+                        book.tile_size()
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn closing_last_normal_tab_keeps_spine_container_origin_until_native_mode_changes() {
+    for mode in [SizingMode::Fullscreen, SizingMode::Maximized] {
+        for axis in [ShrinkAxis::Horizontal, ShrinkAxis::Vertical] {
+            let mut space = non_normal_space(1., mode, ColumnDisplay::Tabbed);
+            let options = space.tiles().next().unwrap().options().clone();
+            let mut incoming = scrolling_tile(2, &space, options.clone());
+            let client = incoming.window().clone();
+            assert!(incoming.set_spine(axis, 40.));
+            space.add_tile_to_column(0, Some(1), incoming, true);
+            settle(&mut space);
+            let before = space
+                .tiles()
+                .find(|t| t.window().id() == &2)
+                .unwrap()
+                .tile_size();
+            let removed = space.remove_tile(&1, Transaction::new());
+            assert_eq!(removed.tile.window().id(), &1);
+            settle(&mut space);
+            assert_eq!(space.columns().count(), 1);
+            assert_eq!(space.tiles().count(), 1);
+            let col = space.columns().next().unwrap();
+            let (book, pos) = col.tiles().next().unwrap();
+            assert_eq!(book.tile_size(), before);
+            assert_eq!(pos.y, if mode.is_fullscreen() { 0. } else { 24. });
+            assert_eq!(col.pending_sizing_mode(), mode);
+            // Output/config changes allocate the spine immediately, without a hidden commit.
+            space.update_config(
+                (1000., 600.).into(),
+                Rectangle::new((0., 20.).into(), (1000., 550.).into()),
+                1.25,
+                options,
+            );
+            settle(&mut space);
+            let expected = match axis {
+                ShrinkAxis::Horizontal => (40., if mode.is_fullscreen() { 600. } else { 550.4 }),
+                ShrinkAxis::Vertical => (1000., 40.),
+            };
+            assert_eq!(space.tiles().next().unwrap().tile_size(), expected.into());
+            client.0.bbox.set(Rectangle::from_size((700, 500).into()));
+            space.update_window(&2, None);
+            assert_eq!(space.tiles().next().unwrap().tile_size(), expected.into());
+            assert_eq!(client.pending_sizing_mode(), SizingMode::Normal);
+            assert_eq!(client.requested_size(), None);
+            // This internal mode removal must keep the spine folded (MoveGrab uses it too).
+            if mode.is_fullscreen() {
+                assert!(space.set_fullscreen(&2, false));
+            } else {
+                assert!(space.set_maximized(&2, false));
+            }
+            settle(&mut space);
+            assert_eq!(
+                space.tiles().next().unwrap().form(),
+                WindowForm::Spine(axis)
+            );
+            assert_eq!(
+                space.columns().next().unwrap().pending_sizing_mode(),
+                SizingMode::Normal
+            );
+            assert_eq!(client.requested_size(), None);
+        }
+    }
+}
+
+#[test]
+fn spine_insertion_into_non_tabbed_fullscreen_column_uses_native_mode_removal() {
+    for mode in [SizingMode::Fullscreen, SizingMode::Maximized] {
+        for axis in [ShrinkAxis::Horizontal, ShrinkAxis::Vertical] {
+            let mut space = non_normal_space(1., mode, ColumnDisplay::Normal);
+            let normal = space.tiles().next().unwrap().window().clone();
+            let options = space.tiles().next().unwrap().options().clone();
+            let mut incoming = scrolling_tile(2, &space, options);
+            let client = incoming.window().clone();
+            assert!(incoming.set_spine(axis, 40.));
+            let plans = space.spine_in_column_plans(0, 1, &incoming, 40.).unwrap();
+            space.add_tile_to_column(0, Some(1), incoming, true);
+            assert_eq!(
+                space
+                    .tiles()
+                    .find(|t| t.window().id() == &2)
+                    .unwrap()
+                    .tile_size(),
+                plans.get(axis).geometry.outer_size()
+            );
+            settle(&mut space);
+            assert_eq!(space.columns().count(), 1);
+            assert_eq!(space.tiles().count(), 2);
+            assert_eq!(
+                space.columns().next().unwrap().pending_sizing_mode(),
+                SizingMode::Normal
+            );
+            assert_eq!(normal.pending_sizing_mode(), SizingMode::Normal);
+            assert_eq!(client.pending_sizing_mode(), SizingMode::Normal);
+            assert_eq!(client.requested_size(), None);
+            assert_eq!(
+                space
+                    .tiles()
+                    .find(|t| t.window().id() == &2)
+                    .unwrap()
+                    .form(),
+                WindowForm::Spine(axis)
+            );
+        }
+    }
+}
+
+#[test]
+fn spine_only_non_normal_tabs_accept_normal_clients_before_their_first_commit() {
+    for mode in [SizingMode::Fullscreen, SizingMode::Maximized] {
+        for axis in [ShrinkAxis::Horizontal, ShrinkAxis::Vertical] {
+            let mut space = non_normal_space(1., mode, ColumnDisplay::Tabbed);
+            let options = space.tiles().next().unwrap().options().clone();
+            let mut book = scrolling_tile(2, &space, options.clone());
+            let hidden = book.window().clone();
+            assert!(book.set_spine(axis, 40.));
+            space.add_tile_to_column(0, None, book, true);
+            space.remove_tile(&1, Transaction::new());
+            space.verify_invariants();
+            let size = space.tiles().next().unwrap().tile_size();
+            let incoming = scrolling_tile(3, &space, options);
+            let client = incoming.window().clone();
+            space.add_tile_to_column(0, Some(0), incoming, true);
+            assert_eq!(client.sizing_mode(), SizingMode::Normal);
+            assert_eq!(client.pending_sizing_mode(), mode);
+            space.verify_invariants();
+            assert_eq!(
+                space
+                    .tiles()
+                    .find(|t| t.window().id() == &2)
+                    .unwrap()
+                    .tile_size(),
+                size
+            );
+            settle(&mut space);
+            assert_eq!(client.sizing_mode(), mode);
+            assert_eq!(hidden.pending_sizing_mode(), SizingMode::Normal);
+            assert_eq!(hidden.requested_size(), None);
+            assert_eq!(space.columns().count(), 1);
+            assert_eq!(
+                space.tiles().map(|t| *t.window().id()).collect::<Vec<_>>(),
+                [3, 2]
+            );
+        }
+    }
+}
+
 #[test]
 fn spine_geometry_is_independent_of_client_and_locks_only_one_axis() {
     for axis in [ShrinkAxis::Horizontal, ShrinkAxis::Vertical] {

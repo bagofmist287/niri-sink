@@ -2711,23 +2711,21 @@ impl<W: LayoutElement> ScrollingSpace<W> {
 
     pub fn spine_plans(&self, id: &W::Id, thickness: f64) -> Option<SpinePlans> {
         let col = self.columns.iter().find(|col| col.contains(id))?;
-        if !col.pending_sizing_mode().is_normal() {
-            return None;
-        }
         let idx = col.position(id)?;
         let mut rows = col.sizing_inputs();
         let height = rows[idx].height;
+        let non_normal_size = col.non_normal_tile_size();
         plan_spine_allocations(
             &col.tiles[idx],
             thickness,
             col.scale,
             &col.options,
-            col.spine_bounds(&rows, idx),
+            non_normal_size.unwrap_or_else(|| col.spine_bounds(&rows, idx)),
             col.spine_preference(rows.len()),
             |mut row| {
                 row.height = height;
                 rows[idx] = row;
-                col.compute_tile_sizes(&rows)[idx]
+                non_normal_size.unwrap_or_else(|| col.compute_tile_sizes(&rows)[idx])
             },
         )
     }
@@ -2741,21 +2739,26 @@ impl<W: LayoutElement> ScrollingSpace<W> {
         thickness: f64,
     ) -> Option<SpinePlans> {
         let col = self.columns.get(column_idx)?;
-        if !col.pending_sizing_mode().is_normal() || tile_idx > col.tiles.len() {
+        if tile_idx > col.tiles.len() {
             return None;
         }
         let mut rows = col.sizing_inputs();
         rows.insert(tile_idx, TileSizing::new(tile, WindowHeight::auto_1()));
+        // Native insertion preserves the mode only for tabbed columns. In a normal column,
+        // add_tile_at() clears fullscreen/maximized before allocating the new member.
+        let non_normal_size = (col.display_mode == ColumnDisplay::Tabbed)
+            .then(|| col.non_normal_tile_size())
+            .flatten();
         plan_spine_allocations(
             tile,
             thickness,
             col.scale,
             &col.options,
-            col.spine_bounds(&rows, tile_idx),
+            non_normal_size.unwrap_or_else(|| col.spine_bounds(&rows, tile_idx)),
             col.spine_preference(rows.len()),
             |row| {
                 rows[tile_idx] = row;
-                col.compute_tile_sizes(&rows)[tile_idx]
+                non_normal_size.unwrap_or_else(|| col.compute_tile_sizes(&rows)[tile_idx])
             },
         )
     }
@@ -3076,10 +3079,21 @@ impl<W: LayoutElement> ScrollingSpace<W> {
             col = &mut self.columns[col_idx];
         }
 
+        let spine_state = col.tiles.iter().all(Tile::is_spine).then(|| {
+            (
+                col.sizing_mode(),
+                col.tiles_origin(),
+                self.data[col_idx].width,
+            )
+        });
         col.set_fullscreen(is_fullscreen);
 
         // With place_within_column, the tab indicator changes the column size immediately.
         self.data[col_idx].update(col);
+
+        if let Some((mode, origin, width)) = spine_state {
+            self.finish_spine_mode_change(col_idx, mode, origin, width);
+        }
 
         true
     }
@@ -3107,12 +3121,71 @@ impl<W: LayoutElement> ScrollingSpace<W> {
             col = &mut self.columns[col_idx];
         }
 
+        let spine_state = col.tiles.iter().all(Tile::is_spine).then(|| {
+            (
+                col.sizing_mode(),
+                col.tiles_origin(),
+                self.data[col_idx].width,
+            )
+        });
         col.set_maximized(maximize);
 
         // With place_within_column, the tab indicator changes the column size immediately.
         self.data[col_idx].update(col);
 
+        if let Some((mode, origin, width)) = spine_state {
+            self.finish_spine_mode_change(col_idx, mode, origin, width);
+        }
+
         true
+    }
+
+    /// A spine-only column changes mode synchronously: there will be no client commit to
+    /// finish the origin, neighboring-column movement or native view-offset bookkeeping.
+    fn finish_spine_mode_change(
+        &mut self,
+        col_idx: usize,
+        previous_mode: SizingMode,
+        previous_origin: Point<f64, Logical>,
+        previous_width: f64,
+    ) {
+        let col = &mut self.columns[col_idx];
+        let mode = col.sizing_mode();
+        if previous_mode == mode {
+            return;
+        }
+        let origin_delta = previous_origin - col.tiles_origin();
+        for tile in &mut col.tiles {
+            tile.animate_move_from(origin_delta);
+        }
+
+        let offset = previous_width - self.data[col_idx].width;
+        if self.active_column_idx <= col_idx {
+            for col in &mut self.columns[col_idx + 1..] {
+                col.animate_move_x_from(offset);
+            }
+        } else {
+            for col in &mut self.columns[..=col_idx] {
+                col.animate_move_x_from(-offset);
+            }
+        }
+
+        if col_idx == self.active_column_idx {
+            if previous_mode.is_normal() && !mode.is_normal() {
+                self.view_offset_to_restore = Some(self.view_offset.stationary());
+            }
+            let restore = if !previous_mode.is_normal() && mode.is_normal() {
+                self.view_offset_to_restore.take()
+            } else {
+                None
+            };
+            if self.interactive_resize.is_none() && !self.view_offset.is_gesture() {
+                if let Some(offset) = restore {
+                    self.animate_view_offset(col_idx, offset);
+                }
+                self.animate_view_offset_to_column(None, col_idx, None);
+            }
+        }
     }
 
     pub fn render_above_top_layer(&self) -> bool {
@@ -4567,7 +4640,12 @@ impl<W: LayoutElement> Column<W> {
         // The logic that satisfies these behaviors is to check if *any* tile is fullscreen.
         let mut any_fullscreen = false;
         let mut any_maximized = false;
+        let mut any_spine = false;
         for tile in &self.tiles {
+            if tile.is_spine() {
+                any_spine = true;
+                continue;
+            }
             match tile.sizing_mode() {
                 SizingMode::Normal => (),
                 SizingMode::Maximized => any_maximized = true,
@@ -4579,6 +4657,11 @@ impl<W: LayoutElement> Column<W> {
             SizingMode::Fullscreen
         } else if any_maximized {
             SizingMode::Maximized
+        } else if any_spine {
+            // Spines assume the container's allocation synchronously, without changing their
+            // hidden clients' mode. Keep its origin when the last normal member disappears,
+            // including while a subsequently inserted normal member waits for its first commit.
+            self.pending_sizing_mode()
         } else {
             SizingMode::Normal
         }
@@ -4734,7 +4817,7 @@ impl<W: LayoutElement> Column<W> {
 
     fn update_tile_sizes_with_transaction(&mut self, animate: bool, transaction: Transaction) {
         let sizing_mode = self.pending_sizing_mode();
-        if matches!(sizing_mode, SizingMode::Fullscreen | SizingMode::Maximized) {
+        if let Some(size) = self.non_normal_tile_size() {
             for (tile_idx, tile) in self.tiles.iter_mut().enumerate() {
                 // In tabbed mode, only the visible window participates in the transaction.
                 let is_active = tile_idx == self.active_tile_idx;
@@ -4744,7 +4827,12 @@ impl<W: LayoutElement> Column<W> {
                     Some(transaction.clone())
                 };
 
-                if matches!(sizing_mode, SizingMode::Fullscreen) {
+                if tile.is_spine() {
+                    // Passive insertion keeps the independent form and never configures the
+                    // hidden client as fullscreen/maximized or at the spine's locked size.
+                    tile.request_tile_size(size, animate, transaction);
+                    self.data[tile_idx].update(tile);
+                } else if matches!(sizing_mode, SizingMode::Fullscreen) {
                     tile.request_fullscreen(animate, transaction);
                 } else {
                     tile.request_maximized(self.parent_area.size, animate, transaction);
@@ -4797,6 +4885,14 @@ impl<W: LayoutElement> Column<W> {
             width,
             &self.options,
         )
+    }
+
+    fn non_normal_tile_size(&self) -> Option<Size<f64, Logical>> {
+        match self.pending_sizing_mode() {
+            SizingMode::Normal => None,
+            SizingMode::Maximized => Some(self.parent_area.size),
+            SizingMode::Fullscreen => Some(self.view_size),
+        }
     }
 
     fn sizing_inputs(&self) -> Vec<TileSizing> {
@@ -5567,10 +5663,15 @@ impl<W: LayoutElement> Column<W> {
             assert!(Rc::ptr_eq(&self.options, &tile.options));
             assert_eq!(self.clock, tile.clock);
             assert_eq!(self.scale, tile.scale());
-            assert_eq!(
-                self.pending_sizing_mode(),
-                tile.window().pending_sizing_mode()
-            );
+            if tile.is_spine() {
+                assert!(tile.sizing_mode().is_normal());
+                assert!(tile.window().pending_sizing_mode().is_normal());
+            } else {
+                assert_eq!(
+                    self.pending_sizing_mode(),
+                    tile.window().pending_sizing_mode()
+                );
+            }
             assert_eq!(self.view_size, tile.view_size());
             tile.verify_invariants();
 
