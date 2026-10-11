@@ -601,3 +601,415 @@ window-rule {
         assert!(ws.active_window().is_none());
     }
 }
+
+fn explicit_mode_fixture() -> (
+    Fixture,
+    super::client::ClientId,
+    Vec<wayland_client::protocol::wl_surface::WlSurface>,
+    Vec<smithay::desktop::Window>,
+) {
+    let mut config = niri_config::Config::default();
+    config.layout.default_column_display = niri_ipc::ColumnDisplay::Tabbed;
+    let mut fixture = Fixture::with_config(config);
+    fixture.add_output(1, (1280, 720));
+    let client = fixture.add_client();
+    let mut surfaces = Vec::new();
+    let mut ids = Vec::new();
+    for _ in 0..3 {
+        let surface = fixture.client(client).create_window().surface.clone();
+        fixture.client(client).window(&surface).commit();
+        fixture.roundtrip(client);
+        let window = fixture.client(client).window(&surface);
+        window.attach_new_buffer();
+        window.set_size(100, 100);
+        window.ack_last_and_commit();
+        fixture.double_roundtrip(client);
+        let id = fixture
+            .niri()
+            .layout
+            .windows()
+            .find(|(_, w)| {
+                w.toplevel().wl_surface().id().protocol_id() == surface.id().protocol_id()
+            })
+            .unwrap()
+            .1
+            .window
+            .clone();
+        surfaces.push(surface);
+        ids.push(id);
+    }
+    for id in &ids[1..] {
+        let ws = fixture
+            .niri()
+            .layout
+            .workspaces_mut()
+            .find(|ws| ws.has_window(id))
+            .unwrap();
+        assert!(ws
+            .tiles_mut()
+            .find(|t| t.window().window == *id)
+            .unwrap()
+            .set_spine(ShrinkAxis::Horizontal, 40.));
+        ws.update_window(id, None);
+        fixture.niri().layout.consume_or_expel_window_left(Some(id));
+    }
+    fixture.niri().layout.activate_window(&ids[0]);
+    fixture.double_roundtrip(client);
+    for surface in &surfaces {
+        let _ = fixture.client(client).window(surface).recent_configures();
+    }
+    (fixture, client, surfaces, ids)
+}
+
+#[test]
+fn explicit_xdg_duplicate_mode_and_early_unset_restore_every_affected_tab() {
+    for mode in [SizingMode::Fullscreen, SizingMode::Maximized] {
+        for all_spines in [false, true] {
+            let (mut fixture, client, surfaces, ids) = explicit_mode_fixture();
+            if all_spines {
+                let ws = fixture
+                    .niri()
+                    .layout
+                    .workspaces_mut()
+                    .find(|ws| ws.has_window(&ids[0]))
+                    .unwrap();
+                assert!(ws
+                    .tiles_mut()
+                    .find(|t| t.window().window == ids[0])
+                    .unwrap()
+                    .set_spine(ShrinkAxis::Vertical, 40.));
+                ws.update_window(&ids[0], None);
+            }
+            if mode.is_fullscreen() {
+                fixture.niri().layout.set_fullscreen(&ids[0], true);
+            } else {
+                fixture.niri().layout.set_maximized(&ids[0], true);
+            }
+            fixture.double_roundtrip(client);
+            if !all_spines {
+                let window = fixture.client(client).window(&surfaces[0]);
+                let size = window.configures_received.last().unwrap().1.size;
+                window.set_size(size.0 as u16, size.1 as u16);
+                window.ack_last_and_commit();
+                fixture.double_roundtrip(client);
+            }
+            assert!(fixture.niri().layout.is_spine(&ids[1]));
+            for surface in &surfaces {
+                let _ = fixture.client(client).window(surface).recent_configures();
+            }
+            let window = fixture.client(client).window(&surfaces[0]);
+            if mode.is_fullscreen() {
+                window.xdg_toplevel.set_fullscreen(None);
+            } else {
+                window.xdg_toplevel.set_maximized();
+            }
+            fixture.double_roundtrip(client);
+            let mut deadline = None;
+            for id in &ids[1..] {
+                assert!(!fixture.niri().layout.is_spine(id));
+                let mapped = fixture
+                    .niri()
+                    .layout
+                    .windows()
+                    .find(|(_, w)| w.window == *id)
+                    .unwrap()
+                    .1;
+                assert_eq!(mapped.pending_sizing_mode(), mode);
+                let current_deadline = mapped.normal_restore_deadline().unwrap();
+                if let Some(deadline) = deadline {
+                    assert_eq!(current_deadline, deadline);
+                }
+                deadline = Some(current_deadline);
+            }
+            let state = if mode.is_fullscreen() {
+                xdg_toplevel::State::Fullscreen
+            } else {
+                xdg_toplevel::State::Maximized
+            };
+            for surface in &surfaces[1..] {
+                let configures = fixture
+                    .client(client)
+                    .window(surface)
+                    .recent_configures()
+                    .collect::<Vec<_>>();
+                assert!(!configures.is_empty());
+                assert!(configures
+                    .iter()
+                    .all(|configure| configure.states.contains(&state)));
+            }
+            // Reverse before either restored book has acked/committed its new mode.
+            let window = fixture.client(client).window(&surfaces[1]);
+            if mode.is_fullscreen() {
+                window.xdg_toplevel.unset_fullscreen();
+            } else {
+                window.xdg_toplevel.unset_maximized();
+            }
+            fixture.double_roundtrip(client);
+            for (surface, id) in surfaces.iter().zip(&ids) {
+                let window = fixture.client(client).window(surface);
+                let configure = &window.configures_received.last().unwrap().1;
+                assert!(!configure.states.contains(&xdg_toplevel::State::Fullscreen));
+                assert!(!configure.states.contains(&xdg_toplevel::State::Maximized));
+                window.set_size(configure.size.0 as u16, configure.size.1 as u16);
+                window.ack_last_and_commit();
+                fixture.double_roundtrip(client);
+                assert!(!fixture.niri().layout.is_spine(id));
+            }
+            assert_eq!(fixture.niri().layout.windows().count(), 3);
+            if all_spines {
+                assert!(fixture.niri().layout.focus().is_none());
+            } else {
+                assert_eq!(fixture.niri().layout.focus().unwrap().window, ids[0]);
+            }
+        }
+    }
+}
+
+#[test]
+fn explicit_mode_by_id_action_uses_container_toggle_and_focusless_action_does_nothing() {
+    use niri_config::Action;
+    for mode in [SizingMode::Fullscreen, SizingMode::Maximized] {
+        let (mut fixture, client, surfaces, ids) = explicit_mode_fixture();
+        let ws = fixture
+            .niri()
+            .layout
+            .workspaces_mut()
+            .find(|ws| ws.has_window(&ids[0]))
+            .unwrap();
+        assert!(ws
+            .tiles_mut()
+            .find(|t| t.window().window == ids[0])
+            .unwrap()
+            .set_spine(ShrinkAxis::Vertical, 40.));
+        ws.update_window(&ids[0], None);
+        let native_id = fixture
+            .niri()
+            .layout
+            .windows()
+            .find(|(_, w)| w.window == ids[0])
+            .unwrap()
+            .1
+            .id()
+            .get();
+        assert!(fixture.niri().layout.focus().is_none());
+        fixture
+            .niri_state()
+            .do_action(Action::FullscreenWindow, false);
+        fixture
+            .niri_state()
+            .do_action(Action::MaximizeWindowToEdges, false);
+        fixture
+            .niri_state()
+            .do_action(Action::ToggleWindowedFullscreen, false);
+        assert!(ids.iter().all(|id| fixture.niri().layout.is_spine(id)));
+        if mode.is_fullscreen() {
+            fixture.niri().layout.set_fullscreen(&ids[0], true);
+        } else {
+            fixture.niri().layout.set_maximized(&ids[0], true);
+        }
+        let action = if mode.is_fullscreen() {
+            Action::FullscreenWindowById(native_id)
+        } else {
+            Action::MaximizeWindowToEdgesById(native_id)
+        };
+        fixture.niri_state().do_action(action, false);
+        fixture.double_roundtrip(client);
+        assert!(ids.iter().all(|id| !fixture.niri().layout.is_spine(id)));
+        let ws = fixture
+            .niri()
+            .layout
+            .workspaces_mut()
+            .find(|ws| ws.has_window(&ids[0]))
+            .unwrap();
+        let col = ws.scrolling().columns().next().unwrap();
+        assert!(!col.is_pending_fullscreen() && !col.is_pending_maximized());
+        assert!(fixture.niri().layout.focus().is_none());
+        for surface in &surfaces {
+            let configure = &fixture
+                .client(client)
+                .window(surface)
+                .configures_received
+                .last()
+                .unwrap()
+                .1;
+            assert!(!configure.states.contains(&xdg_toplevel::State::Fullscreen));
+            assert!(!configure.states.contains(&xdg_toplevel::State::Maximized));
+        }
+    }
+}
+
+#[test]
+fn explicit_windowed_action_with_no_resize_waits_for_processed_flag_commit() {
+    use niri_config::Action;
+    let config = niri_config::Config::parse_mem("window-rule { open-floating false; min-width 100; max-width 100; min-height 100; max-height 100; }").unwrap();
+    let mut fixture = Fixture::with_config(config);
+    fixture.add_output(1, (1280, 720));
+    let client = fixture.add_client();
+    let surface = fixture.client(client).create_window().surface.clone();
+    fixture.client(client).window(&surface).commit();
+    fixture.roundtrip(client);
+    let window = fixture.client(client).window(&surface);
+    window.attach_new_buffer();
+    window.set_size(100, 100);
+    window.ack_last_and_commit();
+    fixture.double_roundtrip(client);
+    let mapped = fixture.niri().layout.windows().next().unwrap().1;
+    let id = mapped.window.clone();
+    let native_id = mapped.id().get();
+    let ws = fixture
+        .niri()
+        .layout
+        .workspaces_mut()
+        .find(|ws| ws.has_window(&id))
+        .unwrap();
+    assert!(ws
+        .tiles_mut()
+        .next()
+        .unwrap()
+        .set_spine(ShrinkAxis::Vertical, 40.));
+    ws.update_window(&id, None);
+    fixture
+        .niri_state()
+        .do_action(Action::ToggleWindowedFullscreenById(native_id), false);
+    fixture.double_roundtrip(client);
+    assert!(!fixture.niri().layout.is_spine(&id));
+    let mapped = fixture.niri().layout.windows().next().unwrap().1;
+    assert!(mapped.is_pending_windowed_fullscreen());
+    assert!(!mapped.is_windowed_fullscreen());
+    assert!(!mapped.normal_restore_ready());
+    let deadline = mapped.normal_restore_deadline().unwrap();
+    let window = fixture.client(client).window(&surface);
+    assert_eq!(
+        window.configures_received.last().unwrap().1.size,
+        (100, 100)
+    );
+    assert!(window
+        .configures_received
+        .last()
+        .unwrap()
+        .1
+        .states
+        .contains(&xdg_toplevel::State::Fullscreen));
+    window.ack_last();
+    fixture.double_roundtrip(client);
+    let mapped = fixture.niri().layout.windows().next().unwrap().1;
+    assert!(!mapped.normal_restore_ready());
+    assert_eq!(mapped.normal_restore_deadline(), Some(deadline));
+    fixture.client(client).window(&surface).commit();
+    fixture.double_roundtrip(client);
+    let mapped = fixture.niri().layout.windows().next().unwrap().1;
+    assert!(mapped.is_windowed_fullscreen());
+    assert_eq!(mapped.sizing_mode(), SizingMode::Normal);
+    assert!(mapped.normal_restore_deadline().is_none());
+    assert!(fixture.niri().layout.focus().is_none());
+}
+
+#[test]
+fn explicit_foreign_handler_mode_requests_restore_tabs_without_activating_books() {
+    use crate::protocols::foreign_toplevel::ForeignToplevelHandler;
+    for mode in [SizingMode::Fullscreen, SizingMode::Maximized] {
+        let (mut fixture, client, surfaces, ids) = explicit_mode_fixture();
+        let surface = fixture
+            .niri()
+            .layout
+            .windows()
+            .find(|(_, w)| w.window == ids[0])
+            .unwrap()
+            .1
+            .toplevel()
+            .wl_surface()
+            .clone();
+        if mode.is_fullscreen() {
+            ForeignToplevelHandler::set_fullscreen(fixture.niri_state(), surface, None);
+        } else {
+            ForeignToplevelHandler::set_maximized(fixture.niri_state(), surface);
+        }
+        fixture.double_roundtrip(client);
+        assert!(ids.iter().all(|id| !fixture.niri().layout.is_spine(id)));
+        for surface in &surfaces {
+            let window = fixture.client(client).window(surface);
+            let configure = &window.configures_received.last().unwrap().1;
+            let state = if mode.is_fullscreen() {
+                xdg_toplevel::State::Fullscreen
+            } else {
+                xdg_toplevel::State::Maximized
+            };
+            assert!(configure.states.contains(&state));
+            window.set_size(configure.size.0 as u16, configure.size.1 as u16);
+            window.ack_last_and_commit();
+        }
+        fixture.double_roundtrip(client);
+        assert_eq!(fixture.niri().layout.focus().unwrap().window, ids[0]);
+    }
+}
+
+#[test]
+fn explicit_xdg_mode_from_floating_book_preserves_native_return_and_other_books() {
+    for mode in [SizingMode::Fullscreen, SizingMode::Maximized] {
+        let (mut fixture, client, surfaces, ids) = explicit_mode_fixture();
+        fixture
+            .niri()
+            .layout
+            .set_window_floating(Some(&ids[1]), true);
+        fixture.double_roundtrip(client);
+        assert!(fixture.niri().layout.is_spine(&ids[1]));
+        let ws = fixture
+            .niri()
+            .layout
+            .workspaces_mut()
+            .find(|ws| ws.has_window(&ids[1]))
+            .unwrap();
+        assert!(ws.is_floating(&ids[1]));
+        let window = fixture.client(client).window(&surfaces[1]);
+        if mode.is_fullscreen() {
+            window.xdg_toplevel.set_fullscreen(None);
+        } else {
+            window.xdg_toplevel.set_maximized();
+        }
+        fixture.double_roundtrip(client);
+        assert!(!fixture.niri().layout.is_spine(&ids[1]));
+        assert!(fixture.niri().layout.is_spine(&ids[2]));
+        let ws = fixture
+            .niri()
+            .layout
+            .workspaces_mut()
+            .find(|ws| ws.has_window(&ids[1]))
+            .unwrap();
+        assert!(!ws.is_floating(&ids[1]));
+        let window = fixture.client(client).window(&surfaces[1]);
+        let configure = &window.configures_received.last().unwrap().1;
+        let state = if mode.is_fullscreen() {
+            xdg_toplevel::State::Fullscreen
+        } else {
+            xdg_toplevel::State::Maximized
+        };
+        assert!(configure.states.contains(&state));
+        window.set_size(configure.size.0 as u16, configure.size.1 as u16);
+        window.ack_last_and_commit();
+        fixture.double_roundtrip(client);
+        let window = fixture.client(client).window(&surfaces[1]);
+        if mode.is_fullscreen() {
+            window.xdg_toplevel.unset_fullscreen();
+        } else {
+            window.xdg_toplevel.unset_maximized();
+        }
+        fixture.double_roundtrip(client);
+        let ws = fixture
+            .niri()
+            .layout
+            .workspaces_mut()
+            .find(|ws| ws.has_window(&ids[1]))
+            .unwrap();
+        assert!(ws.is_floating(&ids[1]));
+        let window = fixture.client(client).window(&surfaces[1]);
+        let configure = &window.configures_received.last().unwrap().1;
+        assert!(!configure.states.contains(&xdg_toplevel::State::Fullscreen));
+        assert!(!configure.states.contains(&xdg_toplevel::State::Maximized));
+        window.set_size(configure.size.0 as u16, configure.size.1 as u16);
+        window.ack_last_and_commit();
+        fixture.double_roundtrip(client);
+        assert_eq!(fixture.niri().layout.windows().count(), 3);
+        assert!(fixture.niri().layout.is_spine(&ids[2]));
+        assert!(!fixture.niri().layout.is_spine(&ids[1]));
+    }
+}

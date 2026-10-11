@@ -500,6 +500,7 @@ impl<W: LayoutElement> FloatingSpace<W> {
         &mut self,
         plans: &[(W::Id, NormalSizePlan)],
         transaction: Transaction,
+        settle_matching: bool,
     ) {
         for (tile, data) in zip(&mut self.tiles, &mut self.data) {
             if !plans.iter().any(|(id, _)| id == tile.window().id()) {
@@ -508,7 +509,7 @@ impl<W: LayoutElement> FloatingSpace<W> {
             let pos = data.logical_pos;
             tile.floating_preset_width_idx = None;
             tile.floating_preset_height_idx = None;
-            tile.submit_normal_restore(true, transaction.clone());
+            tile.submit_normal_restore(true, transaction.clone(), settle_matching);
             data.update(tile);
             data.set_logical_pos(pos);
         }

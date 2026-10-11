@@ -3686,6 +3686,103 @@ impl<W: LayoutElement> Layout<W> {
         activate
     }
 
+    /// Only explicit user/protocol requests call this preparation. Native move/display setters
+    /// keep the independent spine form. The operation coordinator must cancel its preview first.
+    fn prepare_spines_for_mode_request(
+        &mut self,
+        id: &W::Id,
+        windowed: bool,
+    ) -> Option<Vec<W::Id>> {
+        if let Some(InteractiveMoveState::Moving(move_)) = &self.interactive_move {
+            if move_.tile.window().id() == id {
+                return (!move_.tile.is_spine()).then(Vec::new);
+            }
+        }
+        let ws = self.workspaces_mut().find(|ws| ws.has_window(id))?;
+        let ids = ws.spines_for_mode_request(id, windowed);
+        if ids.is_empty() {
+            return Some(ids);
+        }
+        ws.restore_normal_spines_for_mode_request(&ids);
+        Some(ids)
+    }
+
+    fn finish_spine_mode_request(&mut self, ids: &[W::Id]) {
+        if ids.is_empty() {
+            return;
+        }
+        for ws in self.workspaces_mut() {
+            let present = ids
+                .iter()
+                .filter(|id| ws.has_window(id))
+                .cloned()
+                .collect::<Vec<_>>();
+            for id in present {
+                if let Some(tile) = ws.tiles_mut().find(|tile| tile.window().id() == &id) {
+                    tile.rearm_normal_restore();
+                }
+                // Refresh through the native owner, so mode-origin/view-offset bookkeeping and
+                // geometry caches observe a no-resize handoff in their original order.
+                ws.update_window(&id, None);
+            }
+        }
+    }
+
+    pub fn request_fullscreen(&mut self, id: &W::Id, value: bool) {
+        let Some(restored) = self.prepare_spines_for_mode_request(id, false) else {
+            return;
+        };
+        self.set_fullscreen(id, value);
+        self.finish_spine_mode_request(&restored);
+    }
+
+    pub fn request_toggle_fullscreen(&mut self, id: &W::Id) {
+        if self.sink_depth(id).is_some() {
+            return;
+        }
+        let value = !self
+            .workspaces()
+            .find(|(_, _, ws)| ws.has_window(id))
+            .and_then(|(_, _, ws)| ws.scrolling().columns().find(|col| col.contains(id)))
+            .is_some_and(|col| col.is_pending_fullscreen());
+        self.request_fullscreen(id, value);
+    }
+
+    pub fn request_maximized(&mut self, id: &W::Id, value: bool) {
+        let Some(restored) = self.prepare_spines_for_mode_request(id, false) else {
+            return;
+        };
+        self.set_maximized(id, value);
+        self.finish_spine_mode_request(&restored);
+    }
+
+    pub fn request_toggle_maximized(&mut self, id: &W::Id) {
+        if self.sink_depth(id).is_some() {
+            return;
+        }
+        let value = !self
+            .workspaces()
+            .find(|(_, _, ws)| ws.has_window(id))
+            .and_then(|(_, _, ws)| ws.scrolling().columns().find(|col| col.contains(id)))
+            .is_some_and(|col| col.is_pending_maximized());
+        self.request_maximized(id, value);
+    }
+
+    pub fn request_toggle_windowed_fullscreen(&mut self, id: &W::Id) {
+        if self.sink_depth(id).is_some() {
+            return;
+        }
+        let Some((_, window)) = self.windows().find(|(_, win)| win.id() == id) else {
+            return;
+        };
+        let value = !window.is_pending_windowed_fullscreen();
+        let Some(restored) = self.prepare_spines_for_mode_request(id, true) else {
+            return;
+        };
+        self.set_windowed_fullscreen(id, value);
+        self.finish_spine_mode_request(&restored);
+    }
+
     pub fn set_fullscreen(&mut self, id: &W::Id, is_fullscreen: bool) {
         // Check if this is a request to unset the windowed fullscreen state.
         if !is_fullscreen {
@@ -3735,6 +3832,12 @@ impl<W: LayoutElement> Layout<W> {
             return;
         }
         let (_, window) = self.windows().find(|(_, win)| win.id() == id).unwrap();
+        let value = !window.is_pending_windowed_fullscreen();
+        self.set_windowed_fullscreen(id, value);
+    }
+
+    fn set_windowed_fullscreen(&mut self, id: &W::Id, value: bool) {
+        let (_, window) = self.windows().find(|(_, win)| win.id() == id).unwrap();
         if window.pending_sizing_mode().is_fullscreen() {
             // Remove the real fullscreen.
             for ws in self.workspaces_mut() {
@@ -3748,7 +3851,7 @@ impl<W: LayoutElement> Layout<W> {
         // This will switch is_pending_fullscreen() to false right away.
         self.with_windows_mut(|window, _| {
             if window.id() == id {
-                window.request_windowed_fullscreen(!window.is_pending_windowed_fullscreen());
+                window.request_windowed_fullscreen(value);
             }
         });
     }

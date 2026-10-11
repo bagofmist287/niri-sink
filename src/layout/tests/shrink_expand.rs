@@ -1699,7 +1699,7 @@ fn normal_restore_in_non_normal_container_keeps_origin_until_mode_commit() {
             .next()
             .unwrap()
             .prepare_normal_restore(plans[0].1));
-        space.commit_normal_restore(&plans, &requests, Transaction::new());
+        space.commit_normal_restore(&plans, &requests, Transaction::new(), true);
         space.verify_invariants();
         assert_eq!(space.tiles().next().unwrap().sizing_mode(), mode);
         assert_eq!(
@@ -1798,7 +1798,7 @@ fn normal_restore_mode_unset_before_first_commit_keeps_native_view_restore_recor
             .next()
             .unwrap()
             .prepare_normal_restore(plans[0].1));
-        space.commit_normal_restore(&plans, &requests, Transaction::new());
+        space.commit_normal_restore(&plans, &requests, Transaction::new(), true);
         // The client is still Normal; the column origin came from the former spine-only mode.
         assert_eq!(
             space.tiles().next().unwrap().window().sizing_mode(),
@@ -1816,5 +1816,256 @@ fn normal_restore_mode_unset_before_first_commit_keeps_native_view_restore_recor
             space.tiles().next().unwrap().window().sizing_mode(),
             SizingMode::Normal
         );
+    }
+}
+
+fn explicit_mode_layout(display: ColumnDisplay) -> Layout<TestWindow> {
+    let mut options = Options::default();
+    options.layout.default_column_display = display;
+    let mut layout = Layout::with_options(Clock::with_time(Duration::ZERO), options);
+    Op::AddOutput(1).apply(&mut layout);
+    Op::AddWindow {
+        params: TestWindowParams::new(1),
+    }
+    .apply(&mut layout);
+    Op::Communicate(1).apply(&mut layout);
+    let ws = layout
+        .workspaces_mut()
+        .find(|ws| ws.has_window(&1))
+        .unwrap();
+    for (id, axis) in [(2, ShrinkAxis::Horizontal), (3, ShrinkAxis::Vertical)] {
+        let mut tile = ws.make_tile(TestWindow::new(TestWindowParams::new(id)));
+        assert!(tile.set_spine(axis, 40.));
+        ws.scrolling_mut().add_tile_to_column(0, None, tile, false);
+    }
+    layout.verify_invariants();
+    layout
+}
+
+#[test]
+fn explicit_duplicate_column_mode_restores_all_tabs_before_native_early_return() {
+    for mode in [SizingMode::Fullscreen, SizingMode::Maximized] {
+        let mut layout = explicit_mode_layout(ColumnDisplay::Tabbed);
+        if mode.is_fullscreen() {
+            layout.set_fullscreen(&1, true);
+        } else {
+            layout.set_maximized(&1, true);
+        }
+        Op::Communicate(1).apply(&mut layout);
+        assert!(layout.is_spine(&2) && layout.is_spine(&3));
+        if mode.is_fullscreen() {
+            layout.request_fullscreen(&1, true);
+        } else {
+            layout.request_maximized(&1, true);
+        }
+        for id in [2, 3] {
+            assert!(!layout.is_spine(&id));
+            let win = layout.windows().find(|(_, w)| w.id() == &id).unwrap().1;
+            assert_eq!(win.pending_sizing_mode(), mode);
+            assert_eq!(
+                win.requested_size(),
+                layout
+                    .windows()
+                    .find(|(_, w)| w.id() == &1)
+                    .unwrap()
+                    .1
+                    .requested_size()
+            );
+            Op::Communicate(id).apply(&mut layout);
+        }
+        assert_eq!(layout.windows().count(), 3);
+        assert_eq!(layout.focus().unwrap().id(), &1);
+        layout.verify_invariants();
+    }
+}
+
+#[test]
+fn explicit_toggle_uses_book_container_flags_before_restore_including_latent_maximize() {
+    for mode in [SizingMode::Fullscreen, SizingMode::Maximized] {
+        let mut layout = explicit_mode_layout(ColumnDisplay::Tabbed);
+        if mode.is_fullscreen() {
+            layout.set_fullscreen(&1, true);
+        } else {
+            layout.set_maximized(&1, true);
+        }
+        Op::Communicate(1).apply(&mut layout);
+        assert_eq!(
+            layout
+                .windows()
+                .find(|(_, w)| w.id() == &2)
+                .unwrap()
+                .1
+                .pending_sizing_mode(),
+            SizingMode::Normal
+        );
+        if mode.is_fullscreen() {
+            layout.request_toggle_fullscreen(&2);
+        } else {
+            layout.request_toggle_maximized(&2);
+        }
+        let ws = layout
+            .workspaces()
+            .find(|(_, _, ws)| ws.has_window(&1))
+            .unwrap()
+            .2;
+        let col = ws.scrolling().columns().next().unwrap();
+        assert!(!col.is_pending_fullscreen() && !col.is_pending_maximized());
+        assert!(!layout.is_spine(&2) && !layout.is_spine(&3));
+        for id in [1, 2, 3] {
+            Op::Communicate(id).apply(&mut layout);
+        }
+        layout.verify_invariants();
+    }
+    let mut layout = explicit_mode_layout(ColumnDisplay::Tabbed);
+    layout.set_maximized(&1, true);
+    layout.set_fullscreen(&1, true);
+    Op::Communicate(1).apply(&mut layout);
+    layout.request_toggle_maximized(&2);
+    let ws = layout
+        .workspaces()
+        .find(|(_, _, ws)| ws.has_window(&1))
+        .unwrap()
+        .2;
+    let col = ws.scrolling().columns().next().unwrap();
+    assert!(col.is_pending_fullscreen());
+    assert!(!col.is_pending_maximized());
+    for id in [1, 2, 3] {
+        Op::Communicate(id).apply(&mut layout);
+    }
+    layout.verify_invariants();
+}
+
+#[test]
+fn explicit_mode_on_normal_column_keeps_native_extraction_and_other_spines() {
+    for mode in [SizingMode::Fullscreen, SizingMode::Maximized] {
+        let mut layout = explicit_mode_layout(ColumnDisplay::Normal);
+        let other = layout
+            .windows()
+            .find(|(_, w)| w.id() == &3)
+            .unwrap()
+            .1
+            .clone();
+        if mode.is_fullscreen() {
+            layout.request_fullscreen(&2, true);
+        } else {
+            layout.request_maximized(&2, true);
+        }
+        assert!(!layout.is_spine(&2));
+        assert!(layout.is_spine(&3));
+        assert_eq!(other.requested_size(), None);
+        let ws = layout
+            .workspaces()
+            .find(|(_, _, ws)| ws.has_window(&1))
+            .unwrap()
+            .2;
+        assert_eq!(ws.scrolling().columns().count(), 2);
+        assert_eq!(
+            layout
+                .windows()
+                .find(|(_, w)| w.id() == &2)
+                .unwrap()
+                .1
+                .pending_sizing_mode(),
+            mode
+        );
+        for id in [1, 2] {
+            Op::Communicate(id).apply(&mut layout);
+        }
+        layout.verify_invariants();
+        assert_eq!(layout.windows().count(), 3);
+    }
+}
+
+#[test]
+fn explicit_windowed_fullscreen_restores_only_affected_scope_and_waits_for_flag_commit() {
+    for fullscreen_container in [false, true] {
+        let mut layout = explicit_mode_layout(ColumnDisplay::Tabbed);
+        if fullscreen_container {
+            layout.set_fullscreen(&1, true);
+            Op::Communicate(1).apply(&mut layout);
+        }
+        layout.request_toggle_windowed_fullscreen(&2);
+        assert!(!layout.is_spine(&2));
+        assert_eq!(layout.is_spine(&3), !fullscreen_container);
+        let ws = layout
+            .workspaces()
+            .find(|(_, _, ws)| ws.has_window(&1))
+            .unwrap()
+            .2;
+        let tile = ws.tiles().find(|t| t.window().id() == &2).unwrap();
+        assert!(tile.window().is_pending_windowed_fullscreen());
+        assert!(!tile.window().is_windowed_fullscreen());
+        assert!(tile.normal_restore_input_blocked());
+        for id in [1, 2, 3] {
+            Op::Communicate(id).apply(&mut layout);
+        }
+        layout.verify_invariants();
+        layout.request_toggle_windowed_fullscreen(&2);
+        Op::Communicate(2).apply(&mut layout);
+        assert!(!layout
+            .windows()
+            .find(|(_, w)| w.id() == &2)
+            .unwrap()
+            .1
+            .is_windowed_fullscreen());
+        layout.verify_invariants();
+    }
+}
+
+#[test]
+fn explicit_floating_modes_restore_form_and_keep_native_return_to_floating() {
+    for mode in [SizingMode::Fullscreen, SizingMode::Maximized] {
+        let mut layout = Layout::<TestWindow>::default();
+        Op::AddOutput(1).apply(&mut layout);
+        let mut params = TestWindowParams::new(1);
+        params.is_floating = true;
+        Op::AddWindow { params }.apply(&mut layout);
+        Op::Communicate(1).apply(&mut layout);
+        let ws = layout
+            .workspaces_mut()
+            .find(|ws| ws.has_window(&1))
+            .unwrap();
+        assert!(ws.is_floating(&1));
+        assert!(ws
+            .tiles_mut()
+            .next()
+            .unwrap()
+            .set_spine(ShrinkAxis::Horizontal, 40.));
+        ws.update_window(&1, None);
+        let win = layout.windows().next().unwrap().1.clone();
+        let output_events = win.0.output_events.borrow().clone();
+        if mode.is_fullscreen() {
+            layout.request_fullscreen(&1, true);
+        } else {
+            layout.request_maximized(&1, true);
+        }
+        assert!(!layout.is_spine(&1));
+        assert!(!layout
+            .workspaces()
+            .find(|(_, _, ws)| ws.has_window(&1))
+            .unwrap()
+            .2
+            .is_floating(&1));
+        assert_eq!(win.pending_sizing_mode(), mode);
+        Op::Communicate(1).apply(&mut layout);
+        layout.verify_invariants();
+        if mode.is_fullscreen() {
+            layout.request_fullscreen(&1, false);
+        } else {
+            layout.request_maximized(&1, false);
+        }
+        Op::Communicate(1).apply(&mut layout);
+        layout.verify_invariants();
+        assert!(layout
+            .workspaces()
+            .find(|(_, _, ws)| ws.has_window(&1))
+            .unwrap()
+            .2
+            .is_floating(&1));
+        assert_eq!(
+            win.0.output_events.borrow().as_slice(),
+            output_events.as_slice()
+        );
+        assert!(Rc::ptr_eq(&win.0, &layout.windows().next().unwrap().1 .0));
     }
 }

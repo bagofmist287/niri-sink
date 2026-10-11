@@ -1506,6 +1506,9 @@ impl LayoutElement for Mapped {
         if self.sink_restoring {
             self.begin_sink_restore();
         }
+        if let Some(barrier) = self.normal_restore_barrier {
+            self.normal_restore_barrier = self.restore_barrier(barrier.deadline);
+        }
     }
 
     fn is_child_of(&self, parent: &Self) -> bool {

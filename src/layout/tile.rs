@@ -59,6 +59,7 @@ pub struct Tile<W: LayoutElement> {
     normal_restore: Option<NormalSizePlan>,
     /// Container origin at batch insertion, retained through a subsequent pending mode change.
     normal_restore_origin_mode: SizingMode,
+    normal_restore_deadline: Option<std::time::Instant>,
     pub(super) normal_restore_focus_cancelled: bool,
 
     /// The border around the window.
@@ -222,6 +223,7 @@ impl<W: LayoutElement> Tile<W> {
             spine: None,
             normal_restore: None,
             normal_restore_origin_mode: SizingMode::Normal,
+            normal_restore_deadline: None,
             normal_restore_focus_cancelled: false,
             border: FocusRing::new(border_config.into()),
             focus_ring: FocusRing::new(focus_ring_config),
@@ -325,6 +327,7 @@ impl<W: LayoutElement> Tile<W> {
                 return;
             }
             self.normal_restore = None;
+            self.normal_restore_deadline = None;
             self.window.finish_normal_restore();
         }
 
@@ -874,6 +877,7 @@ impl<W: LayoutElement> Tile<W> {
         };
         self.spine = Some(spine);
         self.normal_restore = None;
+        self.normal_restore_deadline = None;
         self.window.finish_normal_restore();
         self.resize_animation = None;
         true
@@ -916,11 +920,17 @@ impl<W: LayoutElement> Tile<W> {
         true
     }
 
-    pub(super) fn submit_normal_restore(&mut self, floating: bool, transaction: Transaction) {
+    pub(super) fn submit_normal_restore(
+        &mut self,
+        floating: bool,
+        transaction: Transaction,
+        settle_matching: bool,
+    ) {
         let Some(plan) = self.normal_restore else {
             return;
         };
         let deadline = transaction.deadline();
+        self.normal_restore_deadline = Some(deadline);
         if floating {
             self.window
                 .request_restore_size_once(plan.client_size, transaction);
@@ -929,9 +939,20 @@ impl<W: LayoutElement> Tile<W> {
                 .request_size(plan.client_size, plan.sizing_mode, false, Some(transaction));
         }
         self.window.begin_normal_restore(deadline);
-        if self.window.normal_restore_ready() && self.sizing_mode == plan.sizing_mode {
+        if settle_matching
+            && self.window.normal_restore_ready()
+            && self.sizing_mode == plan.sizing_mode
+        {
             self.update_window();
         }
+    }
+
+    /// Recheck the final intent before a configure is published, retaining the batch deadline.
+    pub(super) fn rearm_normal_restore(&mut self) {
+        let Some(deadline) = self.normal_restore_deadline else {
+            return;
+        };
+        self.window.begin_normal_restore(deadline);
     }
 
     pub fn normal_restore_input_blocked(&self) -> bool {
@@ -948,6 +969,10 @@ impl<W: LayoutElement> Tile<W> {
 
     pub fn is_normal_restoring(&self) -> bool {
         self.normal_restore_input_blocked()
+    }
+
+    pub(super) fn has_normal_restore_allocation(&self) -> bool {
+        self.normal_restore.is_some()
     }
 
     pub fn sizing_mode(&self) -> SizingMode {

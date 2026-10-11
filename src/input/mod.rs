@@ -896,7 +896,7 @@ impl State {
             Action::FullscreenWindow => {
                 let focus = self.niri.layout.focus().map(|m| m.window.clone());
                 if let Some(window) = focus {
-                    self.niri.layout.toggle_fullscreen(&window);
+                    self.niri.layout.request_toggle_fullscreen(&window);
                     // FIXME: granular
                     self.niri.queue_redraw_all();
                 }
@@ -905,7 +905,7 @@ impl State {
                 let window = self.niri.layout.windows().find(|(_, m)| m.id().get() == id);
                 let window = window.map(|(_, m)| m.window.clone());
                 if let Some(window) = window {
-                    self.niri.layout.toggle_fullscreen(&window);
+                    self.niri.layout.request_toggle_fullscreen(&window);
                     // FIXME: granular
                     self.niri.queue_redraw_all();
                 }
@@ -913,7 +913,7 @@ impl State {
             Action::ToggleWindowedFullscreen => {
                 let focus = self.niri.layout.focus().map(|m| m.window.clone());
                 if let Some(window) = focus {
-                    self.niri.layout.toggle_windowed_fullscreen(&window);
+                    self.niri.layout.request_toggle_windowed_fullscreen(&window);
                     // FIXME: granular
                     self.niri.queue_redraw_all();
                 }
@@ -922,7 +922,7 @@ impl State {
                 let window = self.niri.layout.windows().find(|(_, m)| m.id().get() == id);
                 let window = window.map(|(_, m)| m.window.clone());
                 if let Some(window) = window {
-                    self.niri.layout.toggle_windowed_fullscreen(&window);
+                    self.niri.layout.request_toggle_windowed_fullscreen(&window);
                     // FIXME: granular
                     self.niri.queue_redraw_all();
                 }
@@ -1731,7 +1731,7 @@ impl State {
             Action::MaximizeWindowToEdges => {
                 let focus = self.niri.layout.focus().map(|m| m.window.clone());
                 if let Some(window) = focus {
-                    self.niri.layout.toggle_maximized(&window);
+                    self.niri.layout.request_toggle_maximized(&window);
                     // FIXME: granular
                     self.niri.queue_redraw_all();
                 }
@@ -1740,7 +1740,7 @@ impl State {
                 let window = self.niri.layout.windows().find(|(_, m)| m.id().get() == id);
                 let window = window.map(|(_, m)| m.window.clone());
                 if let Some(window) = window {
-                    self.niri.layout.toggle_maximized(&window);
+                    self.niri.layout.request_toggle_maximized(&window);
                     // FIXME: granular
                     self.niri.queue_redraw_all();
                 }

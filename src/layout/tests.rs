@@ -206,6 +206,7 @@ impl LayoutElement for TestWindow {
         self.0.normal_restore_deadline.get().is_none_or(|deadline| {
             std::time::Instant::now() >= deadline
                 || (self.sizing_mode() == self.pending_sizing_mode()
+                    && self.is_windowed_fullscreen() == self.is_pending_windowed_fullscreen()
                     && self.requested_size().is_none_or(|size| {
                         (size.w == 0 || size.w == self.size().w)
                             && (size.h == 0 || size.h == self.size().h)

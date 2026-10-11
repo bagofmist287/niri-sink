@@ -2792,6 +2792,7 @@ impl<W: LayoutElement> ScrollingSpace<W> {
         plans: &[(W::Id, NormalSizePlan)],
         requests: &[(W::Id, ColumnWidth)],
         transaction: Transaction,
+        settle_matching: bool,
     ) {
         for (col_idx, col) in self.columns.iter_mut().enumerate() {
             let targets = col
@@ -2821,11 +2822,28 @@ impl<W: LayoutElement> ScrollingSpace<W> {
             for idx in targets {
                 // Restored hidden tabs also need a configure/commit barrier. Native reflows
                 // otherwise omit their transaction participation because they are invisible.
-                col.tiles[idx].submit_normal_restore(false, transaction.clone());
+                col.tiles[idx].submit_normal_restore(false, transaction.clone(), settle_matching);
                 col.data[idx].update(&col.tiles[idx]);
             }
             self.data[col_idx].update(col);
         }
+    }
+
+    /// Explicit column modes affect every tab; windowed fullscreen otherwise affects one client.
+    pub(super) fn spines_for_mode_request(&self, id: &W::Id, windowed: bool) -> Vec<W::Id> {
+        let Some(col) = self.columns.iter().find(|col| col.contains(id)) else {
+            return Vec::new();
+        };
+        let whole_column =
+            col.display_mode == ColumnDisplay::Tabbed && (!windowed || col.is_pending_fullscreen());
+        col.tiles
+            .iter()
+            .filter(|tile| {
+                (tile.is_spine() || tile.has_normal_restore_allocation())
+                    && (whole_column || tile.window().id() == id)
+            })
+            .map(|tile| tile.window().id().clone())
+            .collect()
     }
 
     pub fn spine_plans(&self, id: &W::Id, thickness: f64) -> Option<SpinePlans> {

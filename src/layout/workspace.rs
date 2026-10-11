@@ -833,6 +833,14 @@ impl<W: LayoutElement> Workspace<W> {
     /// Commit one current-slot batch. This does not activate or reorder any member.
     /// The operation coordinator may explicitly activate a chosen member afterwards.
     pub fn restore_normal_spines(&mut self, ids: &[W::Id]) -> Vec<W::Id> {
+        self.restore_normal_spines_inner(ids, true)
+    }
+
+    pub(super) fn restore_normal_spines_for_mode_request(&mut self, ids: &[W::Id]) -> Vec<W::Id> {
+        self.restore_normal_spines_inner(ids, false)
+    }
+
+    fn restore_normal_spines_inner(&mut self, ids: &[W::Id], settle_matching: bool) -> Vec<W::Id> {
         let requests = self.normal_spine_requests(ids);
         let mut plans = self.scrolling.normal_spine_plans(&requests);
         plans.extend(self.floating.normal_spine_plans(ids));
@@ -842,10 +850,30 @@ impl<W: LayoutElement> Workspace<W> {
             }
         }
         let transaction = Transaction::new();
-        self.scrolling
-            .commit_normal_restore(&plans, &requests, transaction.clone());
-        self.floating.commit_normal_restore(&plans, transaction);
+        self.scrolling.commit_normal_restore(
+            &plans,
+            &requests,
+            transaction.clone(),
+            settle_matching,
+        );
+        self.floating
+            .commit_normal_restore(&plans, transaction, settle_matching);
         plans.into_iter().map(|(id, _)| id).collect()
+    }
+
+    pub(super) fn spines_for_mode_request(&self, id: &W::Id, windowed: bool) -> Vec<W::Id> {
+        if self.floating.has_window(id) {
+            return self
+                .floating
+                .tiles()
+                .filter(|tile| {
+                    tile.window().id() == id
+                        && (tile.is_spine() || tile.has_normal_restore_allocation())
+                })
+                .map(|tile| tile.window().id().clone())
+                .collect();
+        }
+        self.scrolling.spines_for_mode_request(id, windowed)
     }
 
     pub fn spine_plans(
