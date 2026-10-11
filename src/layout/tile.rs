@@ -11,6 +11,7 @@ use smithay::utils::{Logical, Point, Rectangle, Scale, Size};
 use super::focus_ring::{FocusRing, FocusRingRenderElement};
 use super::opening_window::{OpenAnimation, OpeningWindowRenderElement};
 use super::shadow::Shadow;
+use super::shrink_expand::{ShrinkAxis, SpineGeometry, WindowForm};
 use super::sink_presentation::{SinkPose, SinkPresentation};
 use super::{
     HitType, LayoutElement, LayoutElementRenderElement, LayoutElementRenderSnapshot, Options,
@@ -51,6 +52,9 @@ pub struct Tile<W: LayoutElement> {
 
     /// The toplevel window itself.
     window: W,
+
+    /// Independent outer geometry; the original client remains owned by this Tile.
+    spine: Option<SpineGeometry>,
 
     /// The border around the window.
     border: FocusRing,
@@ -210,6 +214,7 @@ impl<W: LayoutElement> Tile<W> {
             sink_overview_presentation: None,
             projection_buffer: Default::default(),
             window,
+            spine: None,
             border: FocusRing::new(border_config.into()),
             focus_ring: FocusRing::new(focus_ring_config),
             shadow: Shadow::new(shadow_config),
@@ -289,6 +294,11 @@ impl<W: LayoutElement> Tile<W> {
         self.shadow.update_config(shadow_config);
 
         self.window.update_config(self.options.blur);
+
+        let border = self.effective_border_width().unwrap_or(0.);
+        if let Some(spine) = &mut self.spine {
+            spine.allocate(spine.outer_size(), self.scale, border);
+        }
     }
 
     pub fn update_shaders(&mut self) {
@@ -300,6 +310,12 @@ impl<W: LayoutElement> Tile<W> {
     pub fn update_window(&mut self) {
         let prev_sizing_mode = self.sizing_mode;
         self.sizing_mode = self.window.sizing_mode();
+
+        if self.is_spine() {
+            // Hidden client commits must not animate or resize the independent outer geometry.
+            self.window.take_animation_snapshot();
+            return;
+        }
 
         if let Some(animate_from) = self.window.take_animation_snapshot() {
             let params = if let Some(resize) = self.resize_animation.take() {
@@ -824,6 +840,41 @@ impl<W: LayoutElement> Tile<W> {
         &mut self.window
     }
 
+    pub fn form(&self) -> WindowForm {
+        self.spine
+            .map_or(WindowForm::Normal, |spine| WindowForm::Spine(spine.axis))
+    }
+
+    pub fn is_spine(&self) -> bool {
+        self.spine.is_some()
+    }
+
+    /// Internal form conversion. The operation layer must validate scope and hand off focus.
+    /// No client configure is sent and no normal-size restore record is created.
+    pub fn set_spine(&mut self, axis: ShrinkAxis, thickness: f64) -> bool {
+        if !self.sizing_mode.is_normal() || !self.window.pending_sizing_mode().is_normal() {
+            return false;
+        }
+        let allocation = self.tile_expected_or_current_size();
+        let Some(spine) = SpineGeometry::new(
+            axis,
+            thickness,
+            allocation,
+            self.scale,
+            self.effective_border_width().unwrap_or(0.),
+        ) else {
+            return false;
+        };
+        self.spine = Some(spine);
+        self.resize_animation = None;
+        true
+    }
+
+    /// Size allocation after this must come from the current native slot.
+    pub fn clear_spine(&mut self) -> bool {
+        self.spine.take().is_some()
+    }
+
     pub fn sizing_mode(&self) -> SizingMode {
         self.sizing_mode
     }
@@ -915,6 +966,9 @@ impl<W: LayoutElement> Tile<W> {
     }
 
     pub fn tile_size(&self) -> Size<f64, Logical> {
+        if let Some(spine) = &self.spine {
+            return spine.outer_size();
+        }
         let mut size = self.window_size();
 
         if self.sizing_mode.is_fullscreen() {
@@ -934,6 +988,9 @@ impl<W: LayoutElement> Tile<W> {
     }
 
     pub fn tile_expected_or_current_size(&self) -> Size<f64, Logical> {
+        if let Some(spine) = &self.spine {
+            return spine.outer_size();
+        }
         let mut size = self.window_expected_or_current_size();
 
         if self.sizing_mode.is_fullscreen() {
@@ -987,6 +1044,9 @@ impl<W: LayoutElement> Tile<W> {
     }
 
     pub fn animated_tile_size(&self) -> Size<f64, Logical> {
+        if let Some(spine) = &self.spine {
+            return spine.outer_size();
+        }
         let mut size = self.tile_size();
 
         if let Some(resize) = &self.resize_animation {
@@ -1055,6 +1115,11 @@ impl<W: LayoutElement> Tile<W> {
         animate: bool,
         transaction: Option<Transaction>,
     ) {
+        let border = self.effective_border_width().unwrap_or(0.);
+        if let Some(spine) = &mut self.spine {
+            spine.allocate(size, self.scale, border);
+            return;
+        }
         // Can't go through effective_border_width() because we might be fullscreen.
         if !self.border.is_off() {
             let width = self.border.width();
@@ -1074,6 +1139,9 @@ impl<W: LayoutElement> Tile<W> {
     }
 
     pub fn tile_width_for_window_width(&self, size: f64) -> f64 {
+        if self.is_spine() {
+            return size;
+        }
         if self.border.is_off() {
             size
         } else {
@@ -1082,6 +1150,9 @@ impl<W: LayoutElement> Tile<W> {
     }
 
     pub fn tile_height_for_window_height(&self, size: f64) -> f64 {
+        if self.is_spine() {
+            return size;
+        }
         if self.border.is_off() {
             size
         } else {
@@ -1090,6 +1161,9 @@ impl<W: LayoutElement> Tile<W> {
     }
 
     pub fn window_width_for_tile_width(&self, size: f64) -> f64 {
+        if self.is_spine() {
+            return size;
+        }
         if self.border.is_off() {
             size
         } else {
@@ -1098,6 +1172,9 @@ impl<W: LayoutElement> Tile<W> {
     }
 
     pub fn window_height_for_tile_height(&self, size: f64) -> f64 {
+        if self.is_spine() {
+            return size;
+        }
         if self.border.is_off() {
             size
         } else {
@@ -1129,6 +1206,9 @@ impl<W: LayoutElement> Tile<W> {
     }
 
     pub fn min_size_nonfullscreen(&self) -> Size<f64, Logical> {
+        if let Some(spine) = &self.spine {
+            return spine.min_size(self.scale, self.effective_border_width().unwrap_or(0.));
+        }
         let mut size = self.window.min_size().to_f64();
 
         // Can't go through effective_border_width() because we might be fullscreen.
@@ -1146,6 +1226,9 @@ impl<W: LayoutElement> Tile<W> {
     }
 
     pub fn max_size_nonfullscreen(&self) -> Size<f64, Logical> {
+        if let Some(spine) = &self.spine {
+            return spine.max_size(self.scale, self.effective_border_width().unwrap_or(0.));
+        }
         let mut size = self.window.max_size().to_f64();
 
         // Can't go through effective_border_width() because we might be fullscreen.

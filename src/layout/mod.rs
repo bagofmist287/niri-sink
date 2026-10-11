@@ -83,6 +83,7 @@ pub mod monitor;
 pub mod opening_window;
 pub mod scrolling;
 pub mod shadow;
+pub mod shrink_expand;
 pub mod sink;
 pub mod sink_overview;
 pub mod sink_presentation;

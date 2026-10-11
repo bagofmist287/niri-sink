@@ -1302,8 +1302,8 @@ impl<W: LayoutElement> ScrollingSpace<W> {
         let prev_width = self.data[col_idx].width;
 
         column.update_window(window);
-        self.data[col_idx].update(column);
         column.update_tile_sizes(false);
+        self.data[col_idx].update(column);
 
         let offset = prev_width - self.data[col_idx].width;
 
@@ -4640,7 +4640,13 @@ impl<W: LayoutElement> Column<W> {
             .unwrap();
         let max_width = max_size
             .iter()
-            .filter_map(|size| {
+            .zip(&self.tiles)
+            .filter_map(|(size, tile)| {
+                // A spine's locked outer width does not cap the native column's allocation.
+                // Normal tiles retain their original shared-width constraint calculation.
+                if tile.is_spine() {
+                    return None;
+                }
                 let w = size.w;
                 if w == 0. {
                     None
@@ -4883,6 +4889,8 @@ impl<W: LayoutElement> Column<W> {
             };
 
             tile.request_tile_size(size, animate, transaction);
+            // Spine allocation is synchronous, without a client commit to refresh this cache.
+            self.data[tile_idx].update(tile);
         }
     }
 
@@ -5602,9 +5610,12 @@ impl<W: LayoutElement> Column<W> {
                 assert!(self.options.layout.preset_window_heights.len() > idx);
             }
 
-            let requested_size = tile.window().requested_size().unwrap();
-            let requested_tile_height =
-                tile.tile_height_for_window_height(f64::from(requested_size.h));
+            let requested_tile_height = if tile.is_spine() {
+                tile.tile_size().h
+            } else {
+                let requested_size = tile.window().requested_size().unwrap();
+                tile.tile_height_for_window_height(f64::from(requested_size.h))
+            };
             let min_tile_height = f64::max(1., tile.min_size_nonfullscreen().h);
 
             if !is_tabbed

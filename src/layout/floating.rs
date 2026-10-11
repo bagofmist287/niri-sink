@@ -428,6 +428,7 @@ impl<W: LayoutElement> FloatingSpace<W> {
         // Restore the previous floating window size, and in case the tile is fullscreen,
         // unfullscreen it.
         let floating_size = tile.floating_window_size;
+        let is_spine = tile.is_spine();
         let win = tile.window_mut();
         let mut size = if !win.pending_sizing_mode().is_normal() {
             // If the window was fullscreen or maximized without a floating size, ask for (0, 0).
@@ -446,7 +447,9 @@ impl<W: LayoutElement> FloatingSpace<W> {
         size.w = ensure_min_max_size_maybe_zero(size.w, min_size.w, max_size.w);
         size.h = ensure_min_max_size_maybe_zero(size.h, min_size.h, max_size.h);
 
-        win.request_size_once(size, true);
+        if !is_spine {
+            win.request_size_once(size, true);
+        }
 
         if activate || self.tiles.is_empty() {
             self.active_window_id = Some(win.id().clone());

@@ -15,6 +15,7 @@ use super::*;
 
 mod animations;
 mod fullscreen;
+mod shrink_expand;
 mod sink;
 mod transfers;
 
