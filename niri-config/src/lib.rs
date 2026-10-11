@@ -40,6 +40,7 @@ pub mod layout;
 pub mod misc;
 pub mod output;
 pub mod recent_windows;
+pub mod shrink_expand;
 pub mod sink;
 pub mod utils;
 pub mod window_rule;
@@ -58,6 +59,9 @@ pub use crate::misc::*;
 pub use crate::output::{Output, OutputName, Outputs, Position, Vrr};
 use crate::recent_windows::RecentWindowsPart;
 pub use crate::recent_windows::{MruDirection, MruFilter, MruPreviews, MruScope, RecentWindows};
+pub use crate::shrink_expand::{
+    ShrinkExpand, ShrinkExpandPart, SpineAppearance, SpineAppearancePart, SpinePaint,
+};
 pub use crate::sink::{OverviewSink, OverviewSinkPart, Sink, SinkPart};
 pub use crate::utils::FloatOrInt;
 use crate::utils::{expand_home_path, Flag, MergeWith as _};
@@ -86,6 +90,7 @@ pub struct Config {
     pub gestures: Gestures,
     pub overview: Overview,
     pub sink: Sink,
+    pub shrink_expand: ShrinkExpand,
     pub environment: Environment,
     pub xwayland_satellite: XwaylandSatellite,
     pub window_rules: Vec<WindowRule>,
@@ -208,6 +213,7 @@ where
                 "gestures" => m_merge!(gestures),
                 "overview" => m_merge!(overview),
                 "sink" => m_merge!(sink),
+                "shrink-expand" => m_merge!(shrink_expand),
                 "xwayland-satellite" => m_merge!(xwayland_satellite),
                 "switch-events" => m_merge!(switch_events),
                 "debug" => m_merge!(debug),
@@ -1453,6 +1459,12 @@ mod tests {
                         },
                     ),
                 },
+                spine: SpineAppearance {
+                    active: Inherit,
+                    inactive: Inherit,
+                    urgent: Inherit,
+                    text_color: None,
+                },
                 preset_column_widths: [
                     Proportion(
                         0.25,
@@ -1757,6 +1769,15 @@ mod tests {
                         opacity: 0.13552201070791198,
                     },
                 ],
+            },
+            shrink_expand: ShrinkExpand {
+                enabled: false,
+                thickness: 32.0,
+                shrink_buffer_ms: 700,
+                expand_buffer_ms: 1000,
+                mouse_zone_px: 24.0,
+                preview_scale: 0.75,
+                animate: true,
             },
             environment: Environment(
                 [

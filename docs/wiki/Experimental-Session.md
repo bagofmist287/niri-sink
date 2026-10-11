@@ -42,12 +42,12 @@ Keep niri's native automatic xwayland-satellite integration. Do not add a second
 satellite daemon or an experimental satellite service. Personal startup programs
 and theme generators also need review for hard-coded configuration paths.
 
-The experimental entry point can share the regular configuration through an
-include, followed by experimental overrides:
+The experimental entry point can share the regular configuration. At the top of
+`~/.config/niri-experimental/config.kdl`, add `include "../niri/config.kdl"`.
+This path is relative to the experimental config file and requires your existing
+regular config. Follow it with experimental overrides:
 
 ```kdl
-include "../niri/config.kdl"
-
 sink {
     enabled true
     visible-depth 2

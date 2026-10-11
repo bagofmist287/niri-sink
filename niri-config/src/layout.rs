@@ -5,7 +5,10 @@ use crate::appearance::{
     Border, FocusRing, InsertHint, Shadow, TabIndicator, DEFAULT_BACKGROUND_COLOR,
 };
 use crate::utils::{expect_only_children, Flag, MergeWith};
-use crate::{BorderRule, Color, FloatOrInt, InsertHintPart, ShadowRule, TabIndicatorPart};
+use crate::{
+    BorderRule, Color, FloatOrInt, InsertHintPart, ShadowRule, SpineAppearance,
+    SpineAppearancePart, TabIndicatorPart,
+};
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Layout {
@@ -14,6 +17,7 @@ pub struct Layout {
     pub shadow: Shadow,
     pub tab_indicator: TabIndicator,
     pub insert_hint: InsertHint,
+    pub spine: SpineAppearance,
     pub preset_column_widths: Vec<PresetSize>,
     pub default_column_width: Option<PresetSize>,
     pub preset_window_heights: Vec<PresetSize>,
@@ -34,6 +38,7 @@ impl Default for Layout {
             shadow: Shadow::default(),
             tab_indicator: TabIndicator::default(),
             insert_hint: InsertHint::default(),
+            spine: SpineAppearance::default(),
             preset_column_widths: vec![
                 PresetSize::Proportion(1. / 3.),
                 PresetSize::Proportion(0.5),
@@ -65,6 +70,7 @@ impl MergeWith<LayoutPart> for Layout {
             shadow,
             tab_indicator,
             insert_hint,
+            spine,
             always_center_single_column,
             empty_workspace_above_first,
             gaps,
@@ -106,6 +112,8 @@ pub struct LayoutPart {
     pub tab_indicator: Option<TabIndicatorPart>,
     #[knuffel(child)]
     pub insert_hint: Option<InsertHintPart>,
+    #[knuffel(child)]
+    pub spine: Option<SpineAppearancePart>,
     #[knuffel(child, unwrap(children))]
     pub preset_column_widths: Option<Vec<PresetSize>>,
     #[knuffel(child)]
