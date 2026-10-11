@@ -87,6 +87,8 @@ pub struct Mapped {
     /// If `None`, then the window is not offscreened.
     offscreen_data: crate::render_helpers::offscreen::OffscreenDataSlot,
     sink_input_barrier: Option<SinkInputBarrier>,
+    /// Independent from Sink ownership/presentation; shared configure/commit semantics only.
+    normal_restore_barrier: Option<SinkInputBarrier>,
     sink_restoring: bool,
     pub(crate) sink_parent_input_blocked: bool,
 
@@ -291,6 +293,7 @@ impl Mapped {
             needs_frame_callback: false,
             offscreen_data: Rc::new(RefCell::new(None)),
             sink_input_barrier: None,
+            normal_restore_barrier: None,
             sink_restoring: false,
             sink_parent_input_blocked: false,
             is_urgent: false,
@@ -627,6 +630,53 @@ impl Drop for Mapped {
     }
 }
 
+impl Mapped {
+    /// Track the requested geometry and mode, without creating a second window or owner.
+    fn restore_barrier(&self, deadline: Instant) -> Option<SinkInputBarrier> {
+        let target = self.requested_size()?;
+        let current = self.size();
+        let matching_pixels =
+            (target.w == 0 || target.w == current.w) && (target.h == 0 || target.h == current.h);
+        let matching_commit = self
+            .toplevel()
+            .with_committed_state(|state| state.and_then(|s| s.size) == Some(target));
+        let matching_mode = self.sizing_mode() == self.pending_sizing_mode()
+            && self.is_windowed_fullscreen == self.is_pending_windowed_fullscreen;
+        if matching_mode && (matching_pixels || matching_commit) {
+            return None;
+        }
+        let mut barrier = SinkInputBarrier::new(deadline);
+        let wanted_states = self.toplevel().with_pending_state(|state| {
+            (
+                state.states.contains(xdg_toplevel::State::Fullscreen),
+                state.states.contains(xdg_toplevel::State::Maximized),
+            )
+        });
+        if let Some(serial) =
+            with_toplevel_last_uncommitted_configure(self.toplevel(), |configure| {
+                let configure = configure?;
+                let states = (
+                    configure
+                        .state
+                        .states
+                        .contains(xdg_toplevel::State::Fullscreen),
+                    configure
+                        .state
+                        .states
+                        .contains(xdg_toplevel::State::Maximized),
+                );
+                (configure.state.size == Some(target)
+                    && states == wanted_states
+                    && self.is_windowed_fullscreen == self.is_pending_windowed_fullscreen)
+                    .then_some(configure.serial)
+            })
+        {
+            barrier.on_configure(serial);
+        }
+        Some(barrier)
+    }
+}
+
 impl LayoutElement for Mapped {
     type Id = Window;
 
@@ -840,6 +890,9 @@ impl LayoutElement for Mapped {
         {
             self.begin_sink_restore();
         }
+        if let Some(barrier) = self.normal_restore_barrier {
+            self.normal_restore_barrier = self.restore_barrier(barrier.deadline);
+        }
     }
 
     fn request_size_once(&mut self, size: Size<i32, Logical>, animate: bool) {
@@ -897,6 +950,9 @@ impl LayoutElement for Mapped {
             if self.sink_restoring {
                 self.begin_sink_restore();
             }
+            if let Some(barrier) = self.normal_restore_barrier {
+                self.normal_restore_barrier = self.restore_barrier(barrier.deadline);
+            }
             return;
         }
 
@@ -918,6 +974,31 @@ impl LayoutElement for Mapped {
         if self.sink_restoring {
             self.begin_sink_restore();
         }
+        if let Some(barrier) = self.normal_restore_barrier {
+            self.normal_restore_barrier = self.restore_barrier(barrier.deadline);
+        }
+    }
+
+    fn request_restore_size_once(&mut self, size: Size<i32, Logical>, transaction: Transaction) {
+        self.request_size_once(size, false);
+        self.transaction_for_next_configure = Some(transaction);
+    }
+
+    fn begin_normal_restore(&mut self, deadline: Instant) {
+        self.normal_restore_barrier = self.restore_barrier(deadline);
+    }
+
+    fn finish_normal_restore(&mut self) {
+        self.normal_restore_barrier = None;
+    }
+
+    fn normal_restore_ready(&self) -> bool {
+        self.normal_restore_barrier
+            .is_none_or(|b| b.ready(Instant::now()))
+    }
+
+    fn normal_restore_deadline(&self) -> Option<Instant> {
+        self.normal_restore_barrier.map(|b| b.deadline)
     }
 
     fn min_size(&self) -> Size<i32, Logical> {
@@ -983,19 +1064,7 @@ impl LayoutElement for Mapped {
 
     fn begin_sink_restore(&mut self) {
         self.sink_restoring = true;
-        let Some(target) = self.requested_size() else {
-            return;
-        };
-        let current = self.size();
-        let matching_pixels =
-            (target.w == 0 || target.w == current.w) && (target.h == 0 || target.h == current.h);
-        let matching_commit = self
-            .toplevel()
-            .with_committed_state(|state| state.and_then(|s| s.size) == Some(target));
-        let matching_mode = self.sizing_mode() == self.pending_sizing_mode()
-            && self.is_windowed_fullscreen == self.is_pending_windowed_fullscreen;
-        if matching_mode && (matching_pixels || matching_commit) {
-            self.sink_input_barrier = None;
+        if self.requested_size().is_none() {
             return;
         }
         let deadline = self
@@ -1008,35 +1077,7 @@ impl LayoutElement for Mapped {
                     .or_else(|| self.pending_transactions.last().map(|(_, t)| t.deadline()))
                     .unwrap_or_else(|| Transaction::new().deadline())
             });
-        let mut barrier = SinkInputBarrier::new(deadline);
-        let wanted_states = self.toplevel().with_pending_state(|state| {
-            (
-                state.states.contains(xdg_toplevel::State::Fullscreen),
-                state.states.contains(xdg_toplevel::State::Maximized),
-            )
-        });
-        if let Some(serial) =
-            with_toplevel_last_uncommitted_configure(self.toplevel(), |configure| {
-                let configure = configure?;
-                let states = (
-                    configure
-                        .state
-                        .states
-                        .contains(xdg_toplevel::State::Fullscreen),
-                    configure
-                        .state
-                        .states
-                        .contains(xdg_toplevel::State::Maximized),
-                );
-                (configure.state.size == Some(target)
-                    && states == wanted_states
-                    && self.is_windowed_fullscreen == self.is_pending_windowed_fullscreen)
-                    .then_some(configure.serial)
-            })
-        {
-            barrier.on_configure(serial);
-        }
-        self.sink_input_barrier = Some(barrier);
+        self.sink_input_barrier = self.restore_barrier(deadline);
     }
 
     fn finish_sink_restore(&mut self) {
@@ -1216,6 +1257,9 @@ impl LayoutElement for Mapped {
             let serial = toplevel.send_configure();
             trace!(?serial, "sending configure");
             if let Some(barrier) = &mut self.sink_input_barrier {
+                barrier.on_configure(serial);
+            }
+            if let Some(barrier) = &mut self.normal_restore_barrier {
                 barrier.on_configure(serial);
             }
 
@@ -1516,6 +1560,9 @@ impl LayoutElement for Mapped {
 
     fn on_commit(&mut self, commit_serial: Serial) {
         if let Some(barrier) = &mut self.sink_input_barrier {
+            barrier.on_commit(commit_serial);
+        }
+        if let Some(barrier) = &mut self.normal_restore_barrier {
             barrier.on_commit(commit_serial);
         }
         if let Some(InteractiveResize::WaitingForLastCommit { serial, .. }) =

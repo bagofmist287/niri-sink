@@ -38,6 +38,7 @@ struct TestWindowInner {
     max_size: Size<i32, Logical>,
     pending_sizing_mode: Cell<SizingMode>,
     pending_activated: Cell<bool>,
+    normal_restore_deadline: Cell<Option<std::time::Instant>>,
     sizing_mode: Cell<SizingMode>,
     is_windowed_fullscreen: Cell<bool>,
     is_pending_windowed_fullscreen: Cell<bool>,
@@ -91,6 +92,7 @@ impl TestWindow {
             max_size: params.min_max_size.1,
             pending_sizing_mode: Cell::new(SizingMode::Normal),
             pending_activated: Cell::new(false),
+            normal_restore_deadline: Cell::new(None),
             sizing_mode: Cell::new(SizingMode::Normal),
             is_windowed_fullscreen: Cell::new(false),
             is_pending_windowed_fullscreen: Cell::new(false),
@@ -190,6 +192,29 @@ impl LayoutElement for TestWindow {
         if mode.is_fullscreen() {
             self.0.is_pending_windowed_fullscreen.set(false);
         }
+    }
+
+    fn begin_normal_restore(&mut self, deadline: std::time::Instant) {
+        self.0.normal_restore_deadline.set(Some(deadline));
+    }
+
+    fn finish_normal_restore(&mut self) {
+        self.0.normal_restore_deadline.set(None);
+    }
+
+    fn normal_restore_ready(&self) -> bool {
+        self.0.normal_restore_deadline.get().is_none_or(|deadline| {
+            std::time::Instant::now() >= deadline
+                || (self.sizing_mode() == self.pending_sizing_mode()
+                    && self.requested_size().is_none_or(|size| {
+                        (size.w == 0 || size.w == self.size().w)
+                            && (size.h == 0 || size.h == self.size().h)
+                    }))
+        })
+    }
+
+    fn normal_restore_deadline(&self) -> Option<std::time::Instant> {
+        self.0.normal_restore_deadline.get()
     }
 
     fn min_size(&self) -> Size<i32, Logical> {

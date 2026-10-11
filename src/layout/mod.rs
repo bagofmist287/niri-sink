@@ -234,6 +234,20 @@ pub trait LayoutElement {
         self.request_size(size, SizingMode::Normal, animate, None);
     }
 
+    /// Normal insertion at an existing floating slot, participating in a restore transaction.
+    fn request_restore_size_once(&mut self, size: Size<i32, Logical>, transaction: Transaction) {
+        self.request_size(size, SizingMode::Normal, false, Some(transaction));
+    }
+
+    fn begin_normal_restore(&mut self, _deadline: std::time::Instant) {}
+    fn finish_normal_restore(&mut self) {}
+    fn normal_restore_ready(&self) -> bool {
+        true
+    }
+    fn normal_restore_deadline(&self) -> Option<std::time::Instant> {
+        None
+    }
+
     fn min_size(&self) -> Size<i32, Logical>;
     fn max_size(&self) -> Size<i32, Logical>;
     fn is_wl_surface(&self, wl_surface: &WlSurface) -> bool;
@@ -2443,7 +2457,10 @@ impl<W: LayoutElement> Layout<W> {
 
     pub fn focus_with_output(&self) -> Option<(&W, &Output)> {
         if let Some(InteractiveMoveState::Moving(move_)) = &self.interactive_move {
-            return (!move_.tile.is_spine()).then_some((move_.tile.window(), &move_.output));
+            return (!move_.tile.is_spine()
+                && !move_.tile.client_input_blocked()
+                && !move_.tile.normal_restore_focus_cancelled)
+                .then_some((move_.tile.window(), &move_.output));
         }
 
         let MonitorSet::Normal {
@@ -3998,7 +4015,7 @@ impl<W: LayoutElement> Layout<W> {
             .tiles_with_render_positions()
             .find(|(tile, _, _)| tile.window().id() == &window_id)
             .unwrap();
-        if tile.sink_input_blocked() {
+        if tile.client_input_blocked() {
             return false;
         }
         let window_offset = tile.window_loc();
@@ -5027,12 +5044,14 @@ impl<W: LayoutElement> Layout<W> {
         let mut ongoing_scrolling_dnd = self.dnd.is_some().then_some(true);
 
         if let Some(InteractiveMoveState::Moving(move_)) = &mut self.interactive_move {
-            let is_spine = move_.tile.is_spine();
+            let input_blocked = move_.tile.is_spine()
+                || move_.tile.client_input_blocked()
+                || move_.tile.normal_restore_focus_cancelled;
             let win = move_.tile.window_mut();
 
             win.set_active_in_column(true);
             win.set_floating(move_.is_floating);
-            win.set_activated(!is_spine);
+            win.set_activated(!input_blocked);
 
             win.set_interactive_resize(None);
 

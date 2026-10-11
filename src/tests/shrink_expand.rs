@@ -288,3 +288,316 @@ fn initial_shrink_rejects_real_transients_with_mapped_or_unmapped_parent() {
         );
     }
 }
+
+#[test]
+fn normal_restore_requires_processed_commit_and_reflow_does_not_extend_deadline() {
+    for expires in [false, true] {
+        let mut fixture = Fixture::new();
+        fixture.add_output(1, (1280, 720));
+        let client = fixture.add_client();
+        let surface = fixture.client(client).create_window().surface.clone();
+        fixture.client(client).window(&surface).commit();
+        fixture.roundtrip(client);
+        let window = fixture.client(client).window(&surface);
+        window.attach_new_buffer();
+        window.set_size(100, 100);
+        window.ack_last_and_commit();
+        fixture.double_roundtrip(client);
+        let id = fixture
+            .niri()
+            .layout
+            .windows()
+            .next()
+            .unwrap()
+            .1
+            .window
+            .clone();
+        let plan;
+        {
+            let ws = fixture
+                .niri()
+                .layout
+                .workspaces_mut()
+                .find(|ws| ws.has_window(&id))
+                .unwrap();
+            assert!(ws
+                .tiles_mut()
+                .find(|t| t.window().window == id)
+                .unwrap()
+                .set_spine(ShrinkAxis::Horizontal, 40.));
+            ws.scrolling_mut().update_window(&id, None);
+        }
+        let mut config = niri_config::Config::default();
+        config.layout.default_column_width = Some(niri_config::PresetSize::Fixed(760));
+        fixture.niri_state().reload_config(Ok(config));
+        {
+            let ws = fixture
+                .niri()
+                .layout
+                .workspaces_mut()
+                .find(|ws| ws.has_window(&id))
+                .unwrap();
+            plan = ws.normal_spine_plans(std::slice::from_ref(&id))[0].1;
+            assert_eq!(
+                ws.restore_normal_spines(std::slice::from_ref(&id)),
+                vec![id.clone()]
+            );
+            let tile = ws.tiles().find(|t| t.window().window == id).unwrap();
+            assert_eq!(tile.form(), WindowForm::Normal);
+            assert_eq!(tile.tile_size(), plan.allocation);
+            assert!(tile.normal_restore_input_blocked());
+            assert!(ws.active_window().is_none());
+        }
+        fixture.double_roundtrip(client);
+        let deadline = fixture
+            .niri()
+            .layout
+            .windows()
+            .find(|(_, w)| w.window == id)
+            .unwrap()
+            .1
+            .normal_restore_deadline()
+            .unwrap();
+        let window = fixture.client(client).window(&surface);
+        assert_eq!(
+            window.configures_received.last().unwrap().1.size,
+            (plan.client_size.w, plan.client_size.h)
+        );
+        window.ack_last();
+        fixture.double_roundtrip(client);
+        {
+            let ws = fixture
+                .niri()
+                .layout
+                .workspaces_mut()
+                .find(|ws| ws.has_window(&id))
+                .unwrap();
+            assert!(!ws.tiles().next().unwrap().window().normal_restore_ready());
+            ws.scrolling_mut().update_window(&id, None);
+            assert_eq!(
+                ws.tiles()
+                    .next()
+                    .unwrap()
+                    .window()
+                    .normal_restore_deadline(),
+                Some(deadline)
+            );
+            assert_eq!(ws.tiles().next().unwrap().tile_size(), plan.allocation);
+        }
+        if expires {
+            std::thread::sleep(
+                deadline.saturating_duration_since(std::time::Instant::now())
+                    + std::time::Duration::from_millis(10),
+            );
+            fixture.double_roundtrip(client);
+            let ws = fixture
+                .niri()
+                .layout
+                .workspaces_mut()
+                .find(|ws| ws.has_window(&id))
+                .unwrap();
+            assert!(!ws.tiles().next().unwrap().normal_restore_input_blocked());
+            assert!(!ws.tiles().next().unwrap().is_normal_restoring());
+            assert!(ws.active_window().is_none());
+        }
+        // The viewport changes only with this surface commit, not with the preceding ack.
+        let window = fixture.client(client).window(&surface);
+        window.set_size(plan.client_size.w as u16, plan.client_size.h as u16);
+        window.commit();
+        fixture.double_roundtrip(client);
+        let ws = fixture
+            .niri()
+            .layout
+            .workspaces_mut()
+            .find(|ws| ws.has_window(&id))
+            .unwrap();
+        let tile = ws.tiles().next().unwrap();
+        assert!(!tile.normal_restore_input_blocked());
+        assert!(tile.window().normal_restore_deadline().is_none());
+        assert_eq!(tile.window().size(), plan.client_size);
+        assert_eq!(ws.windows().count(), 1);
+        assert!(ws.active_window().is_none());
+        assert!(ws.activate_window(&id));
+        assert!(ws.active_window().is_some());
+    }
+}
+
+#[test]
+fn normal_restore_with_matching_geometry_does_not_wait_for_another_buffer() {
+    let mut fixture = Fixture::new();
+    fixture.add_output(1, (1280, 720));
+    let client = fixture.add_client();
+    let surface = fixture.client(client).create_window().surface.clone();
+    let window = fixture.client(client).window(&surface);
+    window.xdg_toplevel.set_min_size(100, 100);
+    window.xdg_toplevel.set_max_size(100, 100);
+    window.commit();
+    fixture.roundtrip(client);
+    let window = fixture.client(client).window(&surface);
+    window.attach_new_buffer();
+    window.set_size(100, 100);
+    window.ack_last_and_commit();
+    fixture.double_roundtrip(client);
+    let id = fixture
+        .niri()
+        .layout
+        .windows()
+        .next()
+        .unwrap()
+        .1
+        .window
+        .clone();
+    fixture.niri().layout.set_window_floating(Some(&id), false);
+    fixture.double_roundtrip(client);
+    let ws = fixture
+        .niri()
+        .layout
+        .workspaces_mut()
+        .find(|ws| ws.has_window(&id))
+        .unwrap();
+    assert!(ws
+        .tiles_mut()
+        .next()
+        .unwrap()
+        .set_spine(ShrinkAxis::Vertical, 40.));
+    ws.scrolling_mut().update_window(&id, None);
+    assert_eq!(
+        ws.normal_spine_plans(std::slice::from_ref(&id))[0]
+            .1
+            .client_size,
+        (100, 100).into()
+    );
+    assert_eq!(
+        ws.restore_normal_spines(std::slice::from_ref(&id)),
+        vec![id.clone()]
+    );
+    assert!(!ws.tiles().next().unwrap().normal_restore_input_blocked());
+    assert!(ws
+        .tiles()
+        .next()
+        .unwrap()
+        .window()
+        .normal_restore_deadline()
+        .is_none());
+    assert!(ws.activate_window(&id));
+    assert!(ws.active_window().is_some());
+}
+
+#[test]
+fn floating_restore_uses_one_shot_client_choice_or_live_rules_and_keeps_position() {
+    for explicit in [false, true] {
+        let config = niri_config::Config::parse_mem("window-rule { open-floating true; }").unwrap();
+        let mut fixture = Fixture::with_config(config);
+        fixture.add_output(1, (1280, 720));
+        let client = fixture.add_client();
+        let surface = fixture.client(client).create_window().surface.clone();
+        fixture.client(client).window(&surface).commit();
+        fixture.roundtrip(client);
+        let window = fixture.client(client).window(&surface);
+        window.attach_new_buffer();
+        window.set_size(100, 100);
+        window.ack_last_and_commit();
+        fixture.double_roundtrip(client);
+        let id = fixture
+            .niri()
+            .layout
+            .windows()
+            .next()
+            .unwrap()
+            .1
+            .window
+            .clone();
+        {
+            let ws = fixture
+                .niri()
+                .layout
+                .workspaces_mut()
+                .find(|ws| ws.has_window(&id))
+                .unwrap();
+            assert!(ws.floating().has_window(&id));
+            assert!(ws
+                .tiles_mut()
+                .next()
+                .unwrap()
+                .set_spine(ShrinkAxis::Horizontal, 40.));
+            ws.update_window(&id, None);
+        }
+        if explicit {
+            let config = niri_config::Config::parse_mem(
+                r#"
+window-rule {
+    open-floating true
+    default-column-width { fixed 720; }
+    default-window-height { fixed 400; }
+}
+"#,
+            )
+            .unwrap();
+            fixture.niri_state().reload_config(Ok(config));
+        }
+        let plan;
+        let position;
+        {
+            let ws = fixture
+                .niri()
+                .layout
+                .workspaces_mut()
+                .find(|ws| ws.has_window(&id))
+                .unwrap();
+            position = ws.floating().tiles_with_offsets().next().unwrap().1;
+            plan = ws.normal_spine_plans(std::slice::from_ref(&id))[0].1;
+            assert_eq!(
+                plan.client_size,
+                if explicit {
+                    (720, 400).into()
+                } else {
+                    (0, 0).into()
+                }
+            );
+            assert_eq!(
+                ws.restore_normal_spines(std::slice::from_ref(&id)),
+                vec![id.clone()]
+            );
+            assert_eq!(
+                ws.floating().tiles_with_offsets().next().unwrap().1,
+                position
+            );
+            assert_eq!(
+                ws.tiles().next().unwrap().normal_restore_input_blocked(),
+                explicit
+            );
+        }
+        fixture.double_roundtrip(client);
+        if explicit {
+            let window = fixture.client(client).window(&surface);
+            assert_eq!(
+                window.configures_received.last().unwrap().1.size,
+                (720, 400)
+            );
+            window.set_size(720, 400);
+            window.ack_last_and_commit();
+            fixture.double_roundtrip(client);
+        }
+        let ws = fixture
+            .niri()
+            .layout
+            .workspaces_mut()
+            .find(|ws| ws.has_window(&id))
+            .unwrap();
+        assert!(ws.floating().has_window(&id));
+        assert_eq!(
+            ws.floating().tiles_with_offsets().next().unwrap().1,
+            position
+        );
+        assert!(!ws.tiles().next().unwrap().normal_restore_input_blocked());
+        assert!(ws
+            .tiles()
+            .next()
+            .unwrap()
+            .window()
+            .normal_restore_deadline()
+            .is_none());
+        assert_eq!(ws.windows().count(), 1);
+        assert!(ws.active_window().is_none());
+    }
+}

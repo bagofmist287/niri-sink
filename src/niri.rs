@@ -1254,7 +1254,8 @@ impl State {
             .niri
             .layout
             .windows()
-            .filter_map(|(_, w)| w.sink_input_deadline())
+            .flat_map(|(_, w)| [w.sink_input_deadline(), w.normal_restore_deadline()])
+            .flatten()
             .filter(|at| *at > now)
             .min();
         if self.niri.sink_input_timer.as_ref().map(|(_, at)| *at) == deadline {

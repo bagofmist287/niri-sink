@@ -11,7 +11,7 @@ use smithay::utils::{Logical, Point, Rectangle, Scale, Size};
 use super::focus_ring::{FocusRing, FocusRingRenderElement};
 use super::opening_window::{OpenAnimation, OpeningWindowRenderElement};
 use super::shadow::Shadow;
-use super::shrink_expand::{ShrinkAxis, SpineGeometry, WindowForm};
+use super::shrink_expand::{NormalSizePlan, ShrinkAxis, SpineGeometry, WindowForm};
 use super::sink_presentation::{SinkPose, SinkPresentation};
 use super::{
     HitType, LayoutElement, LayoutElementRenderElement, LayoutElementRenderSnapshot, Options,
@@ -55,6 +55,11 @@ pub struct Tile<W: LayoutElement> {
 
     /// Independent outer geometry; the original client remains owned by this Tile.
     spine: Option<SpineGeometry>,
+    /// Current-slot allocation while the original client catches up, never a restore history.
+    normal_restore: Option<NormalSizePlan>,
+    /// Container origin at batch insertion, retained through a subsequent pending mode change.
+    normal_restore_origin_mode: SizingMode,
+    pub(super) normal_restore_focus_cancelled: bool,
 
     /// The border around the window.
     border: FocusRing,
@@ -215,6 +220,9 @@ impl<W: LayoutElement> Tile<W> {
             projection_buffer: Default::default(),
             window,
             spine: None,
+            normal_restore: None,
+            normal_restore_origin_mode: SizingMode::Normal,
+            normal_restore_focus_cancelled: false,
             border: FocusRing::new(border_config.into()),
             focus_ring: FocusRing::new(focus_ring_config),
             shadow: Shadow::new(shadow_config),
@@ -310,6 +318,15 @@ impl<W: LayoutElement> Tile<W> {
     pub fn update_window(&mut self) {
         let prev_sizing_mode = self.sizing_mode;
         self.sizing_mode = self.window.sizing_mode();
+
+        if let Some(plan) = self.normal_restore {
+            self.window.take_animation_snapshot();
+            if !self.window.normal_restore_ready() || self.sizing_mode != plan.sizing_mode {
+                return;
+            }
+            self.normal_restore = None;
+            self.window.finish_normal_restore();
+        }
 
         if self.is_spine() {
             // Hidden client commits must not animate or resize the independent outer geometry.
@@ -856,6 +873,8 @@ impl<W: LayoutElement> Tile<W> {
             return false;
         };
         self.spine = Some(spine);
+        self.normal_restore = None;
+        self.window.finish_normal_restore();
         self.resize_animation = None;
         true
     }
@@ -866,6 +885,7 @@ impl<W: LayoutElement> Tile<W> {
             || self.window.is_windowed_fullscreen()
             || self.window.is_pending_windowed_fullscreen()
             || self.sink_presentation.is_some()
+            || self.is_normal_restoring()
         {
             return None;
         }
@@ -884,8 +904,64 @@ impl<W: LayoutElement> Tile<W> {
         self.spine.take().is_some()
     }
 
+    /// Batch form update, before any member is configured. The caller owns the slot snapshot.
+    pub(super) fn prepare_normal_restore(&mut self, plan: NormalSizePlan) -> bool {
+        if self.spine.take().is_none() {
+            return false;
+        }
+        self.normal_restore = Some(plan);
+        self.normal_restore_origin_mode = plan.sizing_mode;
+        self.normal_restore_focus_cancelled = true;
+        self.resize_animation = None;
+        true
+    }
+
+    pub(super) fn submit_normal_restore(&mut self, floating: bool, transaction: Transaction) {
+        let Some(plan) = self.normal_restore else {
+            return;
+        };
+        let deadline = transaction.deadline();
+        if floating {
+            self.window
+                .request_restore_size_once(plan.client_size, transaction);
+        } else {
+            self.window
+                .request_size(plan.client_size, plan.sizing_mode, false, Some(transaction));
+        }
+        self.window.begin_normal_restore(deadline);
+        if self.window.normal_restore_ready() && self.sizing_mode == plan.sizing_mode {
+            self.update_window();
+        }
+    }
+
+    pub fn normal_restore_input_blocked(&self) -> bool {
+        self.normal_restore.is_some() && !self.window.normal_restore_ready()
+    }
+
+    pub fn client_input_blocked(&self) -> bool {
+        self.sink_input_blocked() || self.normal_restore_input_blocked()
+    }
+
+    pub fn allow_normal_restore_focus(&mut self) {
+        self.normal_restore_focus_cancelled = false;
+    }
+
+    pub fn is_normal_restoring(&self) -> bool {
+        self.normal_restore_input_blocked()
+    }
+
     pub fn sizing_mode(&self) -> SizingMode {
-        self.sizing_mode
+        if self.normal_restore.is_none() {
+            return self.sizing_mode;
+        }
+        if self.sizing_mode.is_fullscreen() || self.normal_restore_origin_mode.is_fullscreen() {
+            SizingMode::Fullscreen
+        } else if self.sizing_mode.is_maximized() || self.normal_restore_origin_mode.is_maximized()
+        {
+            SizingMode::Maximized
+        } else {
+            SizingMode::Normal
+        }
     }
 
     fn fullscreen_progress(&self) -> f64 {
@@ -978,6 +1054,9 @@ impl<W: LayoutElement> Tile<W> {
         if let Some(spine) = &self.spine {
             return spine.outer_size();
         }
+        if let Some(plan) = self.normal_restore {
+            return plan.allocation;
+        }
         let mut size = self.window_size();
 
         if self.sizing_mode.is_fullscreen() {
@@ -999,6 +1078,9 @@ impl<W: LayoutElement> Tile<W> {
     pub fn tile_expected_or_current_size(&self) -> Size<f64, Logical> {
         if let Some(spine) = &self.spine {
             return spine.outer_size();
+        }
+        if let Some(plan) = self.normal_restore {
+            return plan.allocation;
         }
         let mut size = self.window_expected_or_current_size();
 
@@ -1055,6 +1137,9 @@ impl<W: LayoutElement> Tile<W> {
     pub fn animated_tile_size(&self) -> Size<f64, Logical> {
         if let Some(spine) = &self.spine {
             return spine.outer_size();
+        }
+        if let Some(plan) = self.normal_restore {
+            return plan.allocation;
         }
         let mut size = self.tile_size();
 
@@ -1130,6 +1215,14 @@ impl<W: LayoutElement> Tile<W> {
             return;
         }
         let size = self.normal_window_size_for_tile_size(size);
+        let allocation = self.normal_tile_size_for_window_size(size);
+        if let Some(plan) = &mut self.normal_restore {
+            *plan = NormalSizePlan {
+                allocation,
+                client_size: size,
+                sizing_mode: SizingMode::Normal,
+            };
+        }
 
         self.window
             .request_size(size, SizingMode::Normal, animate, transaction);
@@ -1214,6 +1307,13 @@ impl<W: LayoutElement> Tile<W> {
         animate: bool,
         transaction: Option<Transaction>,
     ) {
+        if let Some(plan) = &mut self.normal_restore {
+            *plan = NormalSizePlan {
+                allocation: size,
+                client_size: size.to_i32_round(),
+                sizing_mode: SizingMode::Maximized,
+            };
+        }
         self.window.request_size(
             size.to_i32_round(),
             SizingMode::Maximized,
@@ -1223,6 +1323,13 @@ impl<W: LayoutElement> Tile<W> {
     }
 
     pub fn request_fullscreen(&mut self, animate: bool, transaction: Option<Transaction>) {
+        if let Some(plan) = &mut self.normal_restore {
+            *plan = NormalSizePlan {
+                allocation: self.view_size,
+                client_size: self.view_size.to_i32_round(),
+                sizing_mode: SizingMode::Fullscreen,
+            };
+        }
         self.window.request_size(
             self.view_size.to_i32_round(),
             SizingMode::Fullscreen,

@@ -1571,3 +1571,250 @@ fn initial_shrink_query_rejects_transients_sink_spines_and_non_normal_modes_with
     layout.update_window(&2, None);
     layout.verify_invariants();
 }
+
+#[test]
+fn normal_restore_submits_live_default_at_same_slot_and_preserves_absent_focus() {
+    for axis in [ShrinkAxis::Horizontal, ShrinkAxis::Vertical] {
+        let mut options = Options::default();
+        options.layout.default_column_width = Some(PresetSize::Fixed(760));
+        let mut workspace =
+            Workspace::new_no_outputs(Clock::with_time(Duration::ZERO), Rc::new(options));
+        let client = TestWindow::new(TestWindowParams::new(1));
+        let mut book = workspace.make_tile(client.clone());
+        book.floating_window_size = Some((999, 888).into());
+        assert!(book.set_spine(axis, 40.));
+        workspace.add_tile(
+            book,
+            WorkspaceAddWindowTarget::Auto,
+            ActivateWindow::Yes,
+            ColumnWidth::Fixed(1100.),
+            true,
+            false,
+            None,
+        );
+        assert!(workspace.active_window().is_none());
+        let expected = workspace.normal_spine_plans(&[1])[0].1;
+        assert_eq!(workspace.restore_normal_spines(&[99, 1, 1]), vec![1]);
+        assert_eq!(client.requested_size(), Some(expected.client_size));
+        assert_eq!(workspace.tiles().next().unwrap().form(), WindowForm::Normal);
+        assert!(workspace.active_window().is_none());
+        assert_eq!(workspace.windows().count(), 1);
+        assert_eq!(workspace.scrolling().columns().count(), 1);
+        assert_eq!(
+            workspace.tiles().next().unwrap().floating_window_size,
+            Some((999, 888).into())
+        );
+        assert!(workspace.restore_normal_spines(&[1]).is_empty());
+        for _ in 0..4 {
+            if client.communicate() {
+                workspace.update_window(&1, None);
+            }
+        }
+        workspace.verify_invariants(None);
+        workspace.refresh(true, true);
+        assert!(!client.0.pending_activated.get());
+        assert!(workspace.active_window().is_none());
+        workspace.activate_window(&1);
+        workspace.refresh(true, true);
+        assert_eq!(workspace.active_window().unwrap().id(), &1);
+        assert!(client.0.pending_activated.get());
+    }
+}
+
+#[test]
+fn normal_restore_batch_reuses_shared_column_solver_and_keeps_existing_focus() {
+    for display in [ColumnDisplay::Normal, ColumnDisplay::Tabbed] {
+        let mut options = Options::default();
+        options.layout.default_column_display = display;
+        let mut workspace =
+            Workspace::new_no_outputs(Clock::with_time(Duration::ZERO), Rc::new(options));
+        let mut clients = Vec::new();
+        for id in 1..=3 {
+            let mut params = TestWindowParams::new(id);
+            params.min_max_size = ((100, 20).into(), (0, 0).into());
+            let client = TestWindow::new(params);
+            let mut tile = workspace.make_tile(client.clone());
+            if id > 1 {
+                assert!(tile.set_spine(ShrinkAxis::Vertical, 40.));
+            }
+            if id == 1 {
+                workspace.add_tile(
+                    tile,
+                    WorkspaceAddWindowTarget::Auto,
+                    ActivateWindow::Yes,
+                    ColumnWidth::Fixed(700.),
+                    false,
+                    false,
+                    None,
+                );
+            } else {
+                workspace
+                    .scrolling_mut()
+                    .add_tile_to_column(0, None, tile, false);
+            }
+            clients.push(client);
+        }
+        workspace
+            .scrolling_mut()
+            .set_window_height(Some(&2), SizeChange::SetFixed(200));
+        let plans = workspace.normal_spine_plans(&[3, 2]);
+        let focus = *workspace.active_window().unwrap().id();
+        assert_eq!(workspace.restore_normal_spines(&[3, 2, 1, 2]), vec![2, 3]);
+        for (id, plan) in &plans {
+            assert_eq!(clients[id - 1].requested_size(), Some(plan.client_size));
+        }
+        for _ in 0..4 {
+            for client in &clients {
+                if client.communicate() {
+                    workspace.update_window(client.id(), None);
+                }
+            }
+        }
+        workspace.verify_invariants(None);
+        assert_eq!(*workspace.active_window().unwrap().id(), focus);
+        assert_eq!(workspace.scrolling().columns().count(), 1);
+        assert_eq!(
+            workspace
+                .tiles()
+                .map(|t| *t.window().id())
+                .collect::<Vec<_>>(),
+            vec![1, 2, 3]
+        );
+    }
+}
+
+#[test]
+fn normal_restore_in_non_normal_container_keeps_origin_until_mode_commit() {
+    for mode in [SizingMode::Fullscreen, SizingMode::Maximized] {
+        let mut space = non_normal_space(1.25, mode, ColumnDisplay::Tabbed);
+        let options = space.tiles().next().unwrap().options().clone();
+        let mut book = scrolling_tile(2, &space, options);
+        assert!(book.set_spine(ShrinkAxis::Vertical, 40.));
+        space.add_tile_to_column(0, None, book, true);
+        space.remove_tile(&1, Transaction::new());
+        let requests = vec![(2, ColumnWidth::Fixed(760.))];
+        let plans = space.normal_spine_plans(&requests);
+        assert!(space
+            .tiles_mut()
+            .next()
+            .unwrap()
+            .prepare_normal_restore(plans[0].1));
+        space.commit_normal_restore(&plans, &requests, Transaction::new());
+        space.verify_invariants();
+        assert_eq!(space.tiles().next().unwrap().sizing_mode(), mode);
+        assert_eq!(
+            space.tiles().next().unwrap().window().pending_sizing_mode(),
+            mode
+        );
+        settle(&mut space);
+        assert_eq!(space.tiles().next().unwrap().window().sizing_mode(), mode);
+        space.verify_invariants();
+    }
+}
+
+#[test]
+fn floating_restore_requests_normal_defaults_and_preserves_logical_position_and_order() {
+    for explicit_size in [false, true] {
+        let options = Rc::new(Options::default());
+        let mut workspace = Workspace::new_no_outputs(Clock::with_time(Duration::ZERO), options);
+        let mut params = TestWindowParams::new(1);
+        params.bbox = Rectangle::from_size((240, 160).into());
+        if explicit_size {
+            params.rules = Some(ResolvedWindowRules {
+                default_width: Some(Some(PresetSize::Fixed(720))),
+                default_height: Some(Some(PresetSize::Fixed(400))),
+                ..Default::default()
+            });
+        }
+        let client = TestWindow::new(params);
+        let mut book = workspace.make_tile(client.clone());
+        book.floating_window_size = Some((999, 888).into());
+        book.floating_pos = Some((0.2, 0.3).into());
+        assert!(book.set_spine(ShrinkAxis::Horizontal, 40.));
+        workspace.add_tile(
+            book,
+            WorkspaceAddWindowTarget::Auto,
+            ActivateWindow::Yes,
+            ColumnWidth::Fixed(900.),
+            false,
+            true,
+            None,
+        );
+        let before = workspace
+            .floating()
+            .tiles_with_offsets()
+            .map(|(t, p)| (*t.window().id(), p))
+            .collect::<Vec<_>>();
+        let plan = workspace.normal_spine_plans(&[1])[0].1;
+        assert_eq!(workspace.restore_normal_spines(&[1]), vec![1]);
+        assert_eq!(client.requested_size(), Some(plan.client_size));
+        assert_eq!(
+            plan.client_size,
+            if explicit_size {
+                (720, 400).into()
+            } else {
+                (0, 0).into()
+            }
+        );
+        assert_eq!(
+            workspace
+                .floating()
+                .tiles_with_offsets()
+                .map(|(t, p)| (*t.window().id(), p))
+                .collect::<Vec<_>>(),
+            before
+        );
+        for _ in 0..4 {
+            if client.communicate() {
+                workspace.update_window(&1, None);
+            }
+        }
+        workspace.verify_invariants(None);
+        assert_eq!(
+            workspace
+                .floating()
+                .tiles_with_offsets()
+                .map(|(t, p)| (*t.window().id(), p))
+                .collect::<Vec<_>>(),
+            before
+        );
+        assert!(workspace.active_window().is_none());
+    }
+}
+
+#[test]
+fn normal_restore_mode_unset_before_first_commit_keeps_native_view_restore_record() {
+    for mode in [SizingMode::Fullscreen, SizingMode::Maximized] {
+        let mut space = non_normal_space(1.25, mode, ColumnDisplay::Tabbed);
+        let options = space.tiles().next().unwrap().options().clone();
+        let mut book = scrolling_tile(2, &space, options);
+        assert!(book.set_spine(ShrinkAxis::Vertical, 40.));
+        space.add_tile_to_column(0, None, book, true);
+        space.remove_tile(&1, Transaction::new());
+        let requests = vec![(2, ColumnWidth::Fixed(760.))];
+        let plans = space.normal_spine_plans(&requests);
+        assert!(space
+            .tiles_mut()
+            .next()
+            .unwrap()
+            .prepare_normal_restore(plans[0].1));
+        space.commit_normal_restore(&plans, &requests, Transaction::new());
+        // The client is still Normal; the column origin came from the former spine-only mode.
+        assert_eq!(
+            space.tiles().next().unwrap().window().sizing_mode(),
+            SizingMode::Normal
+        );
+        if mode.is_fullscreen() {
+            space.set_fullscreen(&2, false);
+        } else {
+            space.set_maximized(&2, false);
+        }
+        space.verify_invariants();
+        settle(&mut space);
+        space.verify_invariants();
+        assert_eq!(
+            space.tiles().next().unwrap().window().sizing_mode(),
+            SizingMode::Normal
+        );
+    }
+}

@@ -859,6 +859,9 @@ impl<W: LayoutElement> ScrollingSpace<W> {
     }
 
     fn activate_column_with_anim_config(&mut self, idx: usize, config: niri_config::Animation) {
+        if let Some(col) = self.columns.get_mut(idx) {
+            col.tiles[col.active_tile_idx].allow_normal_restore_focus();
+        }
         if self.active_column_idx == idx
             // During a DnD scroll, animate even when activating the same window, for DnD hold.
             && (self.columns.is_empty() || !self.view_offset.is_dnd_scroll())
@@ -2763,6 +2766,14 @@ impl<W: LayoutElement> ScrollingSpace<W> {
                 } else {
                     allocation.to_i32_round()
                 };
+                // The native allocator's fractional request is floored for Wayland, then the
+                // resulting client geometry is rounded to physical pixels. Hold that outer size,
+                // rather than an unrepresentable pre-configure fraction while awaiting commit.
+                let allocation = if mode.is_normal() {
+                    tile.normal_tile_size_for_window_size(client_size)
+                } else {
+                    allocation
+                };
                 plans.push((
                     tile.window().id().clone(),
                     NormalSizePlan {
@@ -2774,6 +2785,47 @@ impl<W: LayoutElement> ScrollingSpace<W> {
             }
         }
         plans
+    }
+
+    pub(super) fn commit_normal_restore(
+        &mut self,
+        plans: &[(W::Id, NormalSizePlan)],
+        requests: &[(W::Id, ColumnWidth)],
+        transaction: Transaction,
+    ) {
+        for (col_idx, col) in self.columns.iter_mut().enumerate() {
+            let targets = col
+                .tiles
+                .iter()
+                .enumerate()
+                .filter_map(|(idx, tile)| {
+                    plans
+                        .iter()
+                        .any(|(id, _)| id == tile.window().id())
+                        .then_some(idx)
+                })
+                .collect::<Vec<_>>();
+            if targets.is_empty() {
+                continue;
+            }
+            if col.tiles.len() == 1 {
+                let id = col.tiles[0].window().id();
+                col.width = requests.iter().find(|(target, _)| target == id).unwrap().1;
+                col.preset_width_idx = None;
+                col.is_full_width = false;
+            }
+            for &idx in &targets {
+                col.data[idx].height = WindowHeight::auto_1();
+            }
+            col.update_tile_sizes_with_transaction(false, transaction.clone());
+            for idx in targets {
+                // Restored hidden tabs also need a configure/commit barrier. Native reflows
+                // otherwise omit their transaction participation because they are invisible.
+                col.tiles[idx].submit_normal_restore(false, transaction.clone());
+                col.data[idx].update(&col.tiles[idx]);
+            }
+            self.data[col_idx].update(col);
+        }
     }
 
     pub fn spine_plans(&self, id: &W::Id, thickness: f64) -> Option<SpinePlans> {
@@ -4039,7 +4091,9 @@ impl<W: LayoutElement> ScrollingSpace<W> {
             };
 
             for (tile_idx, tile) in col.tiles.iter_mut().enumerate() {
-                let is_spine = tile.is_spine();
+                let input_blocked = tile.is_spine()
+                    || tile.client_input_blocked()
+                    || tile.normal_restore_focus_cancelled;
                 let win = tile.window_mut();
 
                 let active_in_column = col.active_tile_idx == tile_idx;
@@ -4054,7 +4108,7 @@ impl<W: LayoutElement> ScrollingSpace<W> {
                     // animations when switching tabs.
                     active &= active_in_column || is_tabbed;
                 }
-                win.set_activated(active && !is_spine);
+                win.set_activated(active && !input_blocked);
 
                 win.set_interactive_resize(col_resize_data);
 
@@ -4749,6 +4803,7 @@ impl<W: LayoutElement> Column<W> {
     }
 
     fn activate_idx(&mut self, idx: usize) -> bool {
+        self.tiles[idx].allow_normal_restore_focus();
         if self.active_tile_idx == idx {
             return false;
         }

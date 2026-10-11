@@ -22,7 +22,7 @@ use crate::niri_render_elements;
 use crate::render_helpers::renderer::NiriRenderer;
 use crate::render_helpers::xray::XrayPos;
 use crate::render_helpers::RenderCtx;
-use crate::utils::transaction::TransactionBlocker;
+use crate::utils::transaction::{Transaction, TransactionBlocker};
 use crate::utils::{
     center_preferring_top_left_in_area, clamp_preferring_top_left_in_area, ensure_min_max_size,
     ensure_min_max_size_maybe_zero, ResizeEdge,
@@ -496,6 +496,24 @@ impl<W: LayoutElement> FloatingSpace<W> {
         self.tiles.is_empty()
     }
 
+    pub(super) fn commit_normal_restore(
+        &mut self,
+        plans: &[(W::Id, NormalSizePlan)],
+        transaction: Transaction,
+    ) {
+        for (tile, data) in zip(&mut self.tiles, &mut self.data) {
+            if !plans.iter().any(|(id, _)| id == tile.window().id()) {
+                continue;
+            }
+            let pos = data.logical_pos;
+            tile.floating_preset_width_idx = None;
+            tile.floating_preset_height_idx = None;
+            tile.submit_normal_restore(true, transaction.clone());
+            data.update(tile);
+            data.set_logical_pos(pos);
+        }
+    }
+
     pub fn add_tile(&mut self, tile: Tile<W>, activate: bool) {
         self.add_tile_at(0, tile, activate);
     }
@@ -653,8 +671,10 @@ impl<W: LayoutElement> FloatingSpace<W> {
         if !self.contains(id) {
             return false;
         }
+        let idx = self.idx_of(id).unwrap();
 
         self.active_window_id = Some(id.clone());
+        self.tiles[idx].allow_normal_restore_focus();
         true
     }
 
@@ -662,7 +682,7 @@ impl<W: LayoutElement> FloatingSpace<W> {
         let Some(idx) = self.idx_of(id) else {
             return false;
         };
-
+        self.tiles[idx].allow_normal_restore_focus();
         self.raise_window(idx, 0);
         self.active_window_id = Some(id.clone());
         self.bring_up_descendants_of(0);
@@ -1316,7 +1336,9 @@ impl<W: LayoutElement> FloatingSpace<W> {
     pub fn refresh(&mut self, is_active: bool, is_focused: bool) {
         let active = self.active_window_id.clone();
         for tile in &mut self.tiles {
-            let is_spine = tile.is_spine();
+            let input_blocked = tile.is_spine()
+                || tile.client_input_blocked()
+                || tile.normal_restore_focus_cancelled;
             let win = tile.window_mut();
 
             win.set_active_in_column(true);
@@ -1326,7 +1348,7 @@ impl<W: LayoutElement> FloatingSpace<W> {
             if self.options.deactivate_unfocused_windows {
                 is_active &= is_focused;
             }
-            win.set_activated(is_active && !is_spine);
+            win.set_activated(is_active && !input_blocked);
 
             let resize_data = self
                 .interactive_resize

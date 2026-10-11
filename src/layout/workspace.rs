@@ -798,7 +798,10 @@ impl<W: LayoutElement> Workspace<W> {
         self.tiles_with_render_positions()
             .find(|(tile, _, _)| tile.window().id() == window.id())
             .filter(|(tile, _, _)| {
-                !tile.is_spine() && !tile.sink_input_blocked() && !tile.sink_focus_cancelled
+                !tile.is_spine()
+                    && !tile.client_input_blocked()
+                    && !tile.sink_focus_cancelled
+                    && !tile.normal_restore_focus_cancelled
             })
             .map(|(tile, _, _)| tile.window())
     }
@@ -809,8 +812,14 @@ impl<W: LayoutElement> Workspace<W> {
         &self,
         ids: &[W::Id],
     ) -> Vec<(W::Id, super::shrink_expand::NormalSizePlan)> {
-        let requests = self
-            .scrolling
+        let requests = self.normal_spine_requests(ids);
+        let mut plans = self.scrolling.normal_spine_plans(&requests);
+        plans.extend(self.floating.normal_spine_plans(ids));
+        plans
+    }
+
+    fn normal_spine_requests(&self, ids: &[W::Id]) -> Vec<(W::Id, ColumnWidth)> {
+        self.scrolling
             .tiles()
             .filter(|tile| tile.is_spine() && ids.contains(tile.window().id()))
             .map(|tile| {
@@ -818,10 +827,25 @@ impl<W: LayoutElement> Workspace<W> {
                 let width = self.resolve_default_width(win.rules().default_width, false);
                 (win.id().clone(), self.resolve_scrolling_width(win, width))
             })
-            .collect::<Vec<_>>();
+            .collect()
+    }
+
+    /// Commit one current-slot batch. This does not activate or reorder any member.
+    /// The operation coordinator may explicitly activate a chosen member afterwards.
+    pub fn restore_normal_spines(&mut self, ids: &[W::Id]) -> Vec<W::Id> {
+        let requests = self.normal_spine_requests(ids);
         let mut plans = self.scrolling.normal_spine_plans(&requests);
         plans.extend(self.floating.normal_spine_plans(ids));
-        plans
+        for tile in self.tiles_mut() {
+            if let Some((_, plan)) = plans.iter().find(|(id, _)| id == tile.window().id()) {
+                assert!(tile.prepare_normal_restore(*plan));
+            }
+        }
+        let transaction = Transaction::new();
+        self.scrolling
+            .commit_normal_restore(&plans, &requests, transaction.clone());
+        self.floating.commit_normal_restore(&plans, transaction);
+        plans.into_iter().map(|(id, _)| id).collect()
     }
 
     pub fn spine_plans(
@@ -1216,7 +1240,10 @@ impl<W: LayoutElement> Workspace<W> {
         else {
             return false;
         };
-        if tile.is_spine() || tile.window().interactive_resize_data().is_some() {
+        if tile.is_spine()
+            || tile.is_normal_restoring()
+            || tile.window().interactive_resize_data().is_some()
+        {
             return false;
         }
         let height = self.scrolling.window_height(id);
@@ -1244,6 +1271,7 @@ impl<W: LayoutElement> Workspace<W> {
         let mut removed = self.detach_tile(id, Transaction::new());
         removed.tile.sink_generation = removed.tile.sink_generation.wrapping_add(1);
         removed.tile.sink_focus_cancelled = false;
+        removed.tile.allow_normal_restore_focus();
         removed.tile.window_mut().finish_sink_restore();
         if self.options.sink.enabled {
             let to = desktop_pose(
@@ -1340,6 +1368,7 @@ impl<W: LayoutElement> Workspace<W> {
         {
             tile.sink_generation = tile.sink_generation.wrapping_add(1);
             tile.sink_focus_cancelled = false;
+            tile.allow_normal_restore_focus();
             if enabled {
                 tile.window_mut().begin_sink_restore();
                 tile.sink_presentation = Some(SinkPresentation::new(
@@ -1539,6 +1568,7 @@ impl<W: LayoutElement> Workspace<W> {
             .find(|tile| Some(tile.window().id()) == id.as_ref())
         {
             tile.sink_focus_cancelled = false;
+            tile.allow_normal_restore_focus();
         }
     }
 
@@ -2512,7 +2542,7 @@ impl<W: LayoutElement> Workspace<W> {
             if let Some(rv) = self
                 .floating
                 .tiles_with_render_positions()
-                .filter(|(tile, _)| !tile.sink_input_blocked())
+                .filter(|(tile, _)| !tile.client_input_blocked())
                 .find_map(|(tile, tile_pos)| HitType::hit_tile(tile, tile_pos, pos))
             {
                 return Some(rv);
@@ -2520,9 +2550,9 @@ impl<W: LayoutElement> Workspace<W> {
         }
 
         self.scrolling.window_under(pos).filter(|(window, _)| {
-            !self
-                .tiles_with_render_positions()
-                .any(|(tile, _, _)| tile.window().id() == window.id() && tile.sink_input_blocked())
+            !self.tiles_with_render_positions().any(|(tile, _, _)| {
+                tile.window().id() == window.id() && tile.client_input_blocked()
+            })
         })
     }
 
@@ -2583,7 +2613,7 @@ impl<W: LayoutElement> Workspace<W> {
             .find_map(|(tile, tile_pos, visible)| {
                 // This logic should be consistent with window_under() in when it returns Some vs.
                 // None.
-                if !visible || tile.sink_input_blocked() {
+                if !visible || tile.client_input_blocked() {
                     return None;
                 }
 
@@ -2676,6 +2706,7 @@ impl<W: LayoutElement> Workspace<W> {
     pub fn activate_window(&mut self, window: &W::Id) -> bool {
         if let Some(tile) = self.tiles_mut().find(|tile| tile.window().id() == window) {
             tile.sink_focus_cancelled = false;
+            tile.allow_normal_restore_focus();
         }
         if self.floating.activate_window(window) {
             self.floating_is_active = FloatingActive::Yes;
@@ -2691,6 +2722,7 @@ impl<W: LayoutElement> Workspace<W> {
     pub fn activate_window_without_raising(&mut self, window: &W::Id) -> bool {
         if let Some(tile) = self.tiles_mut().find(|tile| tile.window().id() == window) {
             tile.sink_focus_cancelled = false;
+            tile.allow_normal_restore_focus();
         }
         if self.floating.activate_window_without_raising(window) {
             self.floating_is_active = FloatingActive::Yes;
@@ -2778,7 +2810,7 @@ impl<W: LayoutElement> Workspace<W> {
     pub fn interactive_resize_begin(&mut self, window: W::Id, edges: ResizeEdge) -> bool {
         if self
             .tiles()
-            .any(|tile| tile.window().id() == &window && tile.sink_input_blocked())
+            .any(|tile| tile.window().id() == &window && tile.client_input_blocked())
         {
             return false;
         }
