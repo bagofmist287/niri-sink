@@ -344,6 +344,9 @@ pub trait LayoutElement {
 
     fn is_child_of(&self, parent: &Self) -> bool;
 
+    /// Includes transient parents outside the currently mapped layout inventory.
+    fn has_parent(&self) -> bool;
+
     fn rules(&self) -> &ResolvedWindowRules;
 
     /// Runs periodic clean-up tasks.
@@ -1678,6 +1681,26 @@ impl<W: LayoutElement> Layout<W> {
     /// Depth in the workspace-local Sink stack; zero is the current top.
     pub fn sink_depth(&self, id: &W::Id) -> Option<usize> {
         self.workspaces().find_map(|(_, _, ws)| ws.sink_depth(id))
+    }
+
+    /// Initial user Shrink query. Form, owner and focus remain unchanged.
+    /// Seat/grab permissions and operation generation belong to the input coordinator.
+    pub fn shrink_plans(&self, id: &W::Id, thickness: f64) -> Option<shrink_expand::SpinePlans> {
+        if self.interactive_move.is_some() || self.dnd.is_some() || self.is_spine(id) {
+            return None;
+        }
+        let (_, window) = self.windows().find(|(_, window)| window.id() == id)?;
+        if window.has_parent()
+            || self
+                .windows()
+                .any(|(_, other)| other.id() != id && other.is_child_of(window))
+        {
+            return None;
+        }
+        self.workspaces()
+            .find(|(_, _, workspace)| workspace.has_window(id))?
+            .2
+            .spine_plans(id, thickness)
     }
 
     pub fn can_transfer_sink(&self) -> bool {

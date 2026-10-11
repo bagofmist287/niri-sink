@@ -1468,6 +1468,10 @@ impl LayoutElement for Mapped {
         self.toplevel().parent().as_ref() == Some(parent.toplevel().wl_surface())
     }
 
+    fn has_parent(&self) -> bool {
+        self.toplevel().parent().is_some()
+    }
+
     fn refresh(&self) {
         self.window.refresh();
     }

@@ -12,6 +12,7 @@ use smithay::utils::{Logical, Point, Rectangle, Scale, Serial, Size};
 
 use super::closing_window::{ClosingWindow, ClosingWindowRenderElement};
 use super::monitor::InsertPosition;
+use super::shrink_expand::{ShrinkAxis, SpineGeometry, SpinePlans};
 use super::tab_indicator::{TabIndicator, TabIndicatorRenderElement, TabInfo};
 use super::tile::{Tile, TileRenderElement, TileRenderSnapshot};
 use super::workspace::{InteractiveResize, ResolvedSize};
@@ -315,6 +316,14 @@ impl TileSizing {
 
     fn is_spine(&self) -> bool {
         self.spine
+    }
+
+    fn with_spine(mut self, spine: SpineGeometry, scale: f64, border: f64) -> Self {
+        self.min_size = spine.min_size(scale, border);
+        self.max_size = spine.max_size(scale, border);
+        self.border_height = 0.;
+        self.spine = true;
+        self
     }
     fn tile_height_for_window_height(&self, height: f64) -> f64 {
         height + self.border_height
@@ -2700,6 +2709,111 @@ impl<W: LayoutElement> ScrollingSpace<W> {
         }
     }
 
+    pub fn spine_plans(&self, id: &W::Id, thickness: f64) -> Option<SpinePlans> {
+        let col = self.columns.iter().find(|col| col.contains(id))?;
+        if !col.pending_sizing_mode().is_normal() {
+            return None;
+        }
+        let idx = col.position(id)?;
+        let mut rows = col.sizing_inputs();
+        let height = rows[idx].height;
+        plan_spine_allocations(
+            &col.tiles[idx],
+            thickness,
+            col.scale,
+            &col.options,
+            col.spine_bounds(&rows, idx),
+            col.spine_preference(rows.len()),
+            |mut row| {
+                row.height = height;
+                rows[idx] = row;
+                col.compute_tile_sizes(&rows)[idx]
+            },
+        )
+    }
+
+    /// Query a native InColumn target. Does not reselect the drop gap or move either owner.
+    pub fn spine_in_column_plans(
+        &self,
+        column_idx: usize,
+        tile_idx: usize,
+        tile: &Tile<W>,
+        thickness: f64,
+    ) -> Option<SpinePlans> {
+        let col = self.columns.get(column_idx)?;
+        if !col.pending_sizing_mode().is_normal() || tile_idx > col.tiles.len() {
+            return None;
+        }
+        let mut rows = col.sizing_inputs();
+        rows.insert(tile_idx, TileSizing::new(tile, WindowHeight::auto_1()));
+        plan_spine_allocations(
+            tile,
+            thickness,
+            col.scale,
+            &col.options,
+            col.spine_bounds(&rows, tile_idx),
+            col.spine_preference(rows.len()),
+            |row| {
+                rows[tile_idx] = row;
+                col.compute_tile_sizes(&rows)[tile_idx]
+            },
+        )
+    }
+
+    /// Query a native new-column allocation, using the same allocator as insertion.
+    pub fn spine_new_column_plans(
+        &self,
+        tile: &Tile<W>,
+        width: ColumnWidth,
+        is_full_width: bool,
+        thickness: f64,
+    ) -> Option<SpinePlans> {
+        // Match Column::new_with_tile: display is selected from the incoming tile's rules/options.
+        let display = tile
+            .window()
+            .rules()
+            .default_column_display
+            .unwrap_or(tile.options.layout.default_column_display);
+        let is_tabbed = display == ColumnDisplay::Tabbed;
+        let extra = if is_tabbed {
+            TabIndicator::new(self.options.layout.tab_indicator).extra_size(1, self.scale)
+        } else {
+            Size::from((0., 0.))
+        };
+        let width = if is_full_width {
+            ColumnWidth::Proportion(1.)
+        } else {
+            width
+        };
+        let width = resolve_column_width(
+            width,
+            self.working_area.size.w,
+            self.options.layout.gaps,
+            extra.w,
+        );
+        let bounds = self.working_area.size
+            - extra
+            - Size::from((self.options.layout.gaps * 2., self.options.layout.gaps * 2.));
+        plan_spine_allocations(
+            tile,
+            thickness,
+            self.scale,
+            &self.options,
+            bounds,
+            ShrinkAxis::Horizontal,
+            |row| {
+                compute_column_tile_sizes(
+                    &[row],
+                    is_tabbed,
+                    self.working_area.size,
+                    extra,
+                    width,
+                    &self.options,
+                )[0]
+            },
+        )
+    }
+
     pub fn toggle_width(&mut self, forwards: bool) {
         if self.columns.is_empty() {
             return;
@@ -4639,9 +4753,7 @@ impl<W: LayoutElement> Column<W> {
             return;
         }
 
-        let tiles = zip(&self.tiles, &self.data)
-            .map(|(tile, data)| TileSizing::new(tile, data.height))
-            .collect::<Vec<_>>();
+        let tiles = self.sizing_inputs();
         let sizes = self.compute_tile_sizes(&tiles);
 
         for (tile_idx, (tile, size)) in zip(&mut self.tiles, sizes).enumerate() {
@@ -4685,6 +4797,47 @@ impl<W: LayoutElement> Column<W> {
             width,
             &self.options,
         )
+    }
+
+    fn sizing_inputs(&self) -> Vec<TileSizing> {
+        zip(&self.tiles, &self.data)
+            .map(|(tile, data)| TileSizing::new(tile, data.height))
+            .collect()
+    }
+
+    fn spine_bounds(&self, tiles: &[TileSizing], target: usize) -> Size<f64, Logical> {
+        let tile_count = tiles.len();
+        let extra = if self.display_mode == ColumnDisplay::Tabbed {
+            self.tab_indicator.extra_size(tile_count, self.scale)
+        } else {
+            Size::from((0., 0.))
+        };
+        let mut bounds = self.working_area.size
+            - extra
+            - Size::from((self.options.layout.gaps * 2., self.options.layout.gaps * 2.));
+        if self.display_mode == ColumnDisplay::Normal {
+            let height_taken = tiles
+                .iter()
+                .enumerate()
+                .filter(|(idx, _)| *idx != target)
+                .map(|(_, tile)| tile.min_size.h.max(1.))
+                .sum::<f64>();
+            bounds.h = bounds.h.min(
+                self.working_area.size.h
+                    - extra.h
+                    - height_taken
+                    - self.options.layout.gaps * (tile_count + 1) as f64,
+            );
+        }
+        bounds
+    }
+
+    fn spine_preference(&self, tile_count: usize) -> ShrinkAxis {
+        if self.display_mode == ColumnDisplay::Normal && tile_count > 1 {
+            ShrinkAxis::Vertical
+        } else {
+            ShrinkAxis::Horizontal
+        }
     }
 
     fn width(&self) -> f64 {
@@ -5594,43 +5747,6 @@ fn resolve_preset_size(
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use niri_config::FloatOrInt;
-
-    use super::*;
-    use crate::utils::round_logical_in_physical;
-
-    #[test]
-    fn working_area_starts_at_physical_pixel() {
-        let struts = Struts {
-            left: FloatOrInt(0.5),
-            right: FloatOrInt(1.),
-            top: FloatOrInt(0.75),
-            bottom: FloatOrInt(1.),
-        };
-
-        let parent_area = Rectangle::from_size(Size::from((1280., 720.)));
-        let area = compute_working_area(parent_area, 1., struts);
-
-        assert_eq!(round_logical_in_physical(1., area.loc.x), area.loc.x);
-        assert_eq!(round_logical_in_physical(1., area.loc.y), area.loc.y);
-    }
-
-    #[test]
-    fn large_fractional_strut() {
-        let struts = Struts {
-            left: FloatOrInt(0.),
-            right: FloatOrInt(0.),
-            top: FloatOrInt(50000.5),
-            bottom: FloatOrInt(0.),
-        };
-
-        let parent_area = Rectangle::from_size(Size::from((1280., 720.)));
-        compute_working_area(parent_area, 1., struts);
-    }
-}
-
 fn resolve_column_width(
     width: ColumnWidth,
     working_width: f64,
@@ -5643,6 +5759,47 @@ fn resolve_column_width(
         }
         ColumnWidth::Fixed(width) => width,
     }
+}
+
+fn plan_spine_allocations<W: LayoutElement>(
+    tile: &Tile<W>,
+    thickness: f64,
+    scale: f64,
+    options: &Options,
+    bounds: Size<f64, Logical>,
+    preferred: ShrinkAxis,
+    mut allocate: impl FnMut(TileSizing) -> Size<f64, Logical>,
+) -> Option<SpinePlans> {
+    tile.plan_spine_geometry(ShrinkAxis::Horizontal, thickness)?;
+    let border = options
+        .layout
+        .border
+        .merged_with(&tile.window().rules().border);
+    let border = if border.off {
+        0.
+    } else {
+        crate::utils::round_logical_in_physical_max1(scale, border.width)
+    };
+    let row = TileSizing::new(tile, WindowHeight::auto_1());
+    let geometry = |axis| {
+        SpineGeometry::new(
+            axis,
+            thickness,
+            tile.tile_expected_or_current_size(),
+            scale,
+            border,
+        )
+    };
+    let horizontal = allocate(row.with_spine(geometry(ShrinkAxis::Horizontal)?, scale, border));
+    let vertical = allocate(row.with_spine(geometry(ShrinkAxis::Vertical)?, scale, border));
+    SpinePlans::new(
+        thickness,
+        [horizontal, vertical],
+        bounds,
+        scale,
+        border,
+        preferred,
+    )
 }
 
 /// Native column allocation, without client configure, caches, focus or ownership changes.
@@ -5907,4 +6064,41 @@ fn compute_column_tile_sizes(
             Size::from((width, height))
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use niri_config::FloatOrInt;
+
+    use super::*;
+    use crate::utils::round_logical_in_physical;
+
+    #[test]
+    fn working_area_starts_at_physical_pixel() {
+        let struts = Struts {
+            left: FloatOrInt(0.5),
+            right: FloatOrInt(1.),
+            top: FloatOrInt(0.75),
+            bottom: FloatOrInt(1.),
+        };
+
+        let parent_area = Rectangle::from_size(Size::from((1280., 720.)));
+        let area = compute_working_area(parent_area, 1., struts);
+
+        assert_eq!(round_logical_in_physical(1., area.loc.x), area.loc.x);
+        assert_eq!(round_logical_in_physical(1., area.loc.y), area.loc.y);
+    }
+
+    #[test]
+    fn large_fractional_strut() {
+        let struts = Struts {
+            left: FloatOrInt(0.),
+            right: FloatOrInt(0.),
+            top: FloatOrInt(50000.5),
+            bottom: FloatOrInt(0.),
+        };
+
+        let parent_area = Rectangle::from_size(Size::from((1280., 720.)));
+        compute_working_area(parent_area, 1., struts);
+    }
 }

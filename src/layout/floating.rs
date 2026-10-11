@@ -435,6 +435,25 @@ impl<W: LayoutElement> FloatingSpace<W> {
         self.tiles.iter().any(|tile| tile.window().id() == id)
     }
 
+    pub fn spine_plans(
+        &self,
+        id: &W::Id,
+        thickness: f64,
+    ) -> Option<super::shrink_expand::SpinePlans> {
+        use super::shrink_expand::{ShrinkAxis, SpinePlans};
+        let tile = self.tiles.iter().find(|tile| tile.window().id() == id)?;
+        let horizontal = tile.plan_spine_geometry(ShrinkAxis::Horizontal, thickness)?;
+        let vertical = tile.plan_spine_geometry(ShrinkAxis::Vertical, thickness)?;
+        SpinePlans::new(
+            thickness,
+            [horizontal.outer_size(), vertical.outer_size()],
+            self.working_area.size,
+            self.scale,
+            tile.effective_border_width().unwrap_or(0.),
+            ShrinkAxis::Horizontal,
+        )
+    }
+
     pub fn is_empty(&self) -> bool {
         self.tiles.is_empty()
     }

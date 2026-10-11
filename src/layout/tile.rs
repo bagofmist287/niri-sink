@@ -852,25 +852,29 @@ impl<W: LayoutElement> Tile<W> {
     /// Internal form conversion. The operation layer must validate scope and hand off focus.
     /// No client configure is sent and no normal-size restore record is created.
     pub fn set_spine(&mut self, axis: ShrinkAxis, thickness: f64) -> bool {
-        if !self.sizing_mode.is_normal()
-            || !self.window.pending_sizing_mode().is_normal()
-            || self.sink_presentation.is_some()
-        {
-            return false;
-        }
-        let allocation = self.tile_expected_or_current_size();
-        let Some(spine) = SpineGeometry::new(
-            axis,
-            thickness,
-            allocation,
-            self.scale,
-            self.effective_border_width().unwrap_or(0.),
-        ) else {
+        let Some(spine) = self.plan_spine_geometry(axis, thickness) else {
             return false;
         };
         self.spine = Some(spine);
         self.resize_animation = None;
         true
+    }
+
+    pub fn plan_spine_geometry(&self, axis: ShrinkAxis, thickness: f64) -> Option<SpineGeometry> {
+        if !self.sizing_mode.is_normal()
+            || !self.window.pending_sizing_mode().is_normal()
+            || self.sink_presentation.is_some()
+        {
+            return None;
+        }
+        let allocation = self.tile_expected_or_current_size();
+        SpineGeometry::new(
+            axis,
+            thickness,
+            allocation,
+            self.scale,
+            self.effective_border_width().unwrap_or(0.),
+        )
     }
 
     /// Size allocation after this must come from the current native slot.

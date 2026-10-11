@@ -714,3 +714,313 @@ fn ordinary_space_switch_finds_normal_receiver_and_skips_all_spine_space() {
         }
     }
 }
+
+#[test]
+fn axis_plans_are_read_only_and_match_committed_native_column_sizes() {
+    for scale in [1., 1.25] {
+        for display in [ColumnDisplay::Normal, ColumnDisplay::Tabbed] {
+            for axis in [ShrinkAxis::Horizontal, ShrinkAxis::Vertical] {
+                let mut options = Options::default();
+                options.layout.default_column_display = display;
+                let options = Rc::new(options);
+                let mut space = scrolling(scale, options.clone());
+                let tile = scrolling_tile(1, &space, options.clone());
+                let client = tile.window().clone();
+                space.add_tile(None, tile, true, ColumnWidth::Fixed(800.), false, None);
+                let other = scrolling_tile(2, &space, options);
+                let other_client = other.window().clone();
+                space.add_tile_to_column(0, None, other, false);
+                settle(&mut space);
+                let before = [client.requested_size(), other_client.requested_size()];
+                let sizes = space.tiles().map(|t| t.tile_size()).collect::<Vec<_>>();
+                let plans = space.spine_plans(&1, 40.1).unwrap();
+                assert_eq!(
+                    [client.requested_size(), other_client.requested_size()],
+                    before
+                );
+                assert_eq!(
+                    space.tiles().map(|t| t.tile_size()).collect::<Vec<_>>(),
+                    sizes
+                );
+                assert!(space.tiles().all(|t| !t.is_spine()));
+                assert_eq!(
+                    plans.first().unwrap().geometry.axis,
+                    if display == ColumnDisplay::Normal {
+                        ShrinkAxis::Vertical
+                    } else {
+                        ShrinkAxis::Horizontal
+                    }
+                );
+                assert!(plans.get(axis).fits);
+                assert_eq!(plans.next(axis).unwrap().geometry.axis, axis.other());
+                assert_eq!(plans.for_move(axis).geometry.axis, axis);
+                space
+                    .tiles_mut()
+                    .find(|t| t.window().id() == &1)
+                    .unwrap()
+                    .set_spine(axis, 40.1);
+                space.update_window(&1, None);
+                assert_eq!(
+                    space
+                        .tiles()
+                        .find(|t| t.window().id() == &1)
+                        .unwrap()
+                        .tile_size(),
+                    plans.get(axis).geometry.outer_size()
+                );
+                settle(&mut space);
+            }
+        }
+    }
+}
+
+#[test]
+fn insertion_plans_match_native_new_column_and_in_column_without_reselecting_topology() {
+    for scale in [1., 1.25] {
+        for display in [ColumnDisplay::Normal, ColumnDisplay::Tabbed] {
+            for in_column in [false, true] {
+                for axis in [ShrinkAxis::Horizontal, ShrinkAxis::Vertical] {
+                    let mut options = Options::default();
+                    options.layout.default_column_display = display;
+                    let options = Rc::new(options);
+                    let mut space = scrolling(scale, options.clone());
+                    let first = scrolling_tile(1, &space, options.clone());
+                    space.add_tile(None, first, true, ColumnWidth::Fixed(800.), false, None);
+                    settle(&mut space);
+                    let mut incoming = scrolling_tile(2, &space, options);
+                    let client = incoming.window().clone();
+                    let plans = if in_column {
+                        space.spine_in_column_plans(0, 1, &incoming, 40.1)
+                    } else {
+                        space.spine_new_column_plans(
+                            &incoming,
+                            ColumnWidth::Fixed(700.),
+                            false,
+                            40.1,
+                        )
+                    }
+                    .unwrap();
+                    assert_eq!(client.requested_size(), None);
+                    assert_eq!(space.tiles().count(), 1);
+                    assert_eq!(space.columns().count(), 1);
+                    assert!(incoming.set_spine(axis, 40.1));
+                    if in_column {
+                        space.add_tile_to_column(0, Some(1), incoming, true);
+                    } else {
+                        space.add_tile(
+                            Some(1),
+                            incoming,
+                            true,
+                            ColumnWidth::Fixed(700.),
+                            false,
+                            None,
+                        );
+                    }
+                    assert_eq!(space.columns().count(), if in_column { 1 } else { 2 });
+                    assert_eq!(
+                        space
+                            .tiles()
+                            .find(|t| t.window().id() == &2)
+                            .unwrap()
+                            .tile_size(),
+                        plans.get(axis).geometry.outer_size()
+                    );
+                    assert_eq!(client.requested_size(), None);
+                    settle(&mut space);
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn axis_legality_precedes_local_preference_when_native_neighbor_is_oversized() {
+    let options: Rc<Options> = Rc::default();
+    let mut space = ScrollingSpace::new(
+        (320., 720.).into(),
+        Rectangle::from_size((320., 720.).into()),
+        1.,
+        Clock::with_time(Duration::ZERO),
+        options.clone(),
+    );
+    let tile = scrolling_tile(1, &space, options.clone());
+    space.add_tile(None, tile, true, ColumnWidth::Fixed(800.), false, None);
+    let mut incoming = scrolling_tile(2, &space, options);
+    let plans = space.spine_in_column_plans(0, 1, &incoming, 40.).unwrap();
+    assert!(plans.get(ShrinkAxis::Horizontal).fits);
+    assert!(!plans.get(ShrinkAxis::Vertical).fits);
+    assert_eq!(plans.first().unwrap().geometry.axis, ShrinkAxis::Horizontal);
+    assert_eq!(
+        plans.next(ShrinkAxis::Horizontal).unwrap().geometry.axis,
+        ShrinkAxis::Horizontal
+    );
+    let chosen = plans.for_move(ShrinkAxis::Vertical);
+    assert_eq!(chosen.geometry.axis, ShrinkAxis::Horizontal);
+    assert!(incoming.set_spine(chosen.geometry.axis, 40.));
+    space.add_tile_to_column(0, Some(1), incoming, true);
+    assert_eq!(space.columns().count(), 1);
+    assert_eq!(
+        space
+            .tiles()
+            .find(|t| t.window().id() == &2)
+            .unwrap()
+            .tile_size(),
+        chosen.geometry.outer_size()
+    );
+    settle(&mut space);
+}
+
+#[test]
+fn both_axes_too_small_keep_move_axis_and_use_native_overflow_allocation() {
+    for axis in [ShrinkAxis::Horizontal, ShrinkAxis::Vertical] {
+        let options: Rc<Options> = Rc::default();
+        let mut space = ScrollingSpace::new(
+            (20., 20.).into(),
+            Rectangle::from_size((20., 20.).into()),
+            1.,
+            Clock::with_time(Duration::ZERO),
+            options.clone(),
+        );
+        let mut incoming = scrolling_tile(1, &space, options);
+        let plans = space
+            .spine_new_column_plans(&incoming, ColumnWidth::Fixed(400.), false, 40.)
+            .unwrap();
+        assert!(plans.first().is_none());
+        assert!(plans.next(axis).is_none());
+        let chosen = plans.for_move(axis);
+        assert_eq!(chosen.geometry.axis, axis);
+        assert!(!chosen.fits);
+        assert!(incoming.set_spine(axis, 40.));
+        space.add_tile(None, incoming, true, ColumnWidth::Fixed(400.), false, None);
+        assert_eq!(
+            space.tiles().next().unwrap().tile_size(),
+            chosen.geometry.outer_size()
+        );
+        assert_eq!(space.columns().count(), 1);
+        settle(&mut space);
+    }
+}
+
+#[test]
+fn sibling_minimum_heights_can_make_both_axes_illegal_without_changing_native_insertion() {
+    for axis in [ShrinkAxis::Horizontal, ShrinkAxis::Vertical] {
+        let options: Rc<Options> = Rc::default();
+        let mut space = scrolling(1., options.clone());
+        let first = scrolling_tile(1, &space, options.clone());
+        space.add_tile(None, first, true, ColumnWidth::Fixed(800.), false, None);
+        let second = scrolling_tile(2, &space, options.clone());
+        space.add_tile_to_column(0, None, second, false);
+        settle(&mut space);
+        let mut incoming = scrolling_tile(3, &space, options);
+        let plans = space.spine_in_column_plans(0, 2, &incoming, 40.).unwrap();
+        assert!(!plans.get(ShrinkAxis::Horizontal).fits);
+        assert!(!plans.get(ShrinkAxis::Vertical).fits);
+        assert!(plans.first().is_none());
+        let chosen = plans.for_move(axis);
+        assert_eq!(chosen.geometry.axis, axis);
+        assert!(incoming.set_spine(axis, 40.));
+        space.add_tile_to_column(0, Some(2), incoming, true);
+        assert_eq!(space.columns().count(), 1);
+        assert_eq!(space.tiles().count(), 3);
+        assert_eq!(
+            space
+                .tiles()
+                .find(|t| t.window().id() == &3)
+                .unwrap()
+                .tile_size(),
+            chosen.geometry.outer_size()
+        );
+        settle(&mut space);
+    }
+}
+
+#[test]
+fn floating_axis_plans_are_read_only_and_default_to_horizontal_shrink() {
+    for axis in [ShrinkAxis::Horizontal, ShrinkAxis::Vertical] {
+        let options: Rc<Options> = Rc::default();
+        let tile = tile(1, 1., options.clone());
+        let client = tile.window().clone();
+        let mut space = FloatingSpace::new(
+            (1280., 720.).into(),
+            Rectangle::from_size((1280., 720.).into()),
+            1.,
+            tile.clock.clone(),
+            options,
+        );
+        space.add_tile(tile, true);
+        let before = client.requested_size();
+        let plans = space.spine_plans(&1, 40.).unwrap();
+        assert_eq!(plans.first().unwrap().geometry.axis, ShrinkAxis::Horizontal);
+        assert_eq!(client.requested_size(), before);
+        assert!(!space.tiles().next().unwrap().is_spine());
+        let tile = space.tiles_mut().next().unwrap();
+        assert!(tile.set_spine(axis, 40.));
+        space.update_window(&1, None);
+        assert_eq!(
+            space.tiles().next().unwrap().tile_size(),
+            plans.get(axis).geometry.outer_size()
+        );
+        assert_eq!(client.requested_size(), before);
+        space.verify_invariants();
+    }
+}
+
+#[test]
+fn initial_shrink_query_rejects_transients_sink_spines_and_non_normal_modes_without_mutation() {
+    let mut layout = Layout::<TestWindow>::default();
+    Op::AddOutput(1).apply(&mut layout);
+    Op::AddWindow {
+        params: TestWindowParams::new(1),
+    }
+    .apply(&mut layout);
+    assert!(layout.shrink_plans(&1, 40.).unwrap().first().is_some());
+    assert!(layout.shrink_plans(&99, 40.).is_none());
+    assert!(layout.shrink_plans(&1, f64::NAN).is_none());
+    let window = layout
+        .windows()
+        .find(|(_, w)| w.id() == &1)
+        .unwrap()
+        .1
+        .clone();
+    let before = window.requested_size();
+    for mode in [SizingMode::Fullscreen, SizingMode::Maximized] {
+        window.0.pending_sizing_mode.set(mode);
+        assert!(layout.shrink_plans(&1, 40.).is_none());
+        assert_eq!(window.requested_size(), before);
+    }
+    window.0.pending_sizing_mode.set(SizingMode::Normal);
+    let mut params = TestWindowParams::new(2);
+    params.parent_id = Some(1);
+    Op::AddWindow { params }.apply(&mut layout);
+    assert!(layout.shrink_plans(&1, 40.).is_none());
+    assert!(layout.shrink_plans(&2, 40.).is_none());
+    let child = layout
+        .windows()
+        .find(|(_, w)| w.id() == &2)
+        .unwrap()
+        .1
+        .clone();
+    child.0.parent_id.set(Some(99));
+    assert!(layout.shrink_plans(&2, 40.).is_none());
+    child.0.parent_id.set(None);
+    assert!(layout.shrink_plans(&1, 40.).is_some());
+    let workspace = layout
+        .workspaces_mut()
+        .find(|ws| ws.has_window(&1))
+        .unwrap();
+    assert!(workspace.sink_window(&1));
+    assert!(layout.shrink_plans(&1, 40.).is_none());
+    let workspace = layout
+        .workspaces_mut()
+        .find(|ws| ws.has_window(&2))
+        .unwrap();
+    let tile = workspace
+        .tiles_mut()
+        .find(|t| t.window().id() == &2)
+        .unwrap();
+    assert!(tile.set_spine(ShrinkAxis::Horizontal, 40.));
+    assert!(layout.shrink_plans(&2, 40.).is_none());
+    assert_eq!(layout.windows().count(), 2);
+    layout.update_window(&2, None);
+    layout.verify_invariants();
+}

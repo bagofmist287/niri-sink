@@ -243,6 +243,10 @@ impl LayoutElement for TestWindow {
         false
     }
 
+    fn has_parent(&self) -> bool {
+        false
+    }
+
     fn refresh(&self) {}
 
     fn rules(&self) -> &ResolvedWindowRules {

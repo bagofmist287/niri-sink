@@ -803,6 +803,18 @@ impl<W: LayoutElement> Workspace<W> {
             .map(|(tile, _, _)| tile.window())
     }
 
+    pub fn spine_plans(
+        &self,
+        id: &W::Id,
+        thickness: f64,
+    ) -> Option<super::shrink_expand::SpinePlans> {
+        if self.floating.has_window(id) {
+            self.floating.spine_plans(id, thickness)
+        } else {
+            self.scrolling.spine_plans(id, thickness)
+        }
+    }
+
     pub fn active_window_mut(&mut self) -> Option<&mut W> {
         self.active_window()?;
         if self.floating_is_active.get() {
