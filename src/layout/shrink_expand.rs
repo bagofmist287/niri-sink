@@ -2,6 +2,17 @@
 
 use smithay::utils::{Logical, Size};
 
+use super::SizingMode;
+
+/// A current-slot allocation, not a saved pre-shrink size. A zero client extent retains the
+/// native client-choice request; the corresponding allocation is only a preview estimate.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct NormalSizePlan {
+    pub allocation: Size<f64, Logical>,
+    pub client_size: Size<i32, Logical>,
+    pub sizing_mode: SizingMode,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ShrinkAxis {
     /// Lock the outer width, producing a vertical spine.

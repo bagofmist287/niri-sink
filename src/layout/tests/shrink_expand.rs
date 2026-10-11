@@ -51,6 +51,313 @@ fn settle(space: &mut ScrollingSpace<TestWindow>) {
     space.verify_invariants();
 }
 
+#[test]
+fn current_slot_normal_plan_uses_live_defaults_rules_and_native_insertion_width() {
+    for rule_width in [None, Some(Some(PresetSize::Fixed(850))), Some(None)] {
+        let mut options = Options::default();
+        options.layout.default_column_width = Some(PresetSize::Fixed(720));
+        let mut workspace =
+            Workspace::new_no_outputs(Clock::with_time(Duration::ZERO), Rc::new(options.clone()));
+        let mut params = TestWindowParams::new(1);
+        params.bbox = Rectangle::from_size((900, 300).into());
+        params.rules = Some(crate::window::ResolvedWindowRules {
+            default_width: rule_width,
+            ..Default::default()
+        });
+        let client = TestWindow::new(params);
+        let mut book = workspace.make_tile(client.clone());
+        assert!(book.set_spine(ShrinkAxis::Horizontal, 40.));
+        workspace.add_tile(
+            book,
+            WorkspaceAddWindowTarget::Auto,
+            ActivateWindow::Yes,
+            ColumnWidth::Fixed(1100.),
+            true,
+            false,
+            None,
+        );
+        // Both the current configuration and the client's own size can change while folded.
+        options.layout.default_column_width = Some(PresetSize::Fixed(760));
+        workspace.update_config(Rc::new(options.clone()));
+        client.0.bbox.set(Rectangle::from_size((680, 300).into()));
+        workspace.update_window(&1, None);
+        let normal = workspace.make_tile(TestWindow::new(TestWindowParams::new(2)));
+        workspace.add_tile(
+            normal,
+            WorkspaceAddWindowTarget::Auto,
+            ActivateWindow::Yes,
+            ColumnWidth::Fixed(400.),
+            false,
+            false,
+            None,
+        );
+        let sizes = workspace.tiles().map(|t| t.tile_size()).collect::<Vec<_>>();
+        let focus = workspace.selected_window().map(|w| *w.id());
+        let plans = workspace.normal_spine_plans(&[99, 1, 2, 1]);
+        assert_eq!(plans.len(), 1);
+        assert_eq!(plans[0].0, 1);
+        assert_eq!(
+            workspace.tiles().map(|t| t.tile_size()).collect::<Vec<_>>(),
+            sizes
+        );
+        assert_eq!(workspace.selected_window().map(|w| *w.id()), focus);
+        assert_eq!(client.requested_size(), None);
+        assert!(client.0.output_events.borrow().is_empty());
+        let width = match rule_width {
+            None => 760.,
+            Some(Some(_)) => 850.,
+            Some(None) => 680.,
+        };
+        let mut oracle =
+            Workspace::new_no_outputs(Clock::with_time(Duration::ZERO), Rc::new(options));
+        let ordinary = TestWindow::new(TestWindowParams::new(1));
+        let tile = oracle.make_tile(ordinary.clone());
+        oracle.add_tile(
+            tile,
+            WorkspaceAddWindowTarget::Auto,
+            ActivateWindow::Yes,
+            ColumnWidth::Fixed(width),
+            false,
+            false,
+            None,
+        );
+        assert_eq!(plans[0].1.client_size, ordinary.requested_size().unwrap());
+        assert_eq!(plans[0].1.sizing_mode, SizingMode::Normal);
+        assert_ne!(plans[0].1.client_size.w, 1100);
+        assert_eq!(workspace.windows().count(), 2);
+        assert!(workspace
+            .tiles()
+            .find(|t| t.window().id() == &1)
+            .unwrap()
+            .is_spine());
+    }
+}
+
+#[test]
+fn batch_normal_plans_replace_all_selected_constraints_in_one_column_snapshot() {
+    for scale in [1., 1.25] {
+        for display in [ColumnDisplay::Normal, ColumnDisplay::Tabbed] {
+            for fixed_height in [false, true] {
+                let mut options = Options::default();
+                options.layout.default_column_display = display;
+                options.layout.border.off = false;
+                options.layout.border.width = 1.3;
+                let options = Rc::new(options);
+                let mut space = scrolling(scale, options.clone());
+                let mut clients = Vec::new();
+                for id in 1..=3 {
+                    let mut params = TestWindowParams::new(id);
+                    params.min_max_size = ((100, 20).into(), (0, 0).into());
+                    let client = TestWindow::new(params);
+                    let mut tile = Tile::new(
+                        client.clone(),
+                        space.view_size(),
+                        scale,
+                        space.clock().clone(),
+                        options.clone(),
+                    );
+                    if id > 1 {
+                        assert!(tile.set_spine(ShrinkAxis::Vertical, 40.));
+                    }
+                    if id == 1 {
+                        space.add_tile(None, tile, true, ColumnWidth::Fixed(700.), false, None);
+                    } else {
+                        space.add_tile_to_column(0, None, tile, false);
+                    }
+                    clients.push(client);
+                }
+                settle(&mut space);
+                if fixed_height {
+                    space.set_window_height(Some(&2), SizeChange::SetFixed(120));
+                }
+                let requests_before = clients
+                    .iter()
+                    .map(TestWindow::requested_size)
+                    .collect::<Vec<_>>();
+                let sizes_before = space.tiles().map(|t| t.tile_size()).collect::<Vec<_>>();
+                let plans = space.normal_spine_plans(&[
+                    (3, ColumnWidth::Fixed(1200.)),
+                    (1, ColumnWidth::Fixed(1200.)),
+                    (2, ColumnWidth::Fixed(1200.)),
+                    (2, ColumnWidth::Fixed(100.)),
+                ]);
+                assert_eq!(plans.iter().map(|(id, _)| *id).collect::<Vec<_>>(), [2, 3]);
+                assert_eq!(
+                    clients
+                        .iter()
+                        .map(TestWindow::requested_size)
+                        .collect::<Vec<_>>(),
+                    requests_before
+                );
+                assert_eq!(
+                    space.tiles().map(|t| t.tile_size()).collect::<Vec<_>>(),
+                    sizes_before
+                );
+                let single = space.normal_spine_plans(&[(2, ColumnWidth::Fixed(1200.))]);
+                if display == ColumnDisplay::Normal && !fixed_height {
+                    assert_ne!(single[0].1.allocation.h, plans[0].1.allocation.h);
+                }
+                // The ordinary allocator is the oracle, with the same members and native Auto(1)
+                // insertion height. Clearing form here is a test setup, not a user Expand action.
+                for tile in space.tiles_mut().filter(|t| t.is_spine()) {
+                    tile.clear_spine();
+                }
+                space.reset_window_height(Some(&2));
+                space.reset_window_height(Some(&3));
+                settle(&mut space);
+                for (id, plan) in plans {
+                    assert_eq!(plan.client_size, clients[id - 1].requested_size().unwrap());
+                    assert_eq!(plan.sizing_mode, SizingMode::Normal);
+                }
+                assert_eq!(space.columns().count(), 1);
+                assert_eq!(
+                    space.tiles().map(|t| *t.window().id()).collect::<Vec<_>>(),
+                    [1, 2, 3]
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn initial_spine_geometry_rejects_pending_and_committed_windowed_fullscreen() {
+    let mut tile = tile(1, 1., Rc::default());
+    let client = tile.window().clone();
+    client.0.is_pending_windowed_fullscreen.set(true);
+    assert!(tile
+        .plan_spine_geometry(ShrinkAxis::Horizontal, 40.)
+        .is_none());
+    assert!(!tile.set_spine(ShrinkAxis::Horizontal, 40.));
+    assert_eq!(tile.form(), WindowForm::Normal);
+    client.communicate();
+    tile.update_window();
+    client.0.is_pending_windowed_fullscreen.set(false);
+    assert!(tile
+        .plan_spine_geometry(ShrinkAxis::Vertical, 40.)
+        .is_none());
+    client.communicate();
+    tile.update_window();
+    assert!(tile
+        .plan_spine_geometry(ShrinkAxis::Vertical, 40.)
+        .is_some());
+}
+
+#[test]
+fn normal_slot_plans_in_non_normal_tabs_inherit_native_container_request() {
+    for mode in [SizingMode::Fullscreen, SizingMode::Maximized] {
+        let mut space = non_normal_space(1.25, mode, ColumnDisplay::Tabbed);
+        let options = space.tiles().next().unwrap().options().clone();
+        let mut book = scrolling_tile(2, &space, options);
+        let client = book.window().clone();
+        assert!(book.set_spine(ShrinkAxis::Vertical, 40.));
+        space.add_tile_to_column(0, None, book, true);
+        let before = space.tiles().map(|t| t.tile_size()).collect::<Vec<_>>();
+        let plans = space.normal_spine_plans(&[(2, ColumnWidth::Fixed(800.))]);
+        assert_eq!(plans.len(), 1);
+        assert_eq!(plans[0].1.sizing_mode, mode);
+        assert_eq!(
+            plans[0].1.client_size,
+            space
+                .tiles()
+                .next()
+                .unwrap()
+                .window()
+                .requested_size()
+                .unwrap()
+        );
+        assert_eq!(
+            plans[0].1.allocation,
+            if mode.is_fullscreen() {
+                space.view_size()
+            } else {
+                space.parent_area().size
+            }
+        );
+        assert_eq!(client.requested_size(), None);
+        assert_eq!(client.pending_sizing_mode(), SizingMode::Normal);
+        assert_eq!(
+            space.tiles().map(|t| t.tile_size()).collect::<Vec<_>>(),
+            before
+        );
+        settle(&mut space);
+    }
+}
+
+#[test]
+fn floating_normal_plans_use_native_defaults_without_size_memory_or_recentering() {
+    for explicit_size in [false, true] {
+        let mut options = Options::default();
+        options.layout.default_column_width = Some(PresetSize::Fixed(1000));
+        let options = Rc::new(options);
+        let mut params = TestWindowParams::new(1);
+        params.bbox = Rectangle::from_size((240, 160).into());
+        if explicit_size {
+            params.min_max_size = ((600, 500).into(), (800, 600).into());
+            params.rules = Some(crate::window::ResolvedWindowRules {
+                default_width: Some(Some(PresetSize::Fixed(720))),
+                default_height: Some(Some(PresetSize::Fixed(400))),
+                ..Default::default()
+            });
+        }
+        let client = TestWindow::new(params);
+        let clock = Clock::with_time(Duration::ZERO);
+        let mut book = Tile::new(
+            client.clone(),
+            (1280., 720.).into(),
+            1.25,
+            clock.clone(),
+            options.clone(),
+        );
+        book.floating_window_size = Some((999, 888).into());
+        book.floating_pos = Some((0.25, 0.75).into());
+        assert!(book.set_spine(ShrinkAxis::Horizontal, 40.));
+        let mut space = FloatingSpace::new(
+            (1280., 720.).into(),
+            Rectangle::from_size((1280., 720.).into()),
+            1.25,
+            clock,
+            options,
+        );
+        space.add_tile(book, true);
+        let before = space
+            .tiles_with_offsets()
+            .map(|(tile, pos)| (tile.tile_size(), pos))
+            .collect::<Vec<_>>();
+        let plan = space.normal_spine_plans(&[99, 1, 1]);
+        assert_eq!(plan.len(), 1);
+        assert_eq!(
+            plan[0].1.client_size,
+            if explicit_size {
+                (720, 500).into()
+            } else {
+                (0, 0).into()
+            }
+        );
+        assert_eq!(
+            plan[0].1.allocation,
+            if explicit_size {
+                (720., 500.).into()
+            } else {
+                (240., 160.).into()
+            }
+        );
+        assert_eq!(plan[0].1.sizing_mode, SizingMode::Normal);
+        assert_eq!(client.requested_size(), None);
+        assert_eq!(
+            space.tiles().next().unwrap().floating_window_size,
+            Some((999, 888).into())
+        );
+        assert_eq!(
+            space
+                .tiles_with_offsets()
+                .map(|(tile, pos)| (tile.tile_size(), pos))
+                .collect::<Vec<_>>(),
+            before
+        );
+        space.verify_invariants();
+    }
+}
+
 fn non_normal_space(
     scale: f64,
     mode: SizingMode,

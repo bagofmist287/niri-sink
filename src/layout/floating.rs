@@ -10,6 +10,7 @@ use smithay::utils::{Logical, Point, Rectangle, Scale, Serial, Size};
 
 use super::closing_window::{ClosingWindow, ClosingWindowRenderElement};
 use super::scrolling::ColumnWidth;
+use super::shrink_expand::NormalSizePlan;
 use super::tile::{Tile, TileRenderElement, TileRenderSnapshot};
 use super::workspace::{InteractiveResize, ResolvedSize};
 use super::{
@@ -454,6 +455,43 @@ impl<W: LayoutElement> FloatingSpace<W> {
         )
     }
 
+    /// Plan normal insertion sizes at the current positions without restoring floating memory,
+    /// reordering the stack, recentering, configuring clients or changing spine geometry.
+    pub fn normal_spine_plans(&self, ids: &[W::Id]) -> Vec<(W::Id, NormalSizePlan)> {
+        self.tiles
+            .iter()
+            .filter_map(|tile| {
+                if !tile.is_spine() || !ids.contains(tile.window().id()) {
+                    return None;
+                }
+                let win = tile.window();
+                let rules = win.rules();
+                let size = self.new_window_size(
+                    rules.default_width.flatten(),
+                    rules.default_height.flatten(),
+                    rules,
+                );
+                let client_size = constrain_normal_size(win, size);
+                let mut estimate = client_size;
+                let current = win.size();
+                if estimate.w == 0 {
+                    estimate.w = current.w;
+                }
+                if estimate.h == 0 {
+                    estimate.h = current.h;
+                }
+                Some((
+                    win.id().clone(),
+                    NormalSizePlan {
+                        allocation: tile.normal_tile_size_for_window_size(estimate),
+                        client_size,
+                        sizing_mode: super::SizingMode::Normal,
+                    },
+                ))
+            })
+            .collect()
+    }
+
     pub fn is_empty(&self) -> bool {
         self.tiles.is_empty()
     }
@@ -482,10 +520,7 @@ impl<W: LayoutElement> FloatingSpace<W> {
 
         // Apply min/max size window rules. If requesting a concrete size, apply completely; if
         // requesting (0, 0), apply only when min/max results in a fixed size.
-        let min_size = win.min_size();
-        let max_size = win.max_size();
-        size.w = ensure_min_max_size_maybe_zero(size.w, min_size.w, max_size.w);
-        size.h = ensure_min_max_size_maybe_zero(size.h, min_size.h, max_size.h);
+        size = constrain_normal_size(win, size);
 
         if !is_spine {
             win.request_size_once(size, true);
@@ -1527,6 +1562,17 @@ fn resolve_preset_size(preset: PresetSize, view_size: f64) -> ResolvedSize {
         PresetSize::Proportion(proportion) => ResolvedSize::Tile(view_size * proportion),
         PresetSize::Fixed(width) => ResolvedSize::Window(f64::from(width)),
     }
+}
+
+fn constrain_normal_size<W: LayoutElement>(
+    win: &W,
+    mut size: Size<i32, Logical>,
+) -> Size<i32, Logical> {
+    let min_size = win.min_size();
+    let max_size = win.max_size();
+    size.w = ensure_min_max_size_maybe_zero(size.w, min_size.w, max_size.w);
+    size.h = ensure_min_max_size_maybe_zero(size.h, min_size.h, max_size.h);
+    size
 }
 
 fn resolve_spine_extent(change: SizeChange, current: f64, available: f64) -> f64 {

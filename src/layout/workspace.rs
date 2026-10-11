@@ -803,6 +803,27 @@ impl<W: LayoutElement> Workspace<W> {
             .map(|(tile, _, _)| tile.window())
     }
 
+    /// Read-only normal insertion requests for a batch, resolved from one native snapshot.
+    /// IDs absent from this workspace, normal windows and Sink members are omitted.
+    pub fn normal_spine_plans(
+        &self,
+        ids: &[W::Id],
+    ) -> Vec<(W::Id, super::shrink_expand::NormalSizePlan)> {
+        let requests = self
+            .scrolling
+            .tiles()
+            .filter(|tile| tile.is_spine() && ids.contains(tile.window().id()))
+            .map(|tile| {
+                let win = tile.window();
+                let width = self.resolve_default_width(win.rules().default_width, false);
+                (win.id().clone(), self.resolve_scrolling_width(win, width))
+            })
+            .collect::<Vec<_>>();
+        let mut plans = self.scrolling.normal_spine_plans(&requests);
+        plans.extend(self.floating.normal_spine_plans(ids));
+        plans
+    }
+
     pub fn spine_plans(
         &self,
         id: &W::Id,

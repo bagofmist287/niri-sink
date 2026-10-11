@@ -8,6 +8,56 @@ use crate::layout::LayoutElement as _;
 use crate::layout::SizingMode;
 
 #[test]
+fn initial_shrink_waits_for_windowed_fullscreen_unset_commit() {
+    let mut fixture = Fixture::new();
+    fixture.add_output(1, (1280, 720));
+    let client = fixture.add_client();
+    let surface = fixture.client(client).create_window().surface.clone();
+    fixture.client(client).window(&surface).commit();
+    fixture.roundtrip(client);
+    let window = fixture.client(client).window(&surface);
+    window.attach_new_buffer();
+    window.set_size(100, 100);
+    window.ack_last_and_commit();
+    fixture.double_roundtrip(client);
+    let id = fixture
+        .niri()
+        .layout
+        .windows()
+        .next()
+        .unwrap()
+        .1
+        .window
+        .clone();
+    fixture.niri().layout.toggle_windowed_fullscreen(&id);
+    assert!(fixture.niri().layout.shrink_plans(&id, 40.).is_none());
+    fixture.double_roundtrip(client);
+    fixture
+        .client(client)
+        .window(&surface)
+        .ack_last_and_commit();
+    fixture.double_roundtrip(client);
+    assert!(fixture.niri().layout.shrink_plans(&id, 40.).is_none());
+    fixture.niri().layout.toggle_windowed_fullscreen(&id);
+    fixture.double_roundtrip(client);
+    // Unset is only pending; the committed client still carries the fullscreen state.
+    assert!(fixture.niri().layout.shrink_plans(&id, 40.).is_none());
+    fixture
+        .client(client)
+        .window(&surface)
+        .ack_last_and_commit();
+    fixture.double_roundtrip(client);
+    assert!(fixture
+        .niri()
+        .layout
+        .shrink_plans(&id, 40.)
+        .unwrap()
+        .first()
+        .is_some());
+    assert_eq!(fixture.niri().layout.windows().count(), 1);
+}
+
+#[test]
 fn passive_spine_tab_insertion_does_not_configure_hidden_client_into_container_mode() {
     for mode in [SizingMode::Fullscreen, SizingMode::Maximized] {
         for axis in [ShrinkAxis::Horizontal, ShrinkAxis::Vertical] {

@@ -863,6 +863,8 @@ impl<W: LayoutElement> Tile<W> {
     pub fn plan_spine_geometry(&self, axis: ShrinkAxis, thickness: f64) -> Option<SpineGeometry> {
         if !self.sizing_mode.is_normal()
             || !self.window.pending_sizing_mode().is_normal()
+            || self.window.is_windowed_fullscreen()
+            || self.window.is_pending_windowed_fullscreen()
             || self.sink_presentation.is_some()
         {
             return None;
@@ -1118,7 +1120,7 @@ impl<W: LayoutElement> Tile<W> {
 
     pub fn request_tile_size(
         &mut self,
-        mut size: Size<f64, Logical>,
+        size: Size<f64, Logical>,
         animate: bool,
         transaction: Option<Transaction>,
     ) {
@@ -1127,6 +1129,17 @@ impl<W: LayoutElement> Tile<W> {
             spine.allocate(size, self.scale, border);
             return;
         }
+        let size = self.normal_window_size_for_tile_size(size);
+
+        self.window
+            .request_size(size, SizingMode::Normal, animate, transaction);
+    }
+
+    /// Convert a normal allocation without consulting the current spine form.
+    pub fn normal_window_size_for_tile_size(
+        &self,
+        mut size: Size<f64, Logical>,
+    ) -> Size<i32, Logical> {
         // Can't go through effective_border_width() because we might be fullscreen.
         if !self.border.is_off() {
             let width = self.border.width();
@@ -1137,12 +1150,18 @@ impl<W: LayoutElement> Tile<W> {
         // The size request has to be i32 unfortunately, due to Wayland. We floor here instead of
         // round to avoid situations where proportionally-sized columns don't fit on the screen
         // exactly.
-        self.window.request_size(
-            size.to_i32_floor(),
-            SizingMode::Normal,
-            animate,
-            transaction,
-        );
+        size.to_i32_floor()
+    }
+
+    pub fn normal_tile_size_for_window_size(&self, size: Size<i32, Logical>) -> Size<f64, Logical> {
+        let mut size = size
+            .to_f64()
+            .to_physical_precise_round(self.scale)
+            .to_logical(self.scale);
+        if !self.border.is_off() {
+            size += Size::from((self.border.width() * 2., self.border.width() * 2.));
+        }
+        size
     }
 
     pub fn tile_width_for_window_width(&self, size: f64) -> f64 {
@@ -1216,6 +1235,10 @@ impl<W: LayoutElement> Tile<W> {
         if let Some(spine) = &self.spine {
             return spine.min_size(self.scale, self.effective_border_width().unwrap_or(0.));
         }
+        self.normal_min_size_nonfullscreen()
+    }
+
+    pub fn normal_min_size_nonfullscreen(&self) -> Size<f64, Logical> {
         let mut size = self.window.min_size().to_f64();
 
         // Can't go through effective_border_width() because we might be fullscreen.
@@ -1236,6 +1259,10 @@ impl<W: LayoutElement> Tile<W> {
         if let Some(spine) = &self.spine {
             return spine.max_size(self.scale, self.effective_border_width().unwrap_or(0.));
         }
+        self.normal_max_size_nonfullscreen()
+    }
+
+    pub fn normal_max_size_nonfullscreen(&self) -> Size<f64, Logical> {
         let mut size = self.window.max_size().to_f64();
 
         // Can't go through effective_border_width() because we might be fullscreen.

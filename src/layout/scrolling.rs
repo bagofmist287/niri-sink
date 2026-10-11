@@ -12,7 +12,7 @@ use smithay::utils::{Logical, Point, Rectangle, Scale, Serial, Size};
 
 use super::closing_window::{ClosingWindow, ClosingWindowRenderElement};
 use super::monitor::InsertPosition;
-use super::shrink_expand::{ShrinkAxis, SpineGeometry, SpinePlans};
+use super::shrink_expand::{NormalSizePlan, ShrinkAxis, SpineGeometry, SpinePlans};
 use super::tab_indicator::{TabIndicator, TabIndicatorRenderElement, TabInfo};
 use super::tile::{Tile, TileRenderElement, TileRenderSnapshot};
 use super::workspace::{InteractiveResize, ResolvedSize};
@@ -323,6 +323,15 @@ impl TileSizing {
         self.max_size = spine.max_size(scale, border);
         self.border_height = 0.;
         self.spine = true;
+        self
+    }
+
+    fn with_normal<W: LayoutElement>(mut self, tile: &Tile<W>) -> Self {
+        self.min_size = tile.normal_min_size_nonfullscreen();
+        self.max_size = tile.normal_max_size_nonfullscreen();
+        self.height = WindowHeight::auto_1();
+        self.border_height = tile.normal_tile_size_for_window_size((0, 0).into()).h;
+        self.spine = false;
         self
     }
     fn tile_height_for_window_height(&self, height: f64) -> f64 {
@@ -2709,6 +2718,64 @@ impl<W: LayoutElement> ScrollingSpace<W> {
         }
     }
 
+    /// Plan all requested spines from one snapshot. Other members retain their current inputs.
+    /// The supplied widths are resolved by the workspace's ordinary new-window policy and
+    /// are used only for a sole member; shared columns retain their current width.
+    pub fn normal_spine_plans(
+        &self,
+        requests: &[(W::Id, ColumnWidth)],
+    ) -> Vec<(W::Id, NormalSizePlan)> {
+        let mut plans = Vec::new();
+        for col in &self.columns {
+            let mut rows = col.sizing_inputs();
+            let mut targets = Vec::new();
+            for (idx, tile) in col.tiles.iter().enumerate() {
+                if tile.is_spine() {
+                    if let Some((_, width)) =
+                        requests.iter().find(|(id, _)| id == tile.window().id())
+                    {
+                        rows[idx] = rows[idx].with_normal(tile);
+                        targets.push((idx, *width));
+                    }
+                }
+            }
+            if targets.is_empty() {
+                continue;
+            }
+            let width = if col.tiles.len() == 1 {
+                targets[0].1
+            } else if col.is_full_width {
+                ColumnWidth::Proportion(1.)
+            } else {
+                col.width
+            };
+            let mode = col.pending_sizing_mode();
+            let sizes = if let Some(size) = col.non_normal_tile_size() {
+                vec![size; rows.len()]
+            } else {
+                col.compute_tile_sizes_at_width(&rows, width)
+            };
+            for (idx, _) in targets {
+                let tile = &col.tiles[idx];
+                let allocation = sizes[idx];
+                let client_size = if mode.is_normal() {
+                    tile.normal_window_size_for_tile_size(allocation)
+                } else {
+                    allocation.to_i32_round()
+                };
+                plans.push((
+                    tile.window().id().clone(),
+                    NormalSizePlan {
+                        allocation,
+                        client_size,
+                        sizing_mode: mode,
+                    },
+                ));
+            }
+        }
+        plans
+    }
+
     pub fn spine_plans(&self, id: &W::Id, thickness: f64) -> Option<SpinePlans> {
         let col = self.columns.iter().find(|col| col.contains(id))?;
         let idx = col.position(id)?;
@@ -4860,16 +4927,24 @@ impl<W: LayoutElement> Column<W> {
     }
 
     fn compute_tile_sizes(&self, tiles: &[TileSizing]) -> Vec<Size<f64, Logical>> {
+        let width = if self.is_full_width {
+            ColumnWidth::Proportion(1.)
+        } else {
+            self.width
+        };
+        self.compute_tile_sizes_at_width(tiles, width)
+    }
+
+    fn compute_tile_sizes_at_width(
+        &self,
+        tiles: &[TileSizing],
+        width: ColumnWidth,
+    ) -> Vec<Size<f64, Logical>> {
         let is_tabbed = self.display_mode == ColumnDisplay::Tabbed;
         let extra_size = if is_tabbed {
             self.tab_indicator.extra_size(tiles.len(), self.scale)
         } else {
             Size::from((0., 0.))
-        };
-        let width = if self.is_full_width {
-            ColumnWidth::Proportion(1.)
-        } else {
-            self.width
         };
         let width = resolve_column_width(
             width,
