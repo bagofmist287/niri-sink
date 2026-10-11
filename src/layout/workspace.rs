@@ -861,7 +861,7 @@ impl<W: LayoutElement> Workspace<W> {
         plans.into_iter().map(|(id, _)| id).collect()
     }
 
-    pub(super) fn spines_for_mode_request(&self, id: &W::Id, windowed: bool) -> Vec<W::Id> {
+    pub(super) fn spines_for_mode_request(&self, id: &W::Id, column_mode: bool) -> Vec<W::Id> {
         if self.floating.has_window(id) {
             return self
                 .floating
@@ -873,7 +873,7 @@ impl<W: LayoutElement> Workspace<W> {
                 .map(|tile| tile.window().id().clone())
                 .collect();
         }
-        self.scrolling.spines_for_mode_request(id, windowed)
+        self.scrolling.spines_for_mode_request(id, column_mode)
     }
 
     pub fn spine_plans(

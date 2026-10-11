@@ -2830,12 +2830,11 @@ impl<W: LayoutElement> ScrollingSpace<W> {
     }
 
     /// Explicit column modes affect every tab; windowed fullscreen otherwise affects one client.
-    pub(super) fn spines_for_mode_request(&self, id: &W::Id, windowed: bool) -> Vec<W::Id> {
+    pub(super) fn spines_for_mode_request(&self, id: &W::Id, column_mode: bool) -> Vec<W::Id> {
         let Some(col) = self.columns.iter().find(|col| col.contains(id)) else {
             return Vec::new();
         };
-        let whole_column =
-            col.display_mode == ColumnDisplay::Tabbed && (!windowed || col.is_pending_fullscreen());
+        let whole_column = col.display_mode == ColumnDisplay::Tabbed && column_mode;
         col.tiles
             .iter()
             .filter(|tile| {

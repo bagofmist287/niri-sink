@@ -2069,3 +2069,23 @@ fn explicit_floating_modes_restore_form_and_keep_native_return_to_floating() {
         assert!(Rc::ptr_eq(&win.0, &layout.windows().next().unwrap().1 .0));
     }
 }
+
+#[test]
+fn explicit_unfullscreen_of_windowed_client_keeps_other_book_tabs_collapsed() {
+    let mut layout = explicit_mode_layout(ColumnDisplay::Tabbed);
+    layout.request_toggle_windowed_fullscreen(&2);
+    Op::Communicate(2).apply(&mut layout);
+    assert!(layout.is_spine(&3));
+    layout.request_fullscreen(&2, false);
+    assert!(layout.is_spine(&3));
+    layout.request_fullscreen(&2, false);
+    assert!(layout.is_spine(&3));
+    Op::Communicate(2).apply(&mut layout);
+    let win = layout.windows().find(|(_, w)| w.id() == &2).unwrap().1;
+    assert!(!win.is_windowed_fullscreen());
+    assert!(!win.is_pending_windowed_fullscreen());
+    layout.request_fullscreen(&2, false);
+    layout.request_maximized(&2, false);
+    assert!(layout.is_spine(&3));
+    layout.verify_invariants();
+}

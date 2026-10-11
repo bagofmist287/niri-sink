@@ -3688,10 +3688,18 @@ impl<W: LayoutElement> Layout<W> {
 
     /// Only explicit user/protocol requests call this preparation. Native move/display setters
     /// keep the independent spine form. The operation coordinator must cancel its preview first.
+    fn column_pending_modes(&self, id: &W::Id) -> (bool, bool) {
+        self.workspaces()
+            .find(|(_, _, ws)| ws.has_window(id))
+            .and_then(|(_, _, ws)| ws.scrolling().columns().find(|col| col.contains(id)))
+            .map(|col| (col.is_pending_fullscreen(), col.is_pending_maximized()))
+            .unwrap_or_default()
+    }
+
     fn prepare_spines_for_mode_request(
         &mut self,
         id: &W::Id,
-        windowed: bool,
+        column_mode: bool,
     ) -> Option<Vec<W::Id>> {
         if let Some(InteractiveMoveState::Moving(move_)) = &self.interactive_move {
             if move_.tile.window().id() == id {
@@ -3699,7 +3707,7 @@ impl<W: LayoutElement> Layout<W> {
             }
         }
         let ws = self.workspaces_mut().find(|ws| ws.has_window(id))?;
-        let ids = ws.spines_for_mode_request(id, windowed);
+        let ids = ws.spines_for_mode_request(id, column_mode);
         if ids.is_empty() {
             return Some(ids);
         }
@@ -3729,7 +3737,14 @@ impl<W: LayoutElement> Layout<W> {
     }
 
     pub fn request_fullscreen(&mut self, id: &W::Id, value: bool) {
-        let Some(restored) = self.prepare_spines_for_mode_request(id, false) else {
+        // Unfullscreen can be client-only (windowed fullscreen); duplicate unsets of a
+        // normal column also leave other tabs untouched. Resolve scope before restoring form.
+        let pending_windowed = self
+            .windows()
+            .find(|(_, win)| win.id() == id)
+            .is_some_and(|(_, win)| win.is_pending_windowed_fullscreen());
+        let column_mode = value || (!pending_windowed && self.column_pending_modes(id).0);
+        let Some(restored) = self.prepare_spines_for_mode_request(id, column_mode) else {
             return;
         };
         self.set_fullscreen(id, value);
@@ -3740,16 +3755,13 @@ impl<W: LayoutElement> Layout<W> {
         if self.sink_depth(id).is_some() {
             return;
         }
-        let value = !self
-            .workspaces()
-            .find(|(_, _, ws)| ws.has_window(id))
-            .and_then(|(_, _, ws)| ws.scrolling().columns().find(|col| col.contains(id)))
-            .is_some_and(|col| col.is_pending_fullscreen());
+        let value = !self.column_pending_modes(id).0;
         self.request_fullscreen(id, value);
     }
 
     pub fn request_maximized(&mut self, id: &W::Id, value: bool) {
-        let Some(restored) = self.prepare_spines_for_mode_request(id, false) else {
+        let column_mode = value || self.column_pending_modes(id).1;
+        let Some(restored) = self.prepare_spines_for_mode_request(id, column_mode) else {
             return;
         };
         self.set_maximized(id, value);
@@ -3760,11 +3772,7 @@ impl<W: LayoutElement> Layout<W> {
         if self.sink_depth(id).is_some() {
             return;
         }
-        let value = !self
-            .workspaces()
-            .find(|(_, _, ws)| ws.has_window(id))
-            .and_then(|(_, _, ws)| ws.scrolling().columns().find(|col| col.contains(id)))
-            .is_some_and(|col| col.is_pending_maximized());
+        let value = !self.column_pending_modes(id).1;
         self.request_maximized(id, value);
     }
 
@@ -3776,7 +3784,8 @@ impl<W: LayoutElement> Layout<W> {
             return;
         };
         let value = !window.is_pending_windowed_fullscreen();
-        let Some(restored) = self.prepare_spines_for_mode_request(id, true) else {
+        let column_mode = self.column_pending_modes(id).0;
+        let Some(restored) = self.prepare_spines_for_mode_request(id, column_mode) else {
             return;
         };
         self.set_windowed_fullscreen(id, value);

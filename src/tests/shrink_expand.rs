@@ -1013,3 +1013,72 @@ fn explicit_xdg_mode_from_floating_book_preserves_native_return_and_other_books(
         assert!(!fixture.niri().layout.is_spine(&ids[1]));
     }
 }
+
+#[test]
+fn explicit_xdg_unfullscreen_of_windowed_client_does_not_expand_sibling_book() {
+    use niri_config::Action;
+    let (mut fixture, client, surfaces, ids) = explicit_mode_fixture();
+    let native_id = fixture
+        .niri()
+        .layout
+        .windows()
+        .find(|(_, w)| w.window == ids[1])
+        .unwrap()
+        .1
+        .id()
+        .get();
+    fixture
+        .niri_state()
+        .do_action(Action::ToggleWindowedFullscreenById(native_id), false);
+    fixture.double_roundtrip(client);
+    let window = fixture.client(client).window(&surfaces[1]);
+    window.ack_last_and_commit();
+    fixture.double_roundtrip(client);
+    assert!(fixture.niri().layout.is_spine(&ids[2]));
+    fixture
+        .client(client)
+        .window(&surfaces[1])
+        .xdg_toplevel
+        .unset_fullscreen();
+    fixture.double_roundtrip(client);
+    assert!(fixture.niri().layout.is_spine(&ids[2]));
+    fixture
+        .client(client)
+        .window(&surfaces[1])
+        .xdg_toplevel
+        .unset_fullscreen();
+    fixture.double_roundtrip(client);
+    assert!(fixture.niri().layout.is_spine(&ids[2]));
+    let window = fixture.client(client).window(&surfaces[1]);
+    assert!(!window
+        .configures_received
+        .last()
+        .unwrap()
+        .1
+        .states
+        .contains(&xdg_toplevel::State::Fullscreen));
+    window.ack_last_and_commit();
+    fixture.double_roundtrip(client);
+    let mapped = fixture
+        .niri()
+        .layout
+        .windows()
+        .find(|(_, w)| w.window == ids[1])
+        .unwrap()
+        .1;
+    assert!(!mapped.is_windowed_fullscreen());
+    assert!(!mapped.is_pending_windowed_fullscreen());
+    fixture
+        .client(client)
+        .window(&surfaces[1])
+        .xdg_toplevel
+        .unset_fullscreen();
+    fixture
+        .client(client)
+        .window(&surfaces[1])
+        .xdg_toplevel
+        .unset_maximized();
+    fixture.double_roundtrip(client);
+    assert!(fixture.niri().layout.is_spine(&ids[2]));
+    assert_eq!(fixture.niri().layout.windows().count(), 3);
+}
