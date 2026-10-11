@@ -410,6 +410,27 @@ impl<W: LayoutElement> FloatingSpace<W> {
             .map(Tile::window_mut)
     }
 
+    /// Select a client focus receiver without changing spine forms.
+    pub(super) fn focus_normal_window(&mut self) -> bool {
+        if self.active_window_id.as_ref().is_some_and(|id| {
+            self.tiles
+                .iter()
+                .any(|tile| tile.window().id() == id && !tile.is_spine())
+        }) {
+            return true;
+        }
+        let Some(id) = self
+            .tiles
+            .iter()
+            .find(|tile| !tile.is_spine())
+            .map(|tile| tile.window().id().clone())
+        else {
+            return false;
+        };
+        self.activate_window(&id);
+        true
+    }
+
     pub fn has_window(&self, id: &W::Id) -> bool {
         self.tiles.iter().any(|tile| tile.window().id() == id)
     }
@@ -653,7 +674,11 @@ impl<W: LayoutElement> FloatingSpace<W> {
         let preset_idx = if let Some(idx) = tile.floating_preset_width_idx {
             (idx + if forwards { 1 } else { len - 1 }) % len
         } else {
-            let current_window = tile.window_expected_or_current_size().w;
+            let current_window = if tile.is_spine() {
+                tile.tile_expected_or_current_size().w
+            } else {
+                tile.window_expected_or_current_size().w
+            };
             let current_tile = tile.tile_expected_or_current_size().w;
 
             let mut it = self
@@ -714,7 +739,11 @@ impl<W: LayoutElement> FloatingSpace<W> {
         let preset_idx = if let Some(idx) = tile.floating_preset_height_idx {
             (idx + if forwards { 1 } else { len - 1 }) % len
         } else {
-            let current_window = tile.window_expected_or_current_size().h;
+            let current_window = if tile.is_spine() {
+                tile.tile_expected_or_current_size().h
+            } else {
+                tile.window_expected_or_current_size().h
+            };
             let current_tile = tile.tile_expected_or_current_size().h;
 
             let mut it = self
@@ -759,6 +788,14 @@ impl<W: LayoutElement> FloatingSpace<W> {
             return;
         };
         let idx = self.idx_of(id).unwrap();
+
+        if self.tiles[idx].is_spine() {
+            self.tiles[idx].floating_preset_width_idx = None;
+            let mut size = self.tiles[idx].tile_size();
+            size.w = resolve_spine_extent(change, size.w, self.working_area.size.w);
+            self.request_spine_size(idx, size);
+            return;
+        }
 
         let tile = &mut self.tiles[idx];
         tile.floating_preset_width_idx = None;
@@ -807,6 +844,14 @@ impl<W: LayoutElement> FloatingSpace<W> {
         };
         let idx = self.idx_of(id).unwrap();
 
+        if self.tiles[idx].is_spine() {
+            self.tiles[idx].floating_preset_height_idx = None;
+            let mut size = self.tiles[idx].tile_size();
+            size.h = resolve_spine_extent(change, size.h, self.working_area.size.h);
+            self.request_spine_size(idx, size);
+            return;
+        }
+
         let tile = &mut self.tiles[idx];
         tile.floating_preset_height_idx = None;
 
@@ -848,6 +893,30 @@ impl<W: LayoutElement> FloatingSpace<W> {
         win.request_size_once(win_size, animate);
     }
 
+    fn request_spine_size(&mut self, idx: usize, size: Size<f64, Logical>) {
+        let tile = &mut self.tiles[idx];
+        let data = &mut self.data[idx];
+        let previous_size = data.size;
+        tile.request_tile_size(size, false, None);
+        data.update(tile);
+
+        // Match native top/left anchoring, without waiting for a hidden client's commit.
+        if let Some(resize) = self
+            .interactive_resize
+            .as_ref()
+            .filter(|resize| &resize.window == tile.window().id())
+        {
+            let mut offset = Point::from((0., 0.));
+            if resize.data.edges.contains(ResizeEdge::LEFT) {
+                offset.x = previous_size.w - data.size.w;
+            }
+            if resize.data.edges.contains(ResizeEdge::TOP) {
+                offset.y = previous_size.h - data.size.h;
+            }
+            data.set_logical_pos(data.logical_pos + offset);
+        }
+    }
+
     fn focus_directional(
         &mut self,
         distance: impl Fn(Point<f64, Logical>, Point<f64, Logical>) -> f64,
@@ -859,7 +928,7 @@ impl<W: LayoutElement> FloatingSpace<W> {
         let center = self.data[active_idx].center();
 
         let result = zip(&self.tiles, &self.data)
-            .filter(|(tile, _)| tile.window().id() != active_id)
+            .filter(|(tile, _)| !tile.is_spine() && tile.window().id() != active_id)
             .map(|(tile, data)| (tile, distance(center, data.center())))
             .filter(|(_, dist)| *dist > 0.)
             .min_by(|(_, dist_a), (_, dist_b)| f64::total_cmp(dist_a, dist_b));
@@ -891,6 +960,7 @@ impl<W: LayoutElement> FloatingSpace<W> {
     pub fn focus_leftmost(&mut self) {
         let result = self
             .tiles_with_offsets()
+            .filter(|(tile, _)| !tile.is_spine())
             .min_by(|(_, pos_a), (_, pos_b)| f64::total_cmp(&pos_a.x, &pos_b.x));
         if let Some((tile, _)) = result {
             let id = tile.window().id().clone();
@@ -901,6 +971,7 @@ impl<W: LayoutElement> FloatingSpace<W> {
     pub fn focus_rightmost(&mut self) {
         let result = self
             .tiles_with_offsets()
+            .filter(|(tile, _)| !tile.is_spine())
             .max_by(|(_, pos_a), (_, pos_b)| f64::total_cmp(&pos_a.x, &pos_b.x));
         if let Some((tile, _)) = result {
             let id = tile.window().id().clone();
@@ -911,6 +982,7 @@ impl<W: LayoutElement> FloatingSpace<W> {
     pub fn focus_topmost(&mut self) {
         let result = self
             .tiles_with_offsets()
+            .filter(|(tile, _)| !tile.is_spine())
             .min_by(|(_, pos_a), (_, pos_b)| f64::total_cmp(&pos_a.y, &pos_b.y));
         if let Some((tile, _)) = result {
             let id = tile.window().id().clone();
@@ -921,6 +993,7 @@ impl<W: LayoutElement> FloatingSpace<W> {
     pub fn focus_bottommost(&mut self) {
         let result = self
             .tiles_with_offsets()
+            .filter(|(tile, _)| !tile.is_spine())
             .max_by(|(_, pos_a), (_, pos_b)| f64::total_cmp(&pos_a.y, &pos_b.y));
         if let Some((tile, _)) = result {
             let id = tile.window().id().clone();
@@ -1117,7 +1190,11 @@ impl<W: LayoutElement> FloatingSpace<W> {
             .find(|tile| tile.window().id() == &window)
             .unwrap();
 
-        let original_window_size = tile.window_size();
+        let original_window_size = if tile.is_spine() {
+            tile.tile_size()
+        } else {
+            tile.window_size()
+        };
 
         let resize = InteractiveResize {
             window,
@@ -1185,6 +1262,7 @@ impl<W: LayoutElement> FloatingSpace<W> {
     pub fn refresh(&mut self, is_active: bool, is_focused: bool) {
         let active = self.active_window_id.clone();
         for tile in &mut self.tiles {
+            let is_spine = tile.is_spine();
             let win = tile.window_mut();
 
             win.set_active_in_column(true);
@@ -1194,7 +1272,7 @@ impl<W: LayoutElement> FloatingSpace<W> {
             if self.options.deactivate_unfocused_windows {
                 is_active &= is_focused;
             }
-            win.set_activated(is_active);
+            win.set_activated(is_active && !is_spine);
 
             let resize_data = self
                 .interactive_resize
@@ -1430,4 +1508,21 @@ fn resolve_preset_size(preset: PresetSize, view_size: f64) -> ResolvedSize {
         PresetSize::Proportion(proportion) => ResolvedSize::Tile(view_size * proportion),
         PresetSize::Fixed(width) => ResolvedSize::Window(f64::from(width)),
     }
+}
+
+fn resolve_spine_extent(change: SizeChange, current: f64, available: f64) -> f64 {
+    let extent = match change {
+        SizeChange::SetFixed(value) => f64::from(value),
+        SizeChange::AdjustFixed(delta) => current + f64::from(delta),
+        SizeChange::SetProportion(prop) => available * (prop / 100.).clamp(0., 10000.),
+        SizeChange::AdjustProportion(delta) => {
+            let prop = if available > 0. {
+                current / available
+            } else {
+                0.
+            };
+            available * (prop + delta / 100.).clamp(0., 10000.)
+        }
+    };
+    extent.clamp(1., 100000.)
 }

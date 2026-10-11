@@ -852,7 +852,10 @@ impl<W: LayoutElement> Tile<W> {
     /// Internal form conversion. The operation layer must validate scope and hand off focus.
     /// No client configure is sent and no normal-size restore record is created.
     pub fn set_spine(&mut self, axis: ShrinkAxis, thickness: f64) -> bool {
-        if !self.sizing_mode.is_normal() || !self.window.pending_sizing_mode().is_normal() {
+        if !self.sizing_mode.is_normal()
+            || !self.window.pending_sizing_mode().is_normal()
+            || self.sink_presentation.is_some()
+        {
             return false;
         }
         let allocation = self.tile_expected_or_current_size();

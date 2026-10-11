@@ -1579,32 +1579,28 @@ impl<W: LayoutElement> ScrollingSpace<W> {
     }
 
     pub fn focus_left(&mut self) -> bool {
-        if self.active_column_idx == 0 {
-            return false;
-        }
-        self.activate_column(self.active_column_idx - 1);
-        true
+        let target = (0..self.active_column_idx)
+            .rev()
+            .find(|idx| self.columns[*idx].has_normal_window());
+        target.is_some_and(|idx| self.focus_normal_column(idx))
     }
 
     pub fn focus_right(&mut self) -> bool {
-        if self.active_column_idx + 1 >= self.columns.len() {
-            return false;
-        }
-
-        self.activate_column(self.active_column_idx + 1);
-        true
+        let target = (self.active_column_idx + 1..self.columns.len())
+            .find(|idx| self.columns[*idx].has_normal_window());
+        target.is_some_and(|idx| self.focus_normal_column(idx))
     }
 
     pub fn focus_column_first(&mut self) {
-        self.activate_column(0);
+        if let Some(idx) = self.columns.iter().position(Column::has_normal_window) {
+            self.focus_normal_column(idx);
+        }
     }
 
     pub fn focus_column_last(&mut self) {
-        if self.columns.is_empty() {
-            return;
+        if let Some(idx) = self.columns.iter().rposition(Column::has_normal_window) {
+            self.focus_normal_column(idx);
         }
-
-        self.activate_column(self.columns.len() - 1);
     }
 
     pub fn focus_column(&mut self, index: usize) {
@@ -1612,7 +1608,40 @@ impl<W: LayoutElement> ScrollingSpace<W> {
             return;
         }
 
-        self.activate_column(index.saturating_sub(1).min(self.columns.len() - 1));
+        let requested = index.saturating_sub(1).min(self.columns.len() - 1);
+        let target = (requested..self.columns.len())
+            .chain((0..requested).rev())
+            .find(|idx| self.columns[*idx].has_normal_window());
+        if let Some(idx) = target {
+            self.focus_normal_column(idx);
+        }
+    }
+
+    /// Navigation can change a tab's structural selection, but never expands a spine.
+    fn focus_normal_column(&mut self, idx: usize) -> bool {
+        let col = &mut self.columns[idx];
+        if col.tiles[col.active_tile_idx].is_spine() {
+            let Some(tile_idx) = col.tiles.iter().position(|tile| !tile.is_spine()) else {
+                return false;
+            };
+            col.activate_idx(tile_idx);
+        }
+        self.activate_column(idx);
+        true
+    }
+
+    pub(super) fn focus_normal_window(&mut self) -> bool {
+        if self
+            .columns
+            .get(self.active_column_idx)
+            .is_some_and(|col| !col.tiles[col.active_tile_idx].is_spine())
+        {
+            return true;
+        }
+        let target = (self.active_column_idx..self.columns.len())
+            .chain((0..self.active_column_idx).rev())
+            .find(|idx| self.columns[*idx].has_normal_window());
+        target.is_some_and(|idx| self.focus_normal_column(idx))
     }
 
     pub fn focus_window_in_column(&mut self, index: u8) {
@@ -2214,8 +2243,8 @@ impl<W: LayoutElement> ScrollingSpace<W> {
         col.set_column_display(display);
 
         // With place_within_column, the tab indicator changes the column size immediately.
-        self.data[self.active_column_idx].update(col);
         col.update_tile_sizes(true);
+        self.data[self.active_column_idx].update(col);
 
         // Disable fullscreen if needed.
         if col.display_mode != ColumnDisplay::Tabbed && col.tiles.len() > 1 {
@@ -2627,6 +2656,18 @@ impl<W: LayoutElement> ScrollingSpace<W> {
         None
     }
 
+    fn column_and_tile_idx(&self, window: Option<&W::Id>) -> (usize, Option<usize>) {
+        if let Some(window) = window {
+            self.columns
+                .iter()
+                .enumerate()
+                .find_map(|(idx, col)| col.position(window).map(|tile_idx| (idx, Some(tile_idx))))
+                .unwrap()
+        } else {
+            (self.active_column_idx, None)
+        }
+    }
+
     pub fn toggle_width(&mut self, forwards: bool) {
         if self.columns.is_empty() {
             return;
@@ -2636,6 +2677,7 @@ impl<W: LayoutElement> ScrollingSpace<W> {
         col.toggle_width(None, forwards);
 
         cancel_resize_for_column(&mut self.interactive_resize, col);
+        self.data[self.active_column_idx].update(col);
     }
 
     pub fn toggle_full_width(&mut self) {
@@ -2647,6 +2689,7 @@ impl<W: LayoutElement> ScrollingSpace<W> {
         col.toggle_full_width();
 
         cancel_resize_for_column(&mut self.interactive_resize, col);
+        self.data[self.active_column_idx].update(col);
     }
 
     pub fn set_window_width(&mut self, window: Option<&W::Id>, change: SizeChange) {
@@ -2654,23 +2697,13 @@ impl<W: LayoutElement> ScrollingSpace<W> {
             return;
         }
 
-        let (col, tile_idx) = if let Some(window) = window {
-            self.columns
-                .iter_mut()
-                .find_map(|col| {
-                    col.tiles
-                        .iter()
-                        .position(|tile| tile.window().id() == window)
-                        .map(|tile_idx| (col, Some(tile_idx)))
-                })
-                .unwrap()
-        } else {
-            (&mut self.columns[self.active_column_idx], None)
-        };
+        let (col_idx, tile_idx) = self.column_and_tile_idx(window);
+        let col = &mut self.columns[col_idx];
 
         col.set_column_width(change, tile_idx, true);
 
         cancel_resize_for_column(&mut self.interactive_resize, col);
+        self.data[col_idx].update(col);
     }
 
     /// Uses the same native maximized area for stored windows and normal columns.
@@ -2724,23 +2757,13 @@ impl<W: LayoutElement> ScrollingSpace<W> {
             return;
         }
 
-        let (col, tile_idx) = if let Some(window) = window {
-            self.columns
-                .iter_mut()
-                .find_map(|col| {
-                    col.tiles
-                        .iter()
-                        .position(|tile| tile.window().id() == window)
-                        .map(|tile_idx| (col, Some(tile_idx)))
-                })
-                .unwrap()
-        } else {
-            (&mut self.columns[self.active_column_idx], None)
-        };
+        let (col_idx, tile_idx) = self.column_and_tile_idx(window);
+        let col = &mut self.columns[col_idx];
 
         col.set_window_height(change, tile_idx, true);
 
         cancel_resize_for_column(&mut self.interactive_resize, col);
+        self.data[col_idx].update(col);
     }
 
     pub fn reset_window_height(&mut self, window: Option<&W::Id>) {
@@ -2748,23 +2771,13 @@ impl<W: LayoutElement> ScrollingSpace<W> {
             return;
         }
 
-        let (col, tile_idx) = if let Some(window) = window {
-            self.columns
-                .iter_mut()
-                .find_map(|col| {
-                    col.tiles
-                        .iter()
-                        .position(|tile| tile.window().id() == window)
-                        .map(|tile_idx| (col, Some(tile_idx)))
-                })
-                .unwrap()
-        } else {
-            (&mut self.columns[self.active_column_idx], None)
-        };
+        let (col_idx, tile_idx) = self.column_and_tile_idx(window);
+        let col = &mut self.columns[col_idx];
 
         col.reset_window_height(tile_idx);
 
         cancel_resize_for_column(&mut self.interactive_resize, col);
+        self.data[col_idx].update(col);
     }
 
     pub fn toggle_window_width(&mut self, window: Option<&W::Id>, forwards: bool) {
@@ -2772,23 +2785,13 @@ impl<W: LayoutElement> ScrollingSpace<W> {
             return;
         }
 
-        let (col, tile_idx) = if let Some(window) = window {
-            self.columns
-                .iter_mut()
-                .find_map(|col| {
-                    col.tiles
-                        .iter()
-                        .position(|tile| tile.window().id() == window)
-                        .map(|tile_idx| (col, Some(tile_idx)))
-                })
-                .unwrap()
-        } else {
-            (&mut self.columns[self.active_column_idx], None)
-        };
+        let (col_idx, tile_idx) = self.column_and_tile_idx(window);
+        let col = &mut self.columns[col_idx];
 
         col.toggle_width(tile_idx, forwards);
 
         cancel_resize_for_column(&mut self.interactive_resize, col);
+        self.data[col_idx].update(col);
     }
 
     pub fn toggle_window_height(&mut self, window: Option<&W::Id>, forwards: bool) {
@@ -2796,23 +2799,13 @@ impl<W: LayoutElement> ScrollingSpace<W> {
             return;
         }
 
-        let (col, tile_idx) = if let Some(window) = window {
-            self.columns
-                .iter_mut()
-                .find_map(|col| {
-                    col.tiles
-                        .iter()
-                        .position(|tile| tile.window().id() == window)
-                        .map(|tile_idx| (col, Some(tile_idx)))
-                })
-                .unwrap()
-        } else {
-            (&mut self.columns[self.active_column_idx], None)
-        };
+        let (col_idx, tile_idx) = self.column_and_tile_idx(window);
+        let col = &mut self.columns[col_idx];
 
         col.toggle_window_height(tile_idx, forwards);
 
         cancel_resize_for_column(&mut self.interactive_resize, col);
+        self.data[col_idx].update(col);
     }
 
     pub fn expand_column_to_available_width(&mut self) {
@@ -2896,6 +2889,7 @@ impl<W: LayoutElement> ScrollingSpace<W> {
             // about to set its width to 100% of the working area. Let's do it via
             // toggle_full_width() as it lets you back out of it more intuitively.
             col.toggle_full_width();
+            self.data[self.active_column_idx].update(col);
             return;
         }
 
@@ -2904,6 +2898,7 @@ impl<W: LayoutElement> ScrollingSpace<W> {
         col.preset_width_idx = None;
         col.is_full_width = false;
         col.update_tile_sizes(true);
+        self.data[self.active_column_idx].update(col);
 
         // Put the leftmost window into the view.
         let new_view_x = leftmost_col_x.unwrap() - gap - working_x;
@@ -3623,7 +3618,11 @@ impl<W: LayoutElement> ScrollingSpace<W> {
             .find(|tile| tile.window().id() == &window)
             .unwrap();
 
-        let original_window_size = tile.window_size();
+        let original_window_size = if tile.is_spine() {
+            tile.tile_size()
+        } else {
+            tile.window_size()
+        };
 
         let resize = InteractiveResize {
             window,
@@ -3652,11 +3651,8 @@ impl<W: LayoutElement> ScrollingSpace<W> {
 
         let is_centering = self.is_centering_focused_column();
 
-        let col = self
-            .columns
-            .iter_mut()
-            .find(|col| col.contains(window))
-            .unwrap();
+        let (col_idx, _) = self.column_and_tile_idx(Some(window));
+        let col = &mut self.columns[col_idx];
 
         let tile_idx = col
             .tiles
@@ -3695,6 +3691,7 @@ impl<W: LayoutElement> ScrollingSpace<W> {
             }
         }
 
+        self.data[col_idx].update(col);
         true
     }
 
@@ -3756,6 +3753,7 @@ impl<W: LayoutElement> ScrollingSpace<W> {
             };
 
             for (tile_idx, tile) in col.tiles.iter_mut().enumerate() {
+                let is_spine = tile.is_spine();
                 let win = tile.window_mut();
 
                 let active_in_column = col.active_tile_idx == tile_idx;
@@ -3770,7 +3768,7 @@ impl<W: LayoutElement> ScrollingSpace<W> {
                     // animations when switching tabs.
                     active &= active_in_column || is_tabbed;
                 }
-                win.set_activated(active);
+                win.set_activated(active && !is_spine);
 
                 win.set_interactive_resize(col_resize_data);
 
@@ -4913,23 +4911,41 @@ impl<W: LayoutElement> Column<W> {
 
     fn focus_index(&mut self, index: u8) {
         let idx = min(usize::from(index.saturating_sub(1)), self.tiles.len() - 1);
-        self.activate_idx(idx);
+        let target = (idx..self.tiles.len())
+            .chain((0..idx).rev())
+            .find(|idx| !self.tiles[*idx].is_spine());
+        if let Some(idx) = target {
+            self.activate_idx(idx);
+        }
     }
 
     fn focus_up(&mut self) -> bool {
-        self.activate_idx(self.active_tile_idx.saturating_sub(1))
+        (0..self.active_tile_idx)
+            .rev()
+            .find(|idx| !self.tiles[*idx].is_spine())
+            .is_some_and(|idx| self.activate_idx(idx))
     }
 
     fn focus_down(&mut self) -> bool {
-        self.activate_idx(min(self.active_tile_idx + 1, self.tiles.len() - 1))
+        (self.active_tile_idx + 1..self.tiles.len())
+            .find(|idx| !self.tiles[*idx].is_spine())
+            .is_some_and(|idx| self.activate_idx(idx))
     }
 
     fn focus_top(&mut self) {
-        self.activate_idx(0);
+        if let Some(idx) = self.tiles.iter().position(|tile| !tile.is_spine()) {
+            self.activate_idx(idx);
+        }
     }
 
     fn focus_bottom(&mut self) {
-        self.activate_idx(self.tiles.len() - 1);
+        if let Some(idx) = self.tiles.iter().rposition(|tile| !tile.is_spine()) {
+            self.activate_idx(idx);
+        }
+    }
+
+    fn has_normal_window(&self) -> bool {
+        self.tiles.iter().any(|tile| !tile.is_spine())
     }
 
     fn move_up(&mut self) -> bool {
@@ -4992,7 +5008,11 @@ impl<W: LayoutElement> Column<W> {
             (idx + if forwards { 1 } else { len - 1 }) % len
         } else {
             let tile = &self.tiles[tile_idx];
-            let current_window = tile.window_expected_or_current_size().w;
+            let current_window = if tile.is_spine() {
+                tile.tile_expected_or_current_size().w
+            } else {
+                tile.window_expected_or_current_size().w
+            };
             let current_tile = tile.tile_expected_or_current_size().w;
 
             let mut it = self
@@ -5111,7 +5131,13 @@ impl<W: LayoutElement> Column<W> {
         let current = self.data[tile_idx].height;
         let tile = &self.tiles[tile_idx];
         let current_window_px = match current {
-            WindowHeight::Auto { .. } | WindowHeight::Preset(_) => tile.window_size().h,
+            WindowHeight::Auto { .. } | WindowHeight::Preset(_) => {
+                if tile.is_spine() {
+                    tile.tile_size().h
+                } else {
+                    tile.window_size().h
+                }
+            }
             WindowHeight::Fixed(height) => height,
         };
         let current_tile_px = tile.tile_height_for_window_height(current_window_px);
@@ -5167,15 +5193,21 @@ impl<W: LayoutElement> Column<W> {
         window_height = f64::min(height_left, window_height);
 
         // Clamp it against the window height constraints.
-        let win = &self.tiles[tile_idx].window();
-        let min_h = win.min_size().h;
-        let max_h = win.max_size().h;
+        let (min_h, max_h) = if tile.is_spine() {
+            (
+                tile.min_size_nonfullscreen().h,
+                tile.max_size_nonfullscreen().h,
+            )
+        } else {
+            let win = tile.window();
+            (f64::from(win.min_size().h), f64::from(win.max_size().h))
+        };
 
-        if max_h > 0 {
-            window_height = f64::min(window_height, f64::from(max_h));
+        if max_h > 0. {
+            window_height = f64::min(window_height, max_h);
         }
-        if min_h > 0 {
-            window_height = f64::max(window_height, f64::from(min_h));
+        if min_h > 0. {
+            window_height = f64::max(window_height, min_h);
         }
 
         self.data[tile_idx].height = WindowHeight::Fixed(window_height.clamp(1., MAX_PX));

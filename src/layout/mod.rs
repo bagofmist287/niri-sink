@@ -1540,7 +1540,7 @@ impl<W: LayoutElement> Layout<W> {
     }
 
     pub fn should_trigger_focus_follows_mouse_on(&self, window: &W::Id) -> bool {
-        if self.sink_depth(window).is_some() {
+        if self.sink_depth(window).is_some() || self.is_spine(window) {
             return false;
         }
         // During an animation, it's easy to trigger focus-follows-mouse on the previous workspace,
@@ -1660,6 +1660,19 @@ impl<W: LayoutElement> Layout<W> {
         };
 
         Some(&monitors[*active_monitor_idx].output)
+    }
+
+    /// Form query that includes the temporary native owner during a move.
+    pub fn is_spine(&self, id: &W::Id) -> bool {
+        if let Some(InteractiveMoveState::Moving(move_)) = &self.interactive_move {
+            if move_.tile.window().id() == id {
+                return move_.tile.is_spine();
+            }
+        }
+        self.workspaces()
+            .flat_map(|(_, _, ws)| ws.tiles())
+            .find(|tile| tile.window().id() == id)
+            .is_some_and(Tile::is_spine)
     }
 
     /// Depth in the workspace-local Sink stack; zero is the current top.
@@ -2407,7 +2420,7 @@ impl<W: LayoutElement> Layout<W> {
 
     pub fn focus_with_output(&self) -> Option<(&W, &Output)> {
         if let Some(InteractiveMoveState::Moving(move_)) = &self.interactive_move {
-            return Some((move_.tile.window(), &move_.output));
+            return (!move_.tile.is_spine()).then_some((move_.tile.window(), &move_.output));
         }
 
         let MonitorSet::Normal {
@@ -4991,11 +5004,12 @@ impl<W: LayoutElement> Layout<W> {
         let mut ongoing_scrolling_dnd = self.dnd.is_some().then_some(true);
 
         if let Some(InteractiveMoveState::Moving(move_)) = &mut self.interactive_move {
+            let is_spine = move_.tile.is_spine();
             let win = move_.tile.window_mut();
 
             win.set_active_in_column(true);
             win.set_floating(move_.is_floating);
-            win.set_activated(true);
+            win.set_activated(!is_spine);
 
             win.set_interactive_resize(None);
 

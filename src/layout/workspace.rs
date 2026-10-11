@@ -797,7 +797,9 @@ impl<W: LayoutElement> Workspace<W> {
         let window = self.selected_window()?;
         self.tiles_with_render_positions()
             .find(|(tile, _, _)| tile.window().id() == window.id())
-            .filter(|(tile, _, _)| !tile.sink_input_blocked() && !tile.sink_focus_cancelled)
+            .filter(|(tile, _, _)| {
+                !tile.is_spine() && !tile.sink_input_blocked() && !tile.sink_focus_cancelled
+            })
             .map(|(tile, _, _)| tile.window())
     }
 
@@ -1181,7 +1183,7 @@ impl<W: LayoutElement> Workspace<W> {
         else {
             return false;
         };
-        if tile.window().interactive_resize_data().is_some() {
+        if tile.is_spine() || tile.window().interactive_resize_data().is_some() {
             return false;
         }
         let height = self.scrolling.window_height(id);
@@ -2142,19 +2144,13 @@ impl<W: LayoutElement> Workspace<W> {
     }
 
     pub fn switch_focus_floating_tiling(&mut self) {
-        if self.floating.is_empty() {
-            // If floating is empty, keep focus on scrolling.
-            return;
-        } else if self.scrolling.is_empty() {
-            // If floating isn't empty but scrolling is, keep focus on floating.
-            return;
+        if self.floating_is_active.get() {
+            if self.scrolling.focus_normal_window() {
+                self.floating_is_active = FloatingActive::No;
+            }
+        } else if self.floating.focus_normal_window() {
+            self.floating_is_active = FloatingActive::Yes;
         }
-
-        self.floating_is_active = if self.floating_is_active.get() {
-            FloatingActive::No
-        } else {
-            FloatingActive::Yes
-        };
     }
 
     pub fn move_floating_window(
