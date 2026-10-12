@@ -60,6 +60,8 @@ pub struct Tile<W: LayoutElement> {
     spine_ui: Spine,
     spine_visual_active: bool,
     shrink_preview: Option<ShrinkPreview>,
+    /// Ephemeral presentation of the current insertion, independent of its input barrier.
+    normal_restore_presentation: Option<NormalRestorePresentation>,
     /// Current-slot allocation while the original client catches up, never a restore history.
     normal_restore: Option<NormalSizePlan>,
     /// Container origin at batch insertion, retained through a subsequent pending mode change.
@@ -167,6 +169,25 @@ pub type TileRenderSnapshot =
     RenderSnapshot<TileRenderElement<GlesRenderer>, TileRenderElement<GlesRenderer>>;
 
 #[derive(Debug)]
+struct NormalRestorePresentation {
+    ghost: ShrinkPreview,
+    // None while waiting for the existing protocol barrier, Some after it releases.
+    reveal: Option<Animation>,
+}
+
+impl NormalRestorePresentation {
+    fn ghost_alpha(&self) -> f32 {
+        self.reveal
+            .as_ref()
+            .map_or(1., |anim| (1. - anim.clamped_value().clamp(0., 1.)) as f32)
+    }
+
+    fn is_animating(&self) -> bool {
+        self.ghost.is_animating() || self.reveal.as_ref().is_some_and(|anim| !anim.is_done())
+    }
+}
+
+#[derive(Debug)]
 struct ResizeAnimation {
     anim: Animation,
     size_from: Size<f64, Logical>,
@@ -230,6 +251,7 @@ impl<W: LayoutElement> Tile<W> {
             spine_ui: Spine::default(),
             spine_visual_active: false,
             shrink_preview: None,
+            normal_restore_presentation: None,
             normal_restore: None,
             normal_restore_origin_mode: SizingMode::Normal,
             normal_restore_deadline: None,
@@ -297,6 +319,11 @@ impl<W: LayoutElement> Tile<W> {
         self.view_size = view_size;
         self.scale = scale;
         self.options = options;
+        if (!self.options.shrink_expand.animate || self.options.animations.off)
+            && self.normal_restore.is_none()
+        {
+            self.normal_restore_presentation = None;
+        }
 
         self.update_decoration_config();
 
@@ -361,6 +388,19 @@ impl<W: LayoutElement> Tile<W> {
             self.normal_restore = None;
             self.normal_restore_deadline = None;
             self.window.finish_normal_restore();
+            if self.options.shrink_expand.animate && !self.options.animations.off {
+                if let Some(presentation) = &mut self.normal_restore_presentation {
+                    presentation.reveal = Some(Animation::new(
+                        self.clock.clone(),
+                        0.,
+                        1.,
+                        0.,
+                        self.options.animations.window_resize.anim,
+                    ));
+                }
+            } else {
+                self.normal_restore_presentation = None;
+            }
         }
 
         if self.is_spine() {
@@ -506,6 +546,12 @@ impl<W: LayoutElement> Tile<W> {
         if let Some(preview) = &mut self.shrink_preview {
             preview.advance();
         }
+        if let Some(presentation) = &mut self.normal_restore_presentation {
+            presentation.ghost.advance();
+            if presentation.reveal.as_ref().is_some_and(Animation::is_done) {
+                self.normal_restore_presentation = None;
+            }
+        }
         if let Some(presentation) = &mut self.sink_overview_presentation {
             presentation.advance();
         }
@@ -619,6 +665,10 @@ impl<W: LayoutElement> Tile<W> {
         self.shrink_preview
             .as_ref()
             .is_some_and(ShrinkPreview::is_animating)
+            || self
+                .normal_restore_presentation
+                .as_ref()
+                .is_some_and(NormalRestorePresentation::is_animating)
             || self
                 .sink_overview_presentation
                 .as_ref()
@@ -747,6 +797,27 @@ impl<W: LayoutElement> Tile<W> {
                     .spine
                     .resolve(false, self.window.is_urgent(), ring, border);
             preview.update(gradient, self.window.geometry_corner_radius(), self.scale);
+        }
+        if let Some(presentation) = &mut self.normal_restore_presentation {
+            presentation.ghost.retarget(
+                animated_tile_size,
+                self.options.animations.window_resize.anim,
+                self.options.shrink_expand.animate && !self.options.animations.off,
+            );
+            let border = self.options.layout.border.merged_with(&rules.border);
+            let ring = self
+                .options
+                .layout
+                .focus_ring
+                .merged_with(&rules.focus_ring);
+            let gradient =
+                self.options
+                    .layout
+                    .spine
+                    .resolve(false, self.window.is_urgent(), ring, border);
+            presentation
+                .ghost
+                .update(gradient, self.window.geometry_corner_radius(), self.scale);
         }
         if let Some(spine) = self.spine {
             let border = self.options.layout.border.merged_with(&rules.border);
@@ -943,6 +1014,7 @@ impl<W: LayoutElement> Tile<W> {
         };
         self.spine = Some(spine);
         self.shrink_preview = None;
+        self.normal_restore_presentation = None;
         self.spine_ui.clear();
         self.spine_visual_active = false;
         self.unmap_snapshot = None;
@@ -1016,9 +1088,19 @@ impl<W: LayoutElement> Tile<W> {
 
     /// Batch form update, before any member is configured. The caller owns the slot snapshot.
     pub(super) fn prepare_normal_restore(&mut self, plan: NormalSizePlan) -> bool {
-        if self.spine.take().is_none() {
+        let Some(spine) = self.spine.take() else {
             return false;
-        }
+        };
+        let mut ghost = ShrinkPreview::new(self.clock.clone(), spine.outer_size());
+        ghost.retarget(
+            plan.allocation,
+            self.options.animations.window_resize.anim,
+            self.options.shrink_expand.animate && !self.options.animations.off,
+        );
+        self.normal_restore_presentation = Some(NormalRestorePresentation {
+            ghost,
+            reveal: None,
+        });
         self.spine_ui.clear();
         self.spine_visual_active = false;
         self.unmap_snapshot = None;
@@ -1027,6 +1109,12 @@ impl<W: LayoutElement> Tile<W> {
         self.normal_restore_focus_cancelled = true;
         self.resize_animation = None;
         true
+    }
+
+    pub(super) fn set_normal_restore_anchor(&mut self, anchor: Point<f64, Logical>) {
+        if let Some(presentation) = &mut self.normal_restore_presentation {
+            presentation.ghost.set_anchor(anchor);
+        }
     }
 
     pub(super) fn submit_normal_restore(
@@ -1951,13 +2039,74 @@ impl<W: LayoutElement> Tile<W> {
         let mut pushed = false;
         // Capture passes must not replace the output's presentation-feedback mapping.
         // render_inner may also write this slot while rendering a native resize animation.
-        let capture_slot = (self.shrink_preview.is_some() && ctx.target != RenderTarget::Output)
+        let capture_slot = ((self.shrink_preview.is_some()
+            || self.normal_restore_presentation.is_some())
+            && ctx.target != RenderTarget::Output)
             .then(|| self.window.offscreen_data_slot())
             .flatten();
         let output_data = capture_slot
             .as_ref()
             .and_then(|slot| slot.borrow_mut().take());
         self.window().set_offscreen_data(None);
+
+        if let Some(presentation) = &self.normal_restore_presentation {
+            let blocked = ctx
+                .target
+                .should_block_out(self.window.rules().block_out_from);
+            let alpha = if self.window.is_ignoring_opacity_window_rule() {
+                1.
+            } else {
+                self.window.rules().opacity.unwrap_or(1.).clamp(0., 1.)
+            };
+            presentation.ghost.render(
+                ctx.renderer,
+                location + self.bob_offset() + presentation.ghost.offset(self.animated_tile_size()),
+                blocked,
+                alpha * tile_alpha * presentation.ghost_alpha(),
+                &mut |elem| push(elem.into()),
+            );
+            // No old client or popup is sampled while the original barrier is pending,
+            // even if the configured fill is translucent.
+            if self.normal_restore.is_some() {
+                if let Some(slot) = &capture_slot {
+                    *slot.borrow_mut() = output_data;
+                }
+                return;
+            }
+            let mut gles = ctx.as_gles();
+            let mut elements = Vec::new();
+            self.render_inner(
+                gles.r(),
+                Point::new(0., 0.),
+                xray_pos,
+                focus_ring,
+                &mut |elem| elements.push(elem),
+            );
+            if let Ok((elem, _sync, data)) =
+                presentation
+                    .ghost
+                    .offscreen(gles.target)
+                    .render(gles.renderer, scale, &elements)
+            {
+                let offset = elem.offset();
+                if let Some(slot) = &capture_slot {
+                    *slot.borrow_mut() = output_data;
+                } else {
+                    self.window().set_offscreen_data(Some(data));
+                }
+                push(
+                    elem.with_alpha(tile_alpha * (1. - presentation.ghost_alpha()))
+                        .with_offset(location + offset)
+                        .into(),
+                );
+                return;
+            }
+            if let Some(slot) = &capture_slot {
+                *slot.borrow_mut() = output_data;
+            }
+            // An allocation failure must not bypass the reveal with an opaque old buffer.
+            return;
+        }
 
         if let Some(preview) = &self.shrink_preview {
             let mut ctx = ctx.as_gles();

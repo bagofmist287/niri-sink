@@ -33,6 +33,66 @@ fn pending_normal_resize_client_choice_keeps_positive_allocation() {
 }
 
 #[test]
+fn normal_restore_visual_clock_does_not_control_protocol_or_input_barrier() {
+    for deadline_release in [false, true] {
+        let mut options = Options::default();
+        options.animations.window_resize.anim = niri_config::Animation {
+            off: false,
+            kind: niri_config::animations::Kind::Easing(niri_config::animations::EasingParams {
+                duration_ms: 100,
+                curve: niri_config::animations::Curve::Linear,
+            }),
+        };
+        let mut params = TestWindowParams::new(1);
+        params.bbox = Rectangle::from_size((300, 200).into());
+        let client = TestWindow::new(params);
+        let mut clock = Clock::with_time(Duration::ZERO);
+        let mut tile = Tile::new(
+            client.clone(),
+            (1280., 720.).into(),
+            1.,
+            clock.clone(),
+            Rc::new(options),
+        );
+        assert!(tile.set_spine(ShrinkAxis::Horizontal, 40.));
+        let plan = crate::layout::shrink_expand::NormalSizePlan {
+            allocation: tile.normal_tile_size_for_window_size((600, 400).into()),
+            client_size: (600, 400).into(),
+            sizing_mode: SizingMode::Normal,
+        };
+        assert!(tile.prepare_normal_restore(plan));
+        tile.submit_normal_restore(false, Transaction::new(), false);
+        let deadline = client.normal_restore_deadline();
+        assert!(tile.are_transitions_ongoing());
+        clock.set_unadjusted(Duration::from_millis(200));
+        tile.advance_animations();
+        assert!(!tile.are_transitions_ongoing());
+        assert!(tile.normal_restore_input_blocked());
+        assert_eq!(tile.tile_size(), plan.allocation);
+        assert_eq!(client.normal_restore_deadline(), deadline);
+        if deadline_release {
+            client
+                .0
+                .normal_restore_deadline
+                .set(Some(std::time::Instant::now()));
+        } else {
+            assert!(client.communicate());
+        }
+        tile.update_window();
+        assert!(!tile.normal_restore_input_blocked());
+        assert!(tile.are_transitions_ongoing());
+        assert_eq!(client.normal_restore_deadline(), None);
+        clock.set_unadjusted(Duration::from_millis(400));
+        tile.advance_animations();
+        assert!(!tile.are_transitions_ongoing());
+        // A later native resize must retain its own protocol/animation behavior.
+        tile.request_normal_resize_once((650, 450).into(), false);
+        assert_eq!(client.requested_size(), Some((650, 450).into()));
+        assert!(!tile.normal_restore_input_blocked());
+    }
+}
+
+#[test]
 fn disable_restore_all_workspaces_in_one_batch_keeps_slots_and_focus() {
     for all_books in [false, true] {
         for no_outputs in [false, true] {
@@ -2252,6 +2312,203 @@ fn spine_test_renderer() -> smithay::backend::renderer::gles::GlesRenderer {
     resources::init(&mut renderer);
     shaders::init(&mut renderer);
     renderer
+}
+
+#[test]
+#[ignore = "requires an explicit software EGL restoration rendering run"]
+fn normal_restore_presentation_hides_stale_content_and_releases_without_input_delay() {
+    use crate::layout::shrink_expand::NormalSizePlan;
+    use crate::render_helpers::solid_color::SolidColorBuffer;
+    use crate::render_helpers::{render_and_download, RenderTarget};
+    use smithay::backend::allocator::Fourcc;
+    use smithay::backend::renderer::ExportMem as _;
+    let mut renderer = spine_test_renderer();
+    for scale in [1., 1.25] {
+        for axis in [ShrinkAxis::Horizontal, ShrinkAxis::Vertical] {
+            for animate in [false, true] {
+                let mut options = Options::default();
+                options.layout.border.off = true;
+                options.layout.focus_ring.off = true;
+                options.layout.spine.inactive =
+                    niri_config::SpinePaint::Solid(niri_config::Color::from_array_unpremul([
+                        1., 0., 0., 0.5,
+                    ]));
+                options.shrink_expand.animate = animate;
+                options.animations.window_resize.anim = niri_config::Animation {
+                    off: false,
+                    kind: niri_config::animations::Kind::Easing(
+                        niri_config::animations::EasingParams {
+                            duration_ms: 200,
+                            curve: niri_config::animations::Curve::Linear,
+                        },
+                    ),
+                };
+                let mut params = TestWindowParams::new(1);
+                params.bbox = Rectangle::from_size((120, 80).into());
+                params.rules = Some(ResolvedWindowRules {
+                    block_out_from: Some(niri_config::BlockOutFrom::ScreenCapture),
+                    ..Default::default()
+                });
+                let client = TestWindow::new(params);
+                *client.0.render_solid.borrow_mut() =
+                    Some(SolidColorBuffer::new((240., 160.), [0., 1., 0., 1.]));
+                *client.0.render_solid_blocked.borrow_mut() =
+                    Some(SolidColorBuffer::new((240., 160.), [0., 0., 0., 1.]));
+                let mut clock = Clock::with_time(Duration::ZERO);
+                let mut tile = Tile::new(
+                    client.clone(),
+                    (1280., 720.).into(),
+                    scale,
+                    clock.clone(),
+                    Rc::new(options),
+                );
+                assert!(tile.set_spine(axis, 40.));
+                let book_size = tile.tile_size();
+                let plan = NormalSizePlan {
+                    allocation: (240., 160.).into(),
+                    client_size: (240, 160).into(),
+                    sizing_mode: SizingMode::Normal,
+                };
+                assert!(tile.prepare_normal_restore(plan));
+                tile.set_normal_restore_anchor((1., 1.).into());
+                let transaction = Transaction::new();
+                let deadline = transaction.deadline();
+                tile.submit_normal_restore(false, transaction, false);
+                tile.update_render_elements(false, Rectangle::from_size((1280., 720.).into()));
+                let collect = |tile: &Tile<TestWindow>, renderer: &mut _, target| {
+                    let mut elements = Vec::new();
+                    tile.render(
+                        RenderCtx {
+                            renderer,
+                            target,
+                            xray: None,
+                        },
+                        (0., 0.).into(),
+                        XrayPos::default(),
+                        false,
+                        &mut |elem| elements.push(elem),
+                    );
+                    elements
+                };
+                let initial = collect(&tile, &mut renderer, RenderTarget::Output);
+                let physical = plan.allocation.to_physical_precise_round(scale);
+                let download = render_and_download(
+                    &mut renderer,
+                    physical,
+                    Scale::from(scale),
+                    Transform::Normal,
+                    Fourcc::Abgr8888,
+                    initial.into_iter().rev(),
+                )
+                .unwrap();
+                let pixels = renderer.map_texture(&download).unwrap();
+                // Growing from a left/top resize retains the bottom/right edge.
+                let x = (5. * scale) as usize;
+                let y = (5. * scale) as usize;
+                let corner = &pixels[(y * physical.w as usize + x) * 4..][..4];
+                if animate {
+                    assert_eq!(corner, [0, 0, 0, 0]);
+                }
+                let x = ((plan.allocation.w - book_size.w / 2.) * scale) as usize;
+                let y = ((plan.allocation.h - book_size.h / 2.) * scale) as usize;
+                let p = &pixels[(y * physical.w as usize + x) * 4..][..4];
+                assert!(
+                    p[0].abs_diff(128) <= 1 && p[1] == 0 && p[3].abs_diff(128) <= 1,
+                    "{p:?}"
+                );
+                assert_eq!(client.0.render_normal_calls.get(), 0);
+                assert_eq!(client.0.render_popup_calls.get(), 0);
+                assert!(tile.normal_restore_input_blocked());
+                assert_eq!(client.normal_restore_deadline(), Some(deadline));
+                // Completing the visual motion cannot release the protocol barrier.
+                clock.set_unadjusted(Duration::from_millis(250));
+                tile.advance_animations();
+                tile.update_render_elements(false, Rectangle::from_size((1280., 720.).into()));
+                let waiting = collect(&tile, &mut renderer, RenderTarget::Output);
+                assert!(tile.normal_restore_input_blocked());
+                assert_eq!(tile.tile_size(), plan.allocation);
+                assert_eq!(client.0.render_normal_calls.get(), 0);
+                drop(waiting);
+                assert!(client.communicate());
+                tile.update_window();
+                assert!(!tile.normal_restore_input_blocked());
+                assert_eq!(client.normal_restore_deadline(), None);
+                clock.set_unadjusted(Duration::from_millis(350));
+                tile.advance_animations();
+                tile.update_render_elements(false, Rectangle::from_size((1280., 720.).into()));
+                let output = collect(&tile, &mut renderer, RenderTarget::Output);
+                let feedback = client
+                    .0
+                    .offscreen_data
+                    .borrow()
+                    .as_ref()
+                    .map(|data| data.id.clone());
+                let capture = collect(&tile, &mut renderer, RenderTarget::ScreenCapture);
+                if animate {
+                    assert!(feedback.is_some());
+                    assert_eq!(
+                        client
+                            .0
+                            .offscreen_data
+                            .borrow()
+                            .as_ref()
+                            .map(|data| data.id.clone()),
+                        feedback
+                    );
+                }
+                let download = render_and_download(
+                    &mut renderer,
+                    physical,
+                    Scale::from(scale),
+                    Transform::Normal,
+                    Fourcc::Abgr8888,
+                    output.into_iter().rev(),
+                )
+                .unwrap();
+                let pixels = renderer.map_texture(&download).unwrap();
+                assert!(
+                    pixels.chunks_exact(4).all(|p| p[1] > 0),
+                    "ready contents must be visible"
+                );
+                if animate {
+                    assert!(pixels.chunks_exact(4).all(|p| p[0] > 0 && p[1] < 255));
+                }
+                let download = render_and_download(
+                    &mut renderer,
+                    physical,
+                    Scale::from(scale),
+                    Transform::Normal,
+                    Fourcc::Abgr8888,
+                    capture.into_iter().rev(),
+                )
+                .unwrap();
+                assert!(renderer
+                    .map_texture(&download)
+                    .unwrap()
+                    .chunks_exact(4)
+                    .all(|p| p[0] == 0 && p[1] == 0 && p[2] == 0));
+                clock.set_unadjusted(Duration::from_millis(500));
+                tile.advance_animations();
+                assert!(!tile.are_transitions_ongoing());
+                let settled = collect(&tile, &mut renderer, RenderTarget::Output);
+                assert!(client.0.offscreen_data.borrow().is_none());
+                let download = render_and_download(
+                    &mut renderer,
+                    physical,
+                    Scale::from(scale),
+                    Transform::Normal,
+                    Fourcc::Abgr8888,
+                    settled.into_iter().rev(),
+                )
+                .unwrap();
+                assert!(renderer
+                    .map_texture(&download)
+                    .unwrap()
+                    .chunks_exact(4)
+                    .all(|p| p == [0, 255, 0, 255]));
+            }
+        }
+    }
 }
 
 #[test]

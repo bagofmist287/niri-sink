@@ -957,6 +957,12 @@ impl<W: LayoutElement> Workspace<W> {
         if !tile.prepare_normal_restore(plan) {
             return false;
         }
+        if floating {
+            tile.set_normal_restore_anchor(Point::from((
+                if intent.gain.x < 0. { 1. } else { 0. },
+                if intent.gain.y < 0. { 1. } else { 0. },
+            )));
+        }
         let transaction = Transaction::new();
         if floating {
             self.floating

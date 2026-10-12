@@ -50,6 +50,11 @@ impl ShrinkPreview {
         animate: bool,
     ) -> bool {
         if self.to == to {
+            if !animate && self.animation.is_some() {
+                self.from = to;
+                self.animation = None;
+                return true;
+            }
             return false;
         }
         self.from = self.pose();

@@ -2,7 +2,7 @@
 
 The `shrink/development` branch provides the five base commands below when
 `enabled true`, with independent spine rendering and compositor-owned hit regions.
-Adjacent selection and complete expansion visuals remain under development. This is a partial development candidate;
+Adjacent selection remains under development. This is a partial development candidate;
 the installed Sink session has not been replaced by this branch.
 
 ```kdl
@@ -159,8 +159,21 @@ expansion includes hidden tabs and floating spines in one transaction, preservin
 ordinary focus or the absence of focus. Submitted operation records distinguish
 Ready, Deadline and TargetsRemoved; a late commit does not rewrite a terminal
 result. These paths are tested with real Wayland fixtures and real IPC sockets.
-Complete expansion visuals and restoration of all workspaces on disable remain
-under development.
+Committed restoration has an independent visual transition. A pure-color shape
+grows from the current spine rectangle toward the native normal allocation. While
+the processed-commit barrier is pending, neither the old client nor its popups are
+sampled, including with translucent spine paint. Once the original commit/deadline
+barrier releases, content fades in while the shape fades out. Input and deferred
+focus follow the barrier, not the visual clock. Turning animation off preserves
+the barrier and shows content immediately when it releases. The shape follows live
+layout paint and the configured spine overrides; screen-capture block-out remains
+effective. Capture caches remain separate from output presentation feedback.
+
+The transition also applies to batch and disable restoration. Left/top floating
+edge restoration retains the opposite edge during the same resize grab. It stores
+only the current insertion's visual pose and drops its caches once the transition
+ends; it does not retain a pre-shrink size. Software EGL verifies pixels, fractional
+scale and capture isolation; this is not physical-device or nested-session evidence.
 
 ## Base commands and operation observation
 
