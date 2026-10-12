@@ -1070,6 +1070,10 @@ impl<W: LayoutElement> Tile<W> {
         self.normal_restore_focus_cancelled = false;
     }
 
+    pub(crate) fn cancel_normal_restore_focus(&mut self) {
+        self.normal_restore_focus_cancelled = true;
+    }
+
     pub fn is_normal_restoring(&self) -> bool {
         self.normal_restore_input_blocked()
     }

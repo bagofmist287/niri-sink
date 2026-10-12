@@ -252,6 +252,10 @@ pub trait LayoutElement {
     fn normal_restore_deadline(&self) -> Option<std::time::Instant> {
         None
     }
+    /// Distinguishes deadline release from a processed client response, including after cleanup.
+    fn normal_restore_timed_out(&self) -> bool {
+        false
+    }
 
     fn min_size(&self) -> Size<i32, Logical>;
     fn max_size(&self) -> Size<i32, Logical>;

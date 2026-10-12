@@ -1,5 +1,6 @@
 //! Seat operation coordination. Records contain identities/results, never layout history.
 mod runtime;
+pub(crate) use runtime::ExpandFocusLease;
 pub(crate) use runtime::PreviewLease;
 pub use runtime::Rejected;
 
@@ -13,6 +14,8 @@ pub enum Kind {
     ShrinkTimed(ShrinkAxis),
     ShrinkSpatial(ShrinkAxis),
     ExpandSelection,
+    ExpandDirect,
+    ExpandAll,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -73,6 +76,7 @@ pub enum TargetState {
     Removed,
     Waiting,
     Ready,
+    Deadline,
 }
 
 #[derive(Debug, Default)]
@@ -183,11 +187,43 @@ impl Coordinator {
         Some(record)
     }
 
+    /// Direct expansion has no selection preview. Called after native form/allocation submission.
+    pub fn submit_immediate(
+        &mut self,
+        workspace: u64,
+        targets: Vec<u64>,
+        kind: Kind,
+        deadline: Option<Instant>,
+    ) -> Record {
+        assert!(self.preview.is_none());
+        assert!(!targets.is_empty());
+        assert!(matches!(kind, Kind::ExpandDirect | Kind::ExpandAll));
+        self.next_id = self
+            .next_id
+            .checked_add(1)
+            .expect("operation IDs exhausted");
+        let record = Record {
+            id: self.next_id,
+            revision: 0,
+            workspace,
+            targets,
+            kind,
+            phase: Phase::Submitted,
+            reason: None,
+        };
+        self.submitted.push(Submitted {
+            record: record.clone(),
+            deadline,
+        });
+        record
+    }
+
     pub fn reconcile(&mut self, now: Instant, mut target_state: impl FnMut(u64) -> TargetState) {
         let mut pending = Vec::new();
         for mut submitted in std::mem::take(&mut self.submitted) {
             let mut alive = false;
             let mut waiting = false;
+            let mut degraded = false;
             for id in &submitted.record.targets {
                 match target_state(*id) {
                     TargetState::Removed => (),
@@ -196,12 +232,20 @@ impl Coordinator {
                         waiting = true;
                     }
                     TargetState::Ready => alive = true,
+                    TargetState::Deadline => {
+                        alive = true;
+                        degraded |= submitted.deadline.is_some();
+                    }
                 }
             }
             let reason = if !alive {
                 Some(FinishReason::TargetsRemoved)
             } else if !waiting {
-                Some(FinishReason::Ready)
+                Some(if degraded {
+                    FinishReason::Deadline
+                } else {
+                    FinishReason::Ready
+                })
             } else if submitted.deadline.is_some_and(|at| now >= at) {
                 Some(FinishReason::Deadline)
             } else {
@@ -229,7 +273,7 @@ impl Coordinator {
 
 fn deadline(kind: Kind, now: Instant, delay: Duration) -> Option<Instant> {
     match kind {
-        Kind::ShrinkSpatial(_) => None,
+        Kind::ShrinkSpatial(_) | Kind::ExpandDirect | Kind::ExpandAll => None,
         _ => Some(now + delay),
     }
 }

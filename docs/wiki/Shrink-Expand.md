@@ -117,3 +117,13 @@ and screenshot rendering use separate caches, and capture passes preserve the
 output's presentation-feedback mapping. CPU, Wayland fixture and software EGL
 checks cover these internal paths; public actions and mouse buffering remain
 under development.
+
+Internal direct and workspace-wide expansion now use the current native slot's
+normal size plan. Direct expansion selects that window, but waits for the
+processed surface commit or the original 300 ms deadline before client input.
+Navigation during that wait cancels the deferred focus handoff. Workspace-wide
+expansion includes hidden tabs and floating spines in one transaction, preserving
+ordinary focus or the absence of focus. Submitted operation records distinguish
+Ready, Deadline and TargetsRemoved; a late commit does not rewrite a terminal
+result. These paths are tested with real Wayland fixtures. They do not yet expose
+public commands, complete expansion visuals or restore all workspaces on disable.

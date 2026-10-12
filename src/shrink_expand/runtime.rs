@@ -1,6 +1,7 @@
 use std::time::{Duration, Instant};
 
 use calloop::timer::{TimeoutAction, Timer};
+use smithay::desktop::Window;
 use smithay::output::Output;
 
 use super::{Kind, Record, TargetState, Ticket};
@@ -15,6 +16,13 @@ pub(crate) struct PreviewLease {
     border: Option<f64>,
 }
 
+#[derive(Debug, Clone)]
+pub(crate) struct ExpandFocusLease {
+    window: Window,
+    workspace: u64,
+    output: Option<Output>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Rejected {
     Disabled,
@@ -24,6 +32,164 @@ pub enum Rejected {
 }
 
 impl State {
+    fn can_expand_spines(&self) -> bool {
+        self.can_recall_sink(false)
+            && !self.niri.screenshot_ui.is_open()
+            && !self.niri.exit_confirm_dialog.is_open()
+    }
+
+    /// Internal direct entry, sharing the current-slot allocator and protocol barrier.
+    #[doc(hidden)]
+    pub fn expand_spine_window(&mut self, id: u64) -> Result<Option<Record>, Rejected> {
+        if !self.niri.config.borrow().shrink_expand.enabled {
+            return Err(Rejected::Disabled);
+        }
+        if self.niri.shrink_expand.preview().is_some() {
+            return Ok(self.cancel_shrink_expand_preview());
+        }
+        if !self.can_expand_spines() {
+            return Err(Rejected::Blocked);
+        }
+        let (_, target) = self
+            .niri
+            .layout
+            .windows()
+            .find(|(_, window)| window.id().get() == id)
+            .ok_or(Rejected::NoTarget)?;
+        let window = target.window.clone();
+        let workspace = self
+            .niri
+            .layout
+            .workspaces()
+            .find(|(_, _, ws)| ws.has_window(&window))
+            .ok_or(Rejected::NoTarget)?
+            .2
+            .id()
+            .get();
+        self.submit_spine_expansion(
+            workspace,
+            vec![window.clone()],
+            Kind::ExpandDirect,
+            Some(window),
+        )
+    }
+
+    /// One workspace snapshot; includes hidden tabs and floating spines without activating them.
+    #[doc(hidden)]
+    pub fn expand_all_spines(&mut self) -> Result<Option<Record>, Rejected> {
+        if !self.niri.config.borrow().shrink_expand.enabled {
+            return Err(Rejected::Disabled);
+        }
+        if self.niri.shrink_expand.preview().is_some() {
+            return Ok(self.cancel_shrink_expand_preview());
+        }
+        if !self.can_expand_spines() {
+            return Err(Rejected::Blocked);
+        }
+        let workspace = self
+            .niri
+            .layout
+            .active_workspace()
+            .ok_or(Rejected::NoTarget)?;
+        let id = workspace.id().get();
+        let windows = workspace
+            .tiles()
+            .filter(|tile| tile.is_spine())
+            .map(|tile| tile.window().window.clone())
+            .collect::<Vec<_>>();
+        self.submit_spine_expansion(id, windows, Kind::ExpandAll, None)
+    }
+
+    fn submit_spine_expansion(
+        &mut self,
+        workspace: u64,
+        windows: Vec<Window>,
+        kind: Kind,
+        focus: Option<Window>,
+    ) -> Result<Option<Record>, Rejected> {
+        let actual = self
+            .niri
+            .layout
+            .workspaces_mut()
+            .find(|ws| ws.id().get() == workspace)
+            .ok_or(Rejected::NoTarget)?
+            .restore_normal_spines(&windows);
+        if actual.is_empty() {
+            return Ok(None);
+        }
+        let targets = self
+            .niri
+            .layout
+            .windows()
+            .filter(|(_, w)| actual.contains(&w.window))
+            .map(|(_, w)| w.id().get())
+            .collect();
+        let deadline = self
+            .niri
+            .layout
+            .windows()
+            .filter(|(_, w)| actual.contains(&w.window))
+            .filter_map(|(_, w)| w.normal_restore_deadline())
+            .min();
+        let record = self
+            .niri
+            .shrink_expand
+            .submit_immediate(workspace, targets, kind, deadline);
+        if let Some(window) = focus {
+            self.cancel_expand_focus_lease();
+            self.niri.layout.activate_window(&window);
+            self.niri.shrink_expand_focus = Some(ExpandFocusLease {
+                window,
+                workspace,
+                output: self.niri.layout.active_output().cloned(),
+            });
+        }
+        self.refresh_shrink_expand_operations();
+        self.niri.queue_redraw_all();
+        Ok(Some(record))
+    }
+
+    fn cancel_expand_focus_lease(&mut self) {
+        if let Some(lease) = self.niri.shrink_expand_focus.take() {
+            if let Some(tile) = self
+                .niri
+                .layout
+                .workspaces_mut()
+                .flat_map(|ws| ws.tiles_mut())
+                .find(|tile| tile.window().window == lease.window)
+            {
+                tile.cancel_normal_restore_focus();
+            }
+        }
+    }
+
+    fn refresh_expand_focus_lease(&mut self) {
+        let Some(lease) = self.niri.shrink_expand_focus.as_ref() else {
+            return;
+        };
+        let valid = self.niri.config.borrow().shrink_expand.enabled
+            && self.can_expand_spines()
+            && self.niri.layout.active_output() == lease.output.as_ref()
+            && self.niri.layout.active_workspace().is_some_and(|ws| {
+                ws.id().get() == lease.workspace
+                    && ws
+                        .selected_window()
+                        .is_some_and(|w| w.window == lease.window)
+                    && !self.niri.layout.is_spine(&lease.window)
+            });
+        if !valid {
+            self.cancel_expand_focus_lease();
+        } else if self
+            .niri
+            .layout
+            .focus()
+            .is_some_and(|w| w.window == lease.window)
+        {
+            self.niri.shrink_expand_focus = None;
+            self.maybe_warp_cursor_to_focus();
+        }
+    }
+
     fn can_start_shrink_preview(&self) -> bool {
         self.can_recall_sink(false)
             && matches!(self.niri.keyboard_focus, KeyboardFocus::Layout { .. })
@@ -233,13 +399,16 @@ impl State {
         if self.niri.shrink_expand.preview().is_some() && !self.shrink_preview_valid() {
             self.cancel_shrink_expand_preview();
         }
+        self.refresh_expand_focus_lease();
         let layout = &self.niri.layout;
         self.niri.shrink_expand.reconcile(Instant::now(), |id| {
             let Some((_, window)) = layout.windows().find(|(_, window)| window.id().get() == id)
             else {
                 return TargetState::Removed;
             };
-            if window.normal_restore_deadline().is_some() {
+            if window.normal_restore_timed_out() {
+                TargetState::Deadline
+            } else if !window.normal_restore_ready() {
                 TargetState::Waiting
             } else {
                 TargetState::Ready

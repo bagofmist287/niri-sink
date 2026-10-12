@@ -89,6 +89,7 @@ pub struct Mapped {
     sink_input_barrier: Option<SinkInputBarrier>,
     /// Independent from Sink ownership/presentation; shared configure/commit semantics only.
     normal_restore_barrier: Option<SinkInputBarrier>,
+    normal_restore_timed_out: bool,
     sink_restoring: bool,
     pub(crate) sink_parent_input_blocked: bool,
 
@@ -294,6 +295,7 @@ impl Mapped {
             offscreen_data: Rc::new(RefCell::new(None)),
             sink_input_barrier: None,
             normal_restore_barrier: None,
+            normal_restore_timed_out: false,
             sink_restoring: false,
             sink_parent_input_blocked: false,
             is_urgent: false,
@@ -1005,10 +1007,22 @@ impl LayoutElement for Mapped {
     }
 
     fn begin_normal_restore(&mut self, deadline: Instant) {
+        if self
+            .normal_restore_barrier
+            .is_none_or(|b| b.deadline != deadline)
+        {
+            self.normal_restore_timed_out = false;
+        }
         self.normal_restore_barrier = self.restore_barrier(deadline);
+        if self.normal_restore_barrier.is_some() {
+            // A finite restore must publish its target even if the hidden client has not
+            // committed a previous size request. Keep ordinary resize throttling unchanged.
+            self.needs_configure = true;
+        }
     }
 
     fn finish_normal_restore(&mut self) {
+        self.normal_restore_timed_out = self.normal_restore_timed_out();
         self.normal_restore_barrier = None;
     }
 
@@ -1019,6 +1033,13 @@ impl LayoutElement for Mapped {
 
     fn normal_restore_deadline(&self) -> Option<Instant> {
         self.normal_restore_barrier.map(|b| b.deadline)
+    }
+
+    fn normal_restore_timed_out(&self) -> bool {
+        self.normal_restore_timed_out
+            || self
+                .normal_restore_barrier
+                .is_some_and(|b| b.degraded(Instant::now()))
     }
 
     fn min_size(&self) -> Size<i32, Logical> {
@@ -1586,6 +1607,7 @@ impl LayoutElement for Mapped {
             barrier.on_commit(commit_serial);
         }
         if let Some(barrier) = &mut self.normal_restore_barrier {
+            self.normal_restore_timed_out |= barrier.degraded(Instant::now());
             barrier.on_commit(commit_serial);
         }
         if let Some(InteractiveResize::WaitingForLastCommit { serial, .. }) =
