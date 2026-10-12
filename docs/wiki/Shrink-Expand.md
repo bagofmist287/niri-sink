@@ -88,3 +88,11 @@ icon resolution is still pending. Sensitive capture targets replace the inner
 fill and caption with black, including when an unblocked caption is cached.
 These checks use an explicit software EGL test, not the installed session or a
 physical input device. No user Shrink/Expand command is available yet.
+
+The layout now carries the parsed behavior settings through global configuration
+updates. Changing `thickness` reallocates existing internal spines in tiled,
+floating and native Moving ownership, without requesting that size from the
+hidden client. It also updates workspaces retained while no output is present.
+Paint-only updates preserve their current thickness. This does not yet enable
+user actions or implement `enabled false` restoration; operation coordination
+remains under development.

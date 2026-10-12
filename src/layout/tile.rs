@@ -286,6 +286,8 @@ impl<W: LayoutElement> Tile<W> {
             self.floating_preset_height_idx = None;
         }
 
+        let thickness_changed =
+            self.options.shrink_expand.thickness != options.shrink_expand.thickness;
         self.view_size = view_size;
         self.scale = scale;
         self.options = options;
@@ -296,7 +298,20 @@ impl<W: LayoutElement> Tile<W> {
 
         let border = self.effective_border_width().unwrap_or(0.);
         if let Some(spine) = &mut self.spine {
-            spine.allocate(spine.outer_size(), self.scale, border);
+            if thickness_changed {
+                // Keep the current slot and axis; reload is not a new Shrink operation.
+                if let Some(updated) = SpineGeometry::new(
+                    spine.axis,
+                    self.options.shrink_expand.thickness,
+                    spine.outer_size(),
+                    self.scale,
+                    border,
+                ) {
+                    *spine = updated;
+                }
+            } else {
+                spine.allocate(spine.outer_size(), self.scale, border);
+            }
         }
     }
 

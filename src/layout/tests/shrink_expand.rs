@@ -1479,6 +1479,177 @@ fn spine_hit_is_independent_of_client_input_and_preserves_body_and_edge_identity
 }
 
 #[test]
+fn shrink_behavior_reload_does_not_resize_or_defocus_normal_windows() {
+    for floating in [false, true] {
+        let mut layout = Layout::<TestWindow>::default();
+        Op::AddOutput(1).apply(&mut layout);
+        let mut params = TestWindowParams::new(1);
+        params.is_floating = floating;
+        Op::AddWindow { params }.apply(&mut layout);
+        Op::Communicate(1).apply(&mut layout);
+        layout.refresh(true);
+        let before = {
+            let tile = layout
+                .workspaces()
+                .flat_map(|(_, _, ws)| ws.tiles())
+                .next()
+                .unwrap();
+            (tile.tile_size(), tile.window().requested_size())
+        };
+        let config =
+            niri_config::Config::parse_mem("shrink-expand { enabled true; thickness 72; }")
+                .unwrap();
+        layout.update_config(&config);
+        layout.refresh(true);
+        let tile = layout
+            .workspaces()
+            .flat_map(|(_, _, ws)| ws.tiles())
+            .next()
+            .unwrap();
+        assert_eq!((tile.tile_size(), tile.window().requested_size()), before);
+        assert_eq!(tile.form(), WindowForm::Normal);
+        assert_eq!(layout.focus().unwrap().id(), &1);
+        layout.verify_invariants();
+    }
+}
+
+#[test]
+fn spine_thickness_reload_reflows_native_slots_without_resizing_hidden_clients() {
+    for axis in [ShrinkAxis::Horizontal, ShrinkAxis::Vertical] {
+        for floating in [false, true] {
+            let mut layout = Layout::<TestWindow>::default();
+            Op::AddOutput(1).apply(&mut layout);
+            let mut params = TestWindowParams::new(1);
+            params.is_floating = floating;
+            Op::AddWindow { params }.apply(&mut layout);
+            Op::Communicate(1).apply(&mut layout);
+            let window = {
+                let tile = layout
+                    .workspaces_mut()
+                    .find(|ws| ws.has_window(&1))
+                    .unwrap()
+                    .tiles_mut()
+                    .find(|t| t.window().id() == &1)
+                    .unwrap();
+                assert!(tile.set_spine(axis, 40.));
+                tile.window().clone()
+            };
+            layout.update_window(&1, None);
+            layout.refresh(true);
+            let requested = window.requested_size();
+            let config = niri_config::Config::parse_mem(
+                "shrink-expand { enabled true; thickness 64; shrink-buffer-ms 900; }",
+            )
+            .unwrap();
+            layout.update_config(&config);
+            layout.refresh(true);
+            assert_eq!(layout.options.shrink_expand, config.shrink_expand);
+            let book = layout
+                .workspaces()
+                .flat_map(|(_, _, ws)| ws.tiles())
+                .find(|t| t.window().id() == &1)
+                .unwrap();
+            assert_eq!(book.form(), WindowForm::Spine(axis));
+            let size = book.tile_size();
+            assert_eq!(
+                match axis {
+                    ShrinkAxis::Horizontal => size.w,
+                    ShrinkAxis::Vertical => size.h,
+                },
+                64.
+            );
+            assert!(size.w >= 64. && size.h >= 64.);
+            assert_eq!(window.requested_size(), requested);
+            assert!(layout.focus().is_none());
+            layout.verify_invariants();
+            // A paint-only reload must keep an explicitly constructed book thickness.
+            let mut config = config;
+            config.layout.spine.inactive = niri_config::SpinePaint::Solid("#246".parse().unwrap());
+            layout.update_config(&config);
+            layout.refresh(true);
+            assert_eq!(window.requested_size(), requested);
+            assert!(layout.is_spine(&1));
+            layout.verify_invariants();
+            Op::RemoveOutput(1).apply(&mut layout);
+            config.shrink_expand.thickness = 96.;
+            layout.update_config(&config);
+            let book = layout
+                .workspaces()
+                .flat_map(|(_, _, ws)| ws.tiles())
+                .find(|t| t.window().id() == &1)
+                .unwrap();
+            let size = book.tile_size();
+            assert_eq!(
+                match axis {
+                    ShrinkAxis::Horizontal => size.w,
+                    ShrinkAxis::Vertical => size.h,
+                },
+                96.
+            );
+            assert_eq!(window.requested_size(), requested);
+            layout.verify_invariants();
+            Op::AddOutput(1).apply(&mut layout);
+            layout.refresh(true);
+            assert!(layout.is_spine(&1));
+            layout.verify_invariants();
+        }
+    }
+}
+
+#[test]
+fn moving_spine_thickness_reload_preserves_owner_axis_and_hidden_client_request() {
+    for axis in [ShrinkAxis::Horizontal, ShrinkAxis::Vertical] {
+        let mut layout = Layout::<TestWindow>::default();
+        Op::AddOutput(1).apply(&mut layout);
+        Op::AddWindow {
+            params: TestWindowParams::new(1),
+        }
+        .apply(&mut layout);
+        Op::Communicate(1).apply(&mut layout);
+        let window = {
+            let tile = layout
+                .workspaces_mut()
+                .find(|ws| ws.has_window(&1))
+                .unwrap()
+                .tiles_mut()
+                .find(|t| t.window().id() == &1)
+                .unwrap();
+            assert!(tile.set_spine(axis, 40.));
+            tile.window().clone()
+        };
+        layout.update_window(&1, None);
+        let output = layout.outputs().next().unwrap().clone();
+        assert!(layout.interactive_move_begin(1, &output, (30., 100.).into()));
+        assert!(layout.interactive_move_update(&1, (300., 0.).into(), output, (330., 100.).into()));
+        let before = window.requested_size();
+        let config =
+            niri_config::Config::parse_mem("shrink-expand { enabled true; thickness 72; }")
+                .unwrap();
+        layout.update_config(&config);
+        let Some(InteractiveMoveState::Moving(move_)) = &layout.interactive_move else {
+            unreachable!()
+        };
+        assert_eq!(move_.tile.form(), WindowForm::Spine(axis));
+        let size = move_.tile.tile_size();
+        assert_eq!(
+            match axis {
+                ShrinkAxis::Horizontal => size.w,
+                ShrinkAxis::Vertical => size.h,
+            },
+            72.
+        );
+        assert_eq!(window.requested_size(), before);
+        assert_eq!(layout.windows().count(), 1);
+        layout.verify_invariants();
+        layout.interactive_move_end(&1);
+        layout.refresh(true);
+        assert!(layout.is_spine(&1));
+        assert_eq!(window.requested_size(), before);
+        layout.verify_invariants();
+    }
+}
+
+#[test]
 fn spine_rule_update_requantizes_border_without_configuring_hidden_client() {
     for axis in [ShrinkAxis::Horizontal, ShrinkAxis::Vertical] {
         for scale in [1., 1.25, 2.] {

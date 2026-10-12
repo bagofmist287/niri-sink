@@ -4494,6 +4494,12 @@ impl<W: LayoutElement> Column<W> {
             update_sizes = true;
         }
 
+        if self.options.shrink_expand.thickness != options.shrink_expand.thickness
+            && self.tiles.iter().any(Tile::is_spine)
+        {
+            update_sizes = true;
+        }
+
         if self.options.layout.tab_indicator != options.layout.tab_indicator {
             update_sizes = true;
         }
