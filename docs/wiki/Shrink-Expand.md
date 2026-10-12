@@ -78,8 +78,27 @@ anchor and keeps the spine collapsed. Switching a moving spine to floating
 placement skips the hidden client's normal floating size request. Focus-based
 cursor warping excludes spines in both tiled and floating spaces. These layout
 paths are tested. Spine hit regions expose body and edge identity without
-forwarding input to the hidden client; drag-time direction adaptation and the
-complete operation dispatch still await integration.
+forwarding input to the hidden client. Left-button, touch and pen-tip input use
+the spine body as a compositor MoveGrab entry, and its edge as a ResizeGrab entry.
+Configured mouse binds keep their native priority. Drag-time direction adaptation
+still awaits E3 integration.
+
+A valid body release below the native 8 px recognition threshold directly expands
+the spine through the current-slot allocator. Reaching the threshold forms a move:
+a short tiled drag returning before 256 px stays collapsed, and floating movement
+uses the native immediate Moving path. The last unframed motion is considered for
+spine click classification. Forced ungrab, touch cancellation, pen proximity-out,
+changed scene scope or feature disable do not click-expand. A body press during
+another preview only cancels that preview and does not expand on release.
+
+Click expansion is queued after the input grab is cleared, then rechecks window,
+workspace, output, Overview generation, current hit and seat permission. In Overview,
+a valid click exits to the target workspace and expands that window. Edge resizing
+accumulates unscaled layout deltas using the current Overview zoom; native client
+and modifier resize entries keep their existing coordinate path. Native right-button
+floating switches keep the initiating left-button grab, and ordinary CSD horizontal
+view-offset recognition remains unchanged. These paths have synthetic pointer,
+touch and tablet grab/Wayland evidence, not physical input-device qualification.
 
 Internal spine rendering uses a separate fill and caption, without drawing the
 client surface, its popups or background effects. Vertical titles are shaped

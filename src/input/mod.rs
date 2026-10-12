@@ -2859,6 +2859,48 @@ impl State {
         self.niri.queue_redraw_all();
     }
 
+    pub(crate) fn try_start_spine_pointer_interaction(
+        &mut self,
+        pointer: &smithay::input::pointer::PointerHandle<State>,
+        button: u32,
+        serial: smithay::utils::Serial,
+    ) -> bool {
+        if button != 0x110 || pointer.is_grabbed() {
+            return false;
+        }
+        let location = pointer.current_location();
+        let Some((window, edges)) = self.spine_interaction_hit(location) else {
+            return false;
+        };
+        let start = AnyStartData::Pointer(PointerGrabStartData {
+            focus: None,
+            button,
+            location,
+        });
+        if edges.is_empty() {
+            if let Some(grab) =
+                MoveGrab::new(self, start, window, false, Some(CursorIcon::Grabbing))
+            {
+                pointer.set_grab(self, grab, serial, Focus::Clear);
+            }
+        } else {
+            self.niri.layout.activate_window(&window);
+            if self
+                .niri
+                .layout
+                .interactive_resize_begin(window.clone(), edges)
+            {
+                let grab = ResizeGrab::new(start, window).with_layout_zoom();
+                pointer.set_grab(self, grab, serial, Focus::Clear);
+                self.niri
+                    .cursor_manager
+                    .set_cursor_image(CursorImageStatus::Named(edges.cursor_icon()));
+            }
+        }
+        self.niri.queue_redraw_all();
+        true
+    }
+
     fn on_pointer_button<I: InputBackend>(&mut self, event: I::PointerButtonEvent) {
         let pointer = self.niri.seat.get_pointer().unwrap();
 
@@ -3000,7 +3042,9 @@ impl State {
                 }
             }
 
-            if let Some(mapped) = self.niri.window_under_cursor() {
+            if self.try_start_spine_pointer_interaction(&pointer, button_code, serial) {
+                // The spine owns this press; it has no client surface to activate or forward to.
+            } else if let Some(mapped) = self.niri.window_under_cursor() {
                 let window = mapped.window.clone();
 
                 // Check if we need to start an interactive move.
@@ -3809,7 +3853,40 @@ impl State {
                             }
                         }
                     } else if !tool.is_grabbed() {
-                        if self.niri.layout.is_overview_open()
+                        if let Some((window, edges)) = self.spine_interaction_hit(pos) {
+                            let start = AnyStartData::TabletTool(TabletToolGrabStartData {
+                                focus: None,
+                                trigger: tablet::tool::GrabTrigger::Tip,
+                                location: pos,
+                            });
+                            if edges.is_empty() {
+                                if let Some(grab) = MoveGrab::new(
+                                    self,
+                                    start,
+                                    window,
+                                    false,
+                                    Some(CursorIcon::Grabbing),
+                                ) {
+                                    tool.set_grab(self, grab, time, serial, Focus::Clear);
+                                }
+                            } else {
+                                self.niri.layout.activate_window(&window);
+                                if self
+                                    .niri
+                                    .layout
+                                    .interactive_resize_begin(window.clone(), edges)
+                                {
+                                    tool.set_grab(
+                                        self,
+                                        ResizeGrab::new(start, window).with_layout_zoom(),
+                                        time,
+                                        serial,
+                                        Focus::Clear,
+                                    );
+                                }
+                            }
+                            self.niri.queue_redraw_all();
+                        } else if self.niri.layout.is_overview_open()
                             && !mod_down
                             && under.layer.is_none()
                             && under.output.is_some()
@@ -4430,7 +4507,32 @@ impl State {
                 }
             }
         } else if !handle.is_grabbed() {
-            if self.niri.layout.is_overview_open()
+            if let Some((window, edges)) = self.spine_interaction_hit(pos) {
+                let start = AnyStartData::Touch(TouchGrabStartData {
+                    focus: None,
+                    slot,
+                    location: pos,
+                });
+                if edges.is_empty() {
+                    if let Some(grab) = MoveGrab::new(self, start, window, false, None) {
+                        handle.set_grab(self, grab, serial);
+                    }
+                } else {
+                    self.niri.layout.activate_window(&window);
+                    if self
+                        .niri
+                        .layout
+                        .interactive_resize_begin(window.clone(), edges)
+                    {
+                        handle.set_grab(
+                            self,
+                            ResizeGrab::new(start, window).with_layout_zoom(),
+                            serial,
+                        );
+                    }
+                }
+                self.niri.queue_redraw_all();
+            } else if self.niri.layout.is_overview_open()
                 && !mod_down
                 && under.layer.is_none()
                 && under.output.is_some()

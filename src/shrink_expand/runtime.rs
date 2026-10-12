@@ -3,7 +3,7 @@ use std::time::{Duration, Instant};
 use calloop::timer::{TimeoutAction, Timer};
 use smithay::desktop::Window;
 use smithay::output::Output;
-use smithay::utils::{Logical, Point};
+use smithay::utils::{IsAlive, Logical, Point};
 use smithay::wayland::input_method::InputMethodKeyboardGrab;
 
 use super::{Kind, Record, TargetState, Ticket};
@@ -37,6 +37,17 @@ pub(crate) struct SpatialSession {
     inhibited: bool,
 }
 
+/// Identity and scene scope of one spine-body press; no layout or size history.
+#[derive(Debug, Clone)]
+pub(crate) struct SpineClick {
+    pub window: Window,
+    pub workspace: u64,
+    pub output: Output,
+    pub overview_open: bool,
+    pub overview_generation: u64,
+    pub cancel_only: bool,
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct ExpandFocusLease {
     window: Window,
@@ -60,7 +71,10 @@ impl State {
             && !self.niri.window_mru_ui.is_open()
             && !self.niri.screenshot_ui.is_open()
             && !self.niri.exit_confirm_dialog.is_open()
-            && matches!(self.niri.keyboard_focus, KeyboardFocus::Layout { .. })
+            && matches!(
+                self.niri.keyboard_focus,
+                KeyboardFocus::Layout { .. } | KeyboardFocus::Overview
+            )
             && self.niri.layout.can_transfer_sink()
             && !self.niri.seat.get_keyboard().is_some_and(|keyboard| {
                 keyboard.is_grabbed()
@@ -480,6 +494,109 @@ impl State {
                     Rejected::NoLegalAxis => "No legal Shrink axis is available".into(),
                 }),
         )
+    }
+
+    pub(crate) fn spine_interaction_hit(
+        &self,
+        pos: Point<f64, Logical>,
+    ) -> Option<(Window, crate::utils::ResizeEdge)> {
+        if !self.niri.config.borrow().shrink_expand.enabled || !self.can_expand_spines() {
+            return None;
+        }
+        let (window, crate::layout::HitType::Spine { edges }) =
+            self.niri.contents_under(pos).window?
+        else {
+            return None;
+        };
+        self.niri
+            .layout
+            .is_spine(&window)
+            .then_some((window, edges))
+    }
+
+    pub(crate) fn spine_click_context(
+        &self,
+        window: &Window,
+        pos: Point<f64, Logical>,
+    ) -> Option<SpineClick> {
+        if !self.niri.layout.is_spine(window) {
+            return None;
+        }
+        let (hit, edges) = self.spine_interaction_hit(pos)?;
+        if &hit != window || !edges.is_empty() {
+            return None;
+        }
+        let (mon, _, ws) = self
+            .niri
+            .layout
+            .workspaces()
+            .find(|(_, _, ws)| ws.has_window(window))?;
+        Some(SpineClick {
+            window: window.clone(),
+            workspace: ws.id().get(),
+            output: mon?.output().clone(),
+            overview_open: self.niri.layout.is_overview_open(),
+            overview_generation: self.niri.layout.overview_generation(),
+            cancel_only: self.niri.shrink_expand.preview().is_some(),
+        })
+    }
+
+    pub(crate) fn spine_press_scope_valid(&self, click: &SpineClick) -> bool {
+        self.niri.config.borrow().shrink_expand.enabled
+            && click.window.alive()
+            && self.niri.layout.is_spine(&click.window)
+            && self.niri.layout.is_overview_open() == click.overview_open
+            && self.niri.layout.overview_generation() == click.overview_generation
+            && self.niri.layout.workspaces().any(|(mon, _, ws)| {
+                ws.id().get() == click.workspace
+                    && ws.has_window(&click.window)
+                    && mon.is_some_and(|mon| mon.output() == &click.output)
+            })
+    }
+
+    pub(crate) fn queue_spine_click(&mut self, click: SpineClick, position: Point<f64, Logical>) {
+        self.niri.event_loop.insert_idle(move |state| {
+            if click.cancel_only
+                || !click.window.alive()
+                || !state.can_expand_spines()
+                || !state.niri.config.borrow().shrink_expand.enabled
+                || state.niri.layout.is_overview_open() != click.overview_open
+                || state.niri.layout.overview_generation() != click.overview_generation
+                || state
+                    .niri
+                    .contents_under(position)
+                    .window
+                    .is_none_or(|(window, hit)| {
+                        window != click.window
+                            || !matches!(hit, crate::layout::HitType::Spine { .. })
+                    })
+            {
+                return;
+            }
+            let target = state.niri.layout.workspaces().find_map(|(mon, idx, ws)| {
+                (ws.id().get() == click.workspace
+                    && ws.has_window(&click.window)
+                    && mon.is_some_and(|mon| mon.output() == &click.output))
+                .then(|| {
+                    (
+                        idx,
+                        ws.windows()
+                            .find(|w| w.window == click.window)
+                            .unwrap()
+                            .id()
+                            .get(),
+                    )
+                })
+            });
+            let Some((idx, id)) = target else {
+                return;
+            };
+            if click.overview_open {
+                state.niri.layout.focus_output(&click.output);
+                state.niri.layout.toggle_overview_to_workspace(idx);
+            }
+            let _ = state.expand_spine_window(id);
+        });
     }
 
     fn can_expand_spines(&self) -> bool {

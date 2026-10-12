@@ -24,6 +24,9 @@ pub struct ResizeGrab {
     // Accumulated and applied in frame().
     new_location: Point<f64, Logical>,
     released: bool,
+    layout_zoom: bool,
+    applied_location: Point<f64, Logical>,
+    logical_delta: Point<f64, Logical>,
 }
 
 impl ResizeGrab {
@@ -35,6 +38,26 @@ impl ResizeGrab {
             window,
             new_location: location,
             released: false,
+            layout_zoom: false,
+            applied_location: location,
+            logical_delta: (0., 0.).into(),
+        }
+    }
+
+    /// Compositor spine edges live in the scaled Overview scene. Native client/mod
+    /// resize entries retain their original coordinate path.
+    pub(crate) fn with_layout_zoom(mut self) -> Self {
+        self.layout_zoom = true;
+        self
+    }
+
+    fn pending_delta(&self, state: &State) -> Point<f64, Logical> {
+        if self.layout_zoom {
+            self.logical_delta
+                + (self.new_location - self.applied_location)
+                    .downscale(state.niri.layout.overview_zoom())
+        } else {
+            self.new_location - self.start_data.location()
         }
     }
 
@@ -54,7 +77,11 @@ impl ResizeGrab {
             return false;
         }
 
-        let delta = self.new_location - self.start_data.location();
+        let delta = self.pending_delta(data);
+        if self.layout_zoom {
+            self.applied_location = self.new_location;
+            self.logical_delta = delta;
+        }
         let input = if self.start_data.is_pointer() {
             crate::shrink_expand::SpatialInput::Pointer
         } else if self.start_data.is_touch() {
@@ -66,7 +93,7 @@ impl ResizeGrab {
     }
 
     fn prepare_release(&mut self, state: &mut State) {
-        let delta = self.new_location - self.start_data.location();
+        let delta = self.pending_delta(state);
         // Only a spatial candidate needs the last unframed motion. Ordinary native release
         // preserves its existing frame batching, including when the feature is disabled.
         self.released =

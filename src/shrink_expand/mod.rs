@@ -3,6 +3,7 @@ mod runtime;
 pub(crate) use runtime::ExpandFocusLease;
 pub(crate) use runtime::PreviewLease;
 pub use runtime::Rejected;
+pub(crate) use runtime::SpineClick;
 pub(crate) use runtime::{SpatialInput, SpatialSession};
 
 use std::collections::VecDeque;

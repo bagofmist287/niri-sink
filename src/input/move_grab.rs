@@ -29,6 +29,8 @@ pub struct MoveGrab {
     window: Window,
     sink_selection: Option<SinkOverviewSelection>,
     sink_confirmed: bool,
+    spine_click: Option<crate::shrink_expand::SpineClick>,
+    spine_released: bool,
     gesture: GestureState,
     enable_view_offset: bool,
     move_icon: CursorIcon,
@@ -56,6 +58,11 @@ impl MoveGrab {
     ) -> Option<Self> {
         let location = start_data.location();
         let (output, pos_within_output) = state.niri.output_under(location)?;
+        let output = output.clone();
+        let spine_click = state.spine_click_context(&window, location);
+        if spine_click.as_ref().is_some_and(|click| click.cancel_only) {
+            state.cancel_shrink_expand_preview();
+        }
 
         Some(Self {
             last_location: location,
@@ -64,6 +71,8 @@ impl MoveGrab {
             start_pos_within_output: pos_within_output,
             sink_selection: state.niri.sink_overview_selection(&window, location),
             sink_confirmed: false,
+            spine_click,
+            spine_released: false,
             window,
             gesture: GestureState::Recognizing,
             enable_view_offset,
@@ -97,6 +106,12 @@ impl MoveGrab {
         }
         let layout = &mut data.niri.layout;
         match self.gesture {
+            GestureState::Recognizing if self.spine_click.is_some() => {
+                let delta = self.new_location - self.start_data.location();
+                if self.spine_released && delta.x * delta.x + delta.y * delta.y < 8. * 8. {
+                    data.queue_spine_click(self.spine_click.take().unwrap(), self.new_location);
+                }
+            }
             GestureState::Recognizing => {
                 // Activate the window on release. This is most prominent in the overview where
                 // windows are not activated on click. In the overview, we also try to do a nice
@@ -129,6 +144,17 @@ impl MoveGrab {
 
         // FIXME: only redraw the window output.
         data.niri.queue_redraw_all();
+    }
+
+    fn prepare_spine_release(&mut self, data: &mut State) {
+        if self.spine_click.is_none() {
+            return;
+        }
+        self.spine_released = true;
+        let c = self.new_location - self.start_data.location();
+        if self.gesture == GestureState::Recognizing && c.x * c.x + c.y * c.y >= 8. * 8. {
+            self.on_frame(data);
+        }
     }
 
     fn begin_move(&mut self, data: &mut State) -> bool {
@@ -186,6 +212,15 @@ impl MoveGrab {
     }
 
     fn on_frame(&mut self, data: &mut State) -> bool {
+        if let Some(click) = &self.spine_click {
+            if !data.niri.config.borrow().shrink_expand.enabled
+                || !data.niri.layout.is_spine(&self.window)
+                || (self.gesture == GestureState::Recognizing
+                    && !data.spine_press_scope_valid(click))
+            {
+                return false;
+            }
+        }
         let Some(timestamp) = self.event_timestamp.take() else {
             return true;
         };
@@ -220,8 +255,10 @@ impl MoveGrab {
                     })
                     .unwrap_or(false);
 
-                let is_view_offset =
-                    self.enable_view_offset && !is_floating && c.x.abs() > c.y.abs();
+                let is_view_offset = self.spine_click.is_none()
+                    && self.enable_view_offset
+                    && !is_floating
+                    && c.x.abs() > c.y.abs();
 
                 let started = if is_view_offset {
                     self.begin_view_offset(data)
@@ -364,6 +401,9 @@ impl PointerGrab<State> for MoveGrab {
         if !handle.current_pressed().contains(&start_data.button) {
             self.sink_confirmed =
                 event.state == ButtonState::Released && event.button == start_data.button;
+            if event.state == ButtonState::Released && event.button == start_data.button {
+                self.prepare_spine_release(data);
+            }
             // The button that initiated the grab was released.
             handle.unset_grab(self, data, event.serial, event.time, true);
             return;
@@ -518,6 +558,7 @@ impl TouchGrab<State> for MoveGrab {
 
         if event.slot == self.start_data.unwrap_touch().slot {
             self.sink_confirmed = true;
+            self.prepare_spine_release(data);
             handle.unset_grab(self, data);
         }
     }
@@ -625,6 +666,7 @@ impl TabletToolGrab<State> for MoveGrab {
     ) {
         handle.up(data, event);
         self.sink_confirmed = true;
+        self.prepare_spine_release(data);
         handle.unset_grab(self, data, event.serial, event.time, true);
     }
 
