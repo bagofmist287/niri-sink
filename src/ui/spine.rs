@@ -9,6 +9,7 @@ use smithay::backend::renderer::element::Kind;
 use smithay::backend::renderer::gles::{GlesRenderer, GlesTexture};
 use smithay::utils::{Logical, Point, Rectangle, Scale, Size, Transform};
 
+use super::spine_icon::AppIconCache;
 use crate::layout::shrink_expand::ShrinkAxis;
 use crate::niri_render_elements;
 use crate::render_helpers::border::BorderRenderElement;
@@ -48,6 +49,7 @@ struct CaptionCache {
     key: Option<CaptionKey>,
     label: Option<(TextureBuffer<GlesTexture>, Point<f64, Logical>)>,
     icon: Option<(TextureBuffer<GlesTexture>, Point<f64, Logical>)>,
+    app_icon: AppIconCache,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -65,6 +67,12 @@ impl Spine {
         self.fill = None;
         self.geometry = None;
         self.caption.get_mut().clear();
+    }
+
+    pub fn reload_icons(&mut self) {
+        let caption = self.caption.get_mut();
+        caption.key = None;
+        caption.app_icon.clear();
     }
 
     pub fn update_shaders(&mut self) {
@@ -194,6 +202,7 @@ impl CaptionCache {
         self.key = None;
         self.label = None;
         self.icon = None;
+        self.app_icon.clear();
     }
 
     fn update(&mut self, renderer: &mut GlesRenderer, key: CaptionKey) {
@@ -232,7 +241,13 @@ impl CaptionCache {
                     (cross - icon_size) / 2.,
                 ))
             };
-            self.icon = fallback_icon(icon_size, key.scale, key.color)
+            let surface = self.app_icon.get(
+                &key.app_id,
+                (icon_size * key.scale).round().clamp(1., 256.) as i32,
+            );
+            self.icon = surface
+                .map(Ok)
+                .unwrap_or_else(|| fallback_icon(icon_size, key.scale, key.color))
                 .and_then(|surface| upload(renderer, surface, key.scale))
                 .ok()
                 .map(|texture| (texture, align(offset, key.scale)));
@@ -374,19 +389,22 @@ fn upload(
     scale: f64,
 ) -> anyhow::Result<TextureBuffer<GlesTexture>> {
     let size = (surface.width(), surface.height());
-    let data = surface
-        .take_data()
-        .map_err(|_| anyhow::anyhow!("caption surface is still borrowed"))?;
-    Ok(TextureBuffer::from_memory(
-        renderer,
-        &data,
-        Fourcc::Argb8888,
-        size,
-        false,
-        Scale::from(scale),
-        Transform::Normal,
-        Vec::new(),
-    )?)
+    let mut result = None;
+    surface
+        .with_data(|data| {
+            result = Some(TextureBuffer::from_memory(
+                renderer,
+                data,
+                Fourcc::Argb8888,
+                size,
+                false,
+                Scale::from(scale),
+                Transform::Normal,
+                Vec::new(),
+            ));
+        })
+        .map_err(|error| anyhow::anyhow!("cannot read caption surface: {error}"))?;
+    Ok(result.unwrap()?)
 }
 
 #[cfg(test)]

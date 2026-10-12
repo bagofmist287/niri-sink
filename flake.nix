@@ -16,6 +16,7 @@
           lib,
           cairo,
           dbus,
+          gdk-pixbuf,
           libGL,
           libdisplay-info_0_3,
           libinput,
@@ -77,6 +78,7 @@
             [
               cairo
               dbus
+              gdk-pixbuf
               libGL
               libdisplay-info_0_3
               libinput

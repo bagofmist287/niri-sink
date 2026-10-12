@@ -50,6 +50,7 @@ struct TestWindowInner {
     render_popup_calls: Cell<usize>,
     render_background_calls: Cell<usize>,
     spine_title: RefCell<String>,
+    spine_app_id: RefCell<String>,
     urgent: Cell<bool>,
 }
 
@@ -109,6 +110,7 @@ impl TestWindow {
             render_popup_calls: Cell::new(0),
             render_background_calls: Cell::new(0),
             spine_title: RefCell::new("Editor 编辑器 · mixed title — ملف".into()),
+            spine_app_id: RefCell::new("org.niri.TestWindow".into()),
             urgent: Cell::new(false),
         }))
     }
@@ -188,7 +190,7 @@ impl LayoutElement for TestWindow {
     fn spine_caption(&self) -> (String, String) {
         (
             self.0.spine_title.borrow().clone(),
-            "org.niri.TestWindow".into(),
+            self.0.spine_app_id.borrow().clone(),
         )
     }
 

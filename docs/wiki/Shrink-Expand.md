@@ -83,8 +83,10 @@ complete operation dispatch still await integration.
 
 Internal spine rendering uses a separate fill and caption, without drawing the
 client surface, its popups or background effects. Vertical titles are shaped
-once and rotated clockwise; the fallback window icon remains upright. Real app
-icon resolution is still pending. Sensitive capture targets replace the inner
+once and rotated clockwise; the fallback window icon remains upright. App icons are resolved from the desktop entry’s `Icon` value and the current
+GTK/GSettings icon theme, with recursive inheritance and hicolor/pixmaps fallback.
+PNG and SVG are decoded by the installed GdkPixbuf loaders; unsupported or missing
+icons use the window fallback. App icon colours and aspect ratio are preserved. Sensitive capture targets replace the inner
 fill and caption with black, including when an unblocked caption is cached.
 These checks use an explicit software EGL test, not the installed session or a
 physical input device. No user Shrink/Expand command is available yet.
@@ -96,3 +98,11 @@ hidden client. It also updates workspaces retained while no output is present.
 Paint-only updates preserve their current thickness. This does not yet enable
 user actions or implement `enabled false` restoration; operation coordination
 remains under development.
+
+Icon source images are cached separately from title shaping. A changed title or
+text colour does not reread the app icon. A new app ID/physical icon size or layout
+configuration update invalidates the source cache, including failed lookups.
+GIO and GdkPixbuf are now direct build dependencies at the already locked versions;
+no additional package version was upgraded. This resolver does not register the
+optional xdg-toplevel-icon protocol. Physical device and installed-session checks
+remain pending.

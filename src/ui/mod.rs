@@ -5,3 +5,4 @@ pub mod mru;
 pub mod screen_transition;
 pub mod screenshot_ui;
 pub mod spine;
+mod spine_icon;

@@ -288,6 +288,9 @@ impl<W: LayoutElement> Tile<W> {
 
         let thickness_changed =
             self.options.shrink_expand.thickness != options.shrink_expand.thickness;
+        if self.is_spine() && !Rc::ptr_eq(&self.options, &options) {
+            self.spine_ui.reload_icons();
+        }
         self.view_size = view_size;
         self.scale = scale;
         self.options = options;

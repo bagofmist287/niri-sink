@@ -1679,17 +1679,11 @@ fn spine_rule_update_requantizes_border_without_configuring_hidden_client() {
     }
 }
 
-#[test]
-#[ignore = "requires an explicit surfaceless EGL renderer run"]
-fn spine_rendering_is_independent_private_and_stable_at_fractional_scale() {
-    use smithay::backend::allocator::Fourcc;
+fn spine_test_renderer() -> smithay::backend::renderer::gles::GlesRenderer {
+    use crate::render_helpers::{resources, shaders};
     use smithay::backend::egl::native::EGLSurfacelessDisplay;
     use smithay::backend::egl::{EGLContext, EGLDisplay};
-    use smithay::backend::renderer::element::Element as _;
     use smithay::backend::renderer::gles::GlesRenderer;
-    use smithay::backend::renderer::ExportMem as _;
-
-    use crate::render_helpers::{render_and_download, resources, shaders, RenderTarget};
     let mut renderer = unsafe {
         let display = EGLDisplay::new(EGLSurfacelessDisplay).unwrap();
         let context = EGLContext::new(&display).unwrap();
@@ -1697,6 +1691,135 @@ fn spine_rendering_is_independent_private_and_stable_at_fractional_scale() {
     };
     resources::init(&mut renderer);
     shaders::init(&mut renderer);
+    renderer
+}
+
+#[test]
+#[ignore = "requires surfaceless EGL and the isolated desktop/icon fixture environment"]
+fn spine_application_icon_stays_upright_and_private() {
+    use crate::render_helpers::{render_and_download, RenderTarget};
+    use smithay::backend::allocator::Fourcc;
+    use smithay::backend::renderer::element::Element as _;
+    use smithay::backend::renderer::ExportMem as _;
+    let app_id =
+        std::env::var("NIRI_SPINE_ICON_APP_ID").expect("supply isolated desktop fixture app ID");
+    let mut renderer = spine_test_renderer();
+    for axis in [ShrinkAxis::Horizontal, ShrinkAxis::Vertical] {
+        for scale in [1., 1.25] {
+            let mut options = Options::default();
+            options.layout.border.off = true;
+            options.layout.focus_ring.off = true;
+            let mut params = TestWindowParams::new(1);
+            params.rules = Some(ResolvedWindowRules {
+                block_out_from: Some(niri_config::BlockOutFrom::ScreenCapture),
+                ..Default::default()
+            });
+            let mut book = Tile::new(
+                TestWindow::new(params),
+                (1280., 720.).into(),
+                scale,
+                Clock::with_time(Duration::ZERO),
+                Rc::new(options),
+            );
+            *book.window().0.spine_app_id.borrow_mut() = app_id.clone();
+            assert!(book.set_spine(axis, 40.));
+            book.request_tile_size((400., 280.).into(), false, None);
+            book.update_render_elements(false, Rectangle::from_size((1280., 720.).into()));
+            let mut collect = |target| {
+                let mut elements = Vec::new();
+                book.render(
+                    RenderCtx {
+                        renderer: &mut renderer,
+                        target,
+                        xray: None,
+                    },
+                    (0., 0.).into(),
+                    XrayPos::default(),
+                    false,
+                    &mut |e| elements.push(e),
+                );
+                elements
+            };
+            let elements = collect(RenderTarget::Output);
+            let revisions = elements
+                .iter()
+                .map(|e| (e.id().clone(), e.current_commit()))
+                .collect::<Vec<_>>();
+            assert_eq!(
+                revisions,
+                collect(RenderTarget::Output)
+                    .iter()
+                    .map(|e| (e.id().clone(), e.current_commit()))
+                    .collect::<Vec<_>>()
+            );
+            let physical = book.tile_size().to_physical_precise_round(scale);
+            let download = render_and_download(
+                &mut renderer,
+                physical,
+                Scale::from(scale),
+                Transform::Normal,
+                Fourcc::Abgr8888,
+                elements.into_iter().rev(),
+            )
+            .unwrap();
+            let data = renderer.map_texture(&download).unwrap();
+            let (x, y) = match axis {
+                ShrinkAxis::Horizontal => (
+                    (12. * scale).round() as usize,
+                    (4. * scale).round() as usize,
+                ),
+                ShrinkAxis::Vertical => (
+                    (4. * scale).round() as usize,
+                    (12. * scale).round() as usize,
+                ),
+            };
+            let extent = (16. * scale).round() as usize;
+            let at = |x: usize, y: usize| &data[(y * physical.w as usize + x) * 4..][..4];
+            assert_eq!(at(x + 2, y + 2), &[255, 0, 0, 255]);
+            assert_eq!(at(x + extent - 3, y + 2), &[0, 255, 0, 255]);
+            assert_eq!(at(x + 2, y + extent - 3), &[0, 0, 255, 255]);
+            assert_eq!(at(x + extent - 3, y + extent - 3), &[255, 255, 0, 255]);
+            let mut blocked = Vec::new();
+            book.render(
+                RenderCtx {
+                    renderer: &mut renderer,
+                    target: RenderTarget::ScreenCapture,
+                    xray: None,
+                },
+                (0., 0.).into(),
+                XrayPos::default(),
+                false,
+                &mut |e| blocked.push(e),
+            );
+            let download = render_and_download(
+                &mut renderer,
+                physical,
+                Scale::from(scale),
+                Transform::Normal,
+                Fourcc::Abgr8888,
+                blocked.into_iter().rev(),
+            )
+            .unwrap();
+            assert!(renderer
+                .map_texture(&download)
+                .unwrap()
+                .chunks_exact(4)
+                .all(|p| p == [0, 0, 0, 255]));
+            assert_eq!(book.window().0.render_normal_calls.get(), 0);
+        }
+    }
+}
+
+#[test]
+#[ignore = "requires an explicit surfaceless EGL renderer run"]
+fn spine_rendering_is_independent_private_and_stable_at_fractional_scale() {
+    use smithay::backend::allocator::Fourcc;
+    use smithay::backend::renderer::element::Element as _;
+    use smithay::backend::renderer::gles::GlesRenderer;
+    use smithay::backend::renderer::ExportMem as _;
+
+    use crate::render_helpers::{render_and_download, RenderTarget};
+    let mut renderer = spine_test_renderer();
     for axis in [ShrinkAxis::Horizontal, ShrinkAxis::Vertical] {
         for scale in [1., 1.25] {
             let mut options = Options::default();
