@@ -17,7 +17,7 @@ use super::shrink_expand::{
 };
 use super::tab_indicator::{TabIndicator, TabIndicatorRenderElement, TabInfo};
 use super::tile::{Tile, TileRenderElement, TileRenderSnapshot};
-use super::workspace::{InteractiveResize, ResolvedSize};
+use super::workspace::{InteractiveResize, ResizeComponents, ResolvedSize};
 use super::{ConfigureIntent, HitType, InteractiveResizeData, LayoutElement, Options, RemovedTile};
 use crate::animation::{Animation, Clock};
 use crate::input::swipe_tracker::SwipeTracker;
@@ -1517,6 +1517,22 @@ impl<W: LayoutElement> ScrollingSpace<W> {
         (from_view_offset - new_view_offset).abs() / self.working_area.size.w
     }
 
+    pub(super) fn activate_window_during_resize(&mut self, id: &W::Id) -> bool {
+        // Explicit restoration selects a formerly unfocusable column. Native navigation
+        // normally cancels resize on a column change; only this same-grab path retains it.
+        if !self
+            .interactive_resize
+            .as_ref()
+            .is_some_and(|resize| &resize.window == id)
+        {
+            return false;
+        }
+        let resize = self.interactive_resize.take();
+        let activated = self.activate_window(id);
+        self.interactive_resize = resize;
+        activated
+    }
+
     pub fn activate_window(&mut self, window: &W::Id) -> bool {
         let column_idx = self.columns.iter().position(|col| col.contains(window));
         let Some(column_idx) = column_idx else {
@@ -2734,6 +2750,14 @@ impl<W: LayoutElement> ScrollingSpace<W> {
         &self,
         requests: &[(W::Id, ColumnWidth)],
     ) -> Vec<(W::Id, NormalSizePlan)> {
+        self.normal_spine_plans_with_resize(requests, None)
+    }
+
+    pub(super) fn normal_spine_plans_with_resize(
+        &self,
+        requests: &[(W::Id, ColumnWidth)],
+        resize: Option<(&W::Id, super::shrink_expand::SpatialResizeIntent)>,
+    ) -> Vec<(W::Id, NormalSizePlan)> {
         let mut plans = Vec::new();
         for col in &self.columns {
             let mut rows = col.sizing_inputs();
@@ -2751,7 +2775,40 @@ impl<W: LayoutElement> ScrollingSpace<W> {
             if targets.is_empty() {
                 continue;
             }
-            let width = if col.tiles.len() == 1 {
+            let resize = resize.filter(|(id, _)| col.contains(id));
+            if let Some((id, intent)) = resize {
+                if intent.gain.y != 0. {
+                    let idx = col.position(id).unwrap();
+                    let heights = col.auto_heights();
+                    for (row, height) in zip(&mut rows, heights) {
+                        row.height = height;
+                    }
+                    let requested = col.tiles[idx]
+                        .normal_window_size_for_tile_size(intent.requested.normal_size())
+                        .h;
+                    let min_taken = if col.display_mode == ColumnDisplay::Tabbed {
+                        0.
+                    } else {
+                        rows.iter()
+                            .enumerate()
+                            .filter(|(i, _)| *i != idx)
+                            .map(|(_, row)| row.min_size.h.max(1.) + col.options.layout.gaps)
+                            .sum()
+                    };
+                    let left = (col.working_area.size.h
+                        - col.extra_size().h
+                        - 2. * col.options.layout.gaps
+                        - min_taken
+                        - rows[idx].border_height)
+                        .max(1.);
+                    rows[idx].height =
+                        WindowHeight::Fixed(f64::from(requested).min(left).clamp(1., 100000.));
+                }
+            }
+            let width = if let Some((_, intent)) = resize.filter(|(_, intent)| intent.gain.x != 0.)
+            {
+                ColumnWidth::Fixed(intent.requested.w.clamp(1., 100000.))
+            } else if col.tiles.len() == 1 {
                 targets[0].1
             } else if col.is_full_width {
                 ColumnWidth::Proportion(1.)
@@ -2800,6 +2857,17 @@ impl<W: LayoutElement> ScrollingSpace<W> {
         transaction: Transaction,
         settle_matching: bool,
     ) {
+        self.commit_normal_restore_with_resize(plans, requests, transaction, settle_matching, None);
+    }
+
+    pub(super) fn commit_normal_restore_with_resize(
+        &mut self,
+        plans: &[(W::Id, NormalSizePlan)],
+        requests: &[(W::Id, ColumnWidth)],
+        transaction: Transaction,
+        settle_matching: bool,
+        resize: Option<(&W::Id, super::shrink_expand::SpatialResizeIntent)>,
+    ) {
         for (col_idx, col) in self.columns.iter_mut().enumerate() {
             let targets = col
                 .tiles
@@ -2823,6 +2891,19 @@ impl<W: LayoutElement> ScrollingSpace<W> {
             }
             for &idx in &targets {
                 col.data[idx].height = WindowHeight::auto_1();
+            }
+            if let Some((id, intent)) = resize.filter(|(id, _)| col.contains(id)) {
+                if intent.gain.x != 0. {
+                    col.width = ColumnWidth::Fixed(intent.requested.w.clamp(1., 100000.));
+                    col.preset_width_idx = None;
+                    col.is_full_width = false;
+                }
+                if intent.gain.y != 0. {
+                    col.convert_heights_to_auto();
+                    let idx = col.position(id).unwrap();
+                    let plan = plans.iter().find(|(target, _)| target == id).unwrap().1;
+                    col.data[idx].height = WindowHeight::Fixed(f64::from(plan.client_size.h));
+                }
             }
             col.update_tile_sizes_with_transaction(false, transaction.clone());
             for idx in targets {
@@ -4033,6 +4114,7 @@ impl<W: LayoutElement> ScrollingSpace<W> {
         let resize = InteractiveResize {
             window,
             original_window_size,
+            delta_origin: (0., 0.).into(),
             data: InteractiveResizeData { edges },
         };
         self.interactive_resize = Some(resize);
@@ -4042,10 +4124,7 @@ impl<W: LayoutElement> ScrollingSpace<W> {
         true
     }
 
-    fn resize_components(
-        &self,
-        window: &W::Id,
-    ) -> Option<(Size<f64, Logical>, Point<f64, Logical>)> {
+    fn resize_components(&self, window: &W::Id) -> Option<ResizeComponents> {
         let resize = self
             .interactive_resize
             .as_ref()
@@ -4077,7 +4156,11 @@ impl<W: LayoutElement> ScrollingSpace<W> {
                 1.
             };
         }
-        Some((resize.original_window_size, gain))
+        Some(ResizeComponents {
+            original: resize.original_window_size,
+            gain,
+            delta_origin: resize.delta_origin,
+        })
     }
 
     pub(super) fn spatial_resize_intent(
@@ -4085,10 +4168,21 @@ impl<W: LayoutElement> ScrollingSpace<W> {
         window: &W::Id,
         delta: Point<f64, Logical>,
     ) -> Option<super::shrink_expand::SpatialResizeIntent> {
-        let (original, gain) = self.resize_components(window)?;
+        let ResizeComponents {
+            original,
+            gain,
+            delta_origin,
+        } = self.resize_components(window)?;
+        let delta = delta - delta_origin;
         let tile = self.tiles().find(|tile| tile.window().id() == window)?;
         if tile.is_spine() {
-            return None;
+            return Some(super::shrink_expand::SpatialResizeIntent {
+                original,
+                requested: (original.w + gain.x * delta.x, original.h + gain.y * delta.y).into(),
+                minimum: tile.tile_size(),
+                gain,
+                delta_origin,
+            });
         }
         let minimum = Size::from((
             self.keyboard_resize_intent(
@@ -4100,8 +4194,8 @@ impl<W: LayoutElement> ScrollingSpace<W> {
             self.keyboard_resize_intent(window, ShrinkAxis::Vertical, SizeChange::AdjustFixed(0))?
                 .minimum,
         ));
-        let requested: Size<f64, Logical> =
-            Size::from((original.w + gain.x * delta.x, original.h + gain.y * delta.y));
+        let requested: super::shrink_expand::RawResizeSize =
+            (original.w + gain.x * delta.x, original.h + gain.y * delta.y).into();
         Some(super::shrink_expand::SpatialResizeIntent {
             original: (
                 tile.tile_width_for_window_width(original.w),
@@ -4115,7 +4209,23 @@ impl<W: LayoutElement> ScrollingSpace<W> {
                 .into(),
             minimum,
             gain,
+            delta_origin,
         })
+    }
+
+    pub(super) fn rebase_spine_resize(
+        &mut self,
+        id: &W::Id,
+        delta: Point<f64, Logical>,
+        plan: NormalSizePlan,
+    ) {
+        let resize = self
+            .interactive_resize
+            .as_mut()
+            .filter(|r| &r.window == id)
+            .unwrap();
+        resize.original_window_size = plan.client_size.to_f64();
+        resize.delta_origin = delta;
     }
 
     pub fn interactive_resize_update(
@@ -4123,9 +4233,15 @@ impl<W: LayoutElement> ScrollingSpace<W> {
         window: &W::Id,
         delta: Point<f64, Logical>,
     ) -> bool {
-        let Some((original, gain)) = self.resize_components(window) else {
+        let Some(ResizeComponents {
+            original,
+            gain,
+            delta_origin,
+        }) = self.resize_components(window)
+        else {
             return false;
         };
+        let delta = delta - delta_origin;
 
         let (col_idx, _) = self.column_and_tile_idx(Some(window));
         let col = &mut self.columns[col_idx];
@@ -5594,18 +5710,24 @@ impl<W: LayoutElement> Column<W> {
     ///
     /// One case where apparent heights will not be preserved is when the column is taller than the
     /// working area.
-    fn convert_heights_to_auto(&mut self) {
+    fn auto_heights(&self) -> Vec<WindowHeight> {
         let heights: Vec<_> = self.tiles.iter().map(|tile| tile.tile_size().h).collect();
-
-        // Weights are invariant to multiplication: a column with weights 2, 2, 1 is equivalent to
-        // a column with weights 4, 4, 2. So we find the median window height and use that as 1.
+        // The common median preserves the native relative weights.
         let mut sorted = heights.clone();
         sorted.sort_unstable_by(|a, b| a.partial_cmp(b).unwrap());
         let median = sorted[sorted.len() / 2];
+        heights
+            .into_iter()
+            .map(|height| WindowHeight::Auto {
+                weight: height / median,
+            })
+            .collect()
+    }
 
+    fn convert_heights_to_auto(&mut self) {
+        let heights = self.auto_heights();
         for (data, height) in zip(&mut self.data, heights) {
-            let weight = height / median;
-            data.height = WindowHeight::Auto { weight };
+            data.height = height;
         }
     }
 

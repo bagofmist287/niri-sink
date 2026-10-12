@@ -1393,6 +1393,17 @@ impl<W: LayoutElement> Tile<W> {
 
         self.window
             .request_size(size, SizingMode::Normal, animate, transaction);
+        self.rearm_normal_restore();
+    }
+
+    pub(super) fn request_normal_resize_once(&mut self, size: Size<i32, Logical>, animate: bool) {
+        let allocation = self.normal_tile_size_for_window_size(size);
+        if let Some(plan) = &mut self.normal_restore {
+            plan.client_size = size;
+            plan.allocation = allocation;
+        }
+        self.window.request_size_once(size, animate);
+        self.rearm_normal_restore();
     }
 
     /// Convert a normal allocation without consulting the current spine form.

@@ -38,17 +38,44 @@ impl KeyboardResizeIntent {
     }
 }
 
+/// A raw drag can cross zero. Keep its signed extents until native allocation clamps them.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct RawResizeSize {
+    pub w: f64,
+    pub h: f64,
+}
+
+impl From<(f64, f64)> for RawResizeSize {
+    fn from((w, h): (f64, f64)) -> Self {
+        Self { w, h }
+    }
+}
+
+impl RawResizeSize {
+    pub fn normal_size(self) -> Size<f64, Logical> {
+        (self.w.max(1.), self.h.max(1.)).into()
+    }
+}
+
 /// Raw native resize geometry; ephemeral input for one motion, never restoration history.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct SpatialResizeIntent {
     pub original: Size<f64, Logical>,
-    pub requested: Size<f64, Logical>,
+    pub requested: RawResizeSize,
     pub minimum: Size<f64, Logical>,
     /// Native edge signs and centering factors; zero means that edge is disallowed.
     pub gain: smithay::utils::Point<f64, Logical>,
+    pub delta_origin: smithay::utils::Point<f64, Logical>,
 }
 
 impl SpatialResizeIntent {
+    pub fn grows_locked_axis(&self, axis: ShrinkAxis) -> bool {
+        match axis {
+            ShrinkAxis::Horizontal => self.gain.x != 0. && self.requested.w > self.original.w,
+            ShrinkAxis::Vertical => self.gain.y != 0. && self.requested.h > self.original.h,
+        }
+    }
+
     pub fn choose_axis(
         &self,
         zone: f64,
@@ -100,10 +127,12 @@ impl SpatialResizeIntent {
     ) -> smithay::utils::Point<f64, Logical> {
         match axis {
             ShrinkAxis::Horizontal => {
-                delta.x = (self.minimum.w + zone - self.original.w) / self.gain.x
+                delta.x =
+                    self.delta_origin.x + (self.minimum.w + zone - self.original.w) / self.gain.x
             }
             ShrinkAxis::Vertical => {
-                delta.y = (self.minimum.h + zone - self.original.h) / self.gain.y
+                delta.y =
+                    self.delta_origin.y + (self.minimum.h + zone - self.original.h) / self.gain.y
             }
         }
         delta

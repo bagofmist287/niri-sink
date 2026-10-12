@@ -42,6 +42,7 @@ pub(crate) struct ExpandFocusLease {
     window: Window,
     workspace: u64,
     output: Option<Output>,
+    resize_input: Option<SpatialInput>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -153,6 +154,20 @@ impl State {
             return false;
         }
         session.delta = delta;
+        if let Some(axis) = self.niri.layout.spine_axis(window) {
+            if raw.grows_locked_axis(axis) {
+                return self
+                    .submit_spine_expansion_with_resize(
+                        workspace_id,
+                        vec![window.clone()],
+                        Kind::ExpandDirect,
+                        Some(window.clone()),
+                        Some((delta, input)),
+                    )
+                    .is_ok();
+            }
+            return self.niri.layout.interactive_resize_update(window, delta);
+        }
         let plans = self.niri.layout.shrink_plans(window, behavior.thickness);
         let legal = plans.map_or([false; 2], |plans| {
             [
@@ -272,6 +287,9 @@ impl State {
         let Some(raw) = self.niri.layout.spatial_resize_intent(window, delta) else {
             return false;
         };
+        if let Some(axis) = self.niri.layout.spine_axis(window) {
+            return raw.grows_locked_axis(axis);
+        }
         let Some(plans) = self.niri.layout.shrink_plans(window, behavior.thickness) else {
             return false;
         };
@@ -539,13 +557,32 @@ impl State {
         kind: Kind,
         focus: Option<Window>,
     ) -> Result<Option<Record>, Rejected> {
-        let actual = self
+        self.submit_spine_expansion_with_resize(workspace, windows, kind, focus, None)
+    }
+
+    fn submit_spine_expansion_with_resize(
+        &mut self,
+        workspace: u64,
+        windows: Vec<Window>,
+        kind: Kind,
+        focus: Option<Window>,
+        resize: Option<(Point<f64, Logical>, SpatialInput)>,
+    ) -> Result<Option<Record>, Rejected> {
+        let ws = self
             .niri
             .layout
             .workspaces_mut()
             .find(|ws| ws.id().get() == workspace)
-            .ok_or(Rejected::NoTarget)?
-            .restore_normal_spines(&windows);
+            .ok_or(Rejected::NoTarget)?;
+        let actual = if let Some((delta, _)) = resize {
+            if ws.restore_spine_for_resize(&windows[0], delta) {
+                windows.clone()
+            } else {
+                Vec::new()
+            }
+        } else {
+            ws.restore_normal_spines(&windows)
+        };
         if actual.is_empty() {
             return Ok(None);
         }
@@ -570,11 +607,14 @@ impl State {
         self.ipc_refresh_shrink_expand();
         if let Some(window) = focus {
             self.cancel_expand_focus_lease();
-            self.niri.layout.activate_window(&window);
+            if resize.is_none() {
+                self.niri.layout.activate_window(&window);
+            }
             self.niri.shrink_expand_focus = Some(ExpandFocusLease {
                 window,
                 workspace,
                 output: self.niri.layout.active_output().cloned(),
+                resize_input: resize.map(|(_, input)| input),
             });
         }
         self.refresh_shrink_expand_operations();
@@ -600,8 +640,21 @@ impl State {
         let Some(lease) = self.niri.shrink_expand_focus.as_ref() else {
             return;
         };
+        // This may run inside ResizeGrab::frame while the originating device is borrowed.
+        // Never ask the generic seat guard to borrow that device again.
+        let resizing = lease.resize_input.filter(|input| {
+            self.niri
+                .shrink_spatial_session
+                .as_ref()
+                .is_some_and(|session| session.window == lease.window && session.input == *input)
+        });
+        let seat_allowed = if let Some(input) = resizing {
+            self.can_shrink_spatial(input)
+        } else {
+            self.can_expand_spines()
+        };
         let valid = self.niri.config.borrow().shrink_expand.enabled
-            && self.can_expand_spines()
+            && seat_allowed
             && self.niri.layout.active_output() == lease.output.as_ref()
             && self.niri.layout.active_workspace().is_some_and(|ws| {
                 ws.id().get() == lease.workspace
@@ -619,7 +672,9 @@ impl State {
             .is_some_and(|w| w.window == lease.window)
         {
             self.niri.shrink_expand_focus = None;
-            self.maybe_warp_cursor_to_focus();
+            if resizing.is_none() {
+                self.maybe_warp_cursor_to_focus();
+            }
         }
     }
 

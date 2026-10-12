@@ -2,8 +2,8 @@
 
 The `shrink/development` branch provides the five base commands below when
 `enabled true`, with independent spine rendering and compositor-owned hit regions.
-Book lock-axis drag expansion, adjacent selection, complete expansion visuals and disable-time
-restoration remain under development. This is a partial development candidate;
+Adjacent selection, complete expansion visuals and disable-time restoration
+remain under development. This is a partial development candidate;
 the installed Sink session has not been replaced by this branch.
 
 ```kdl
@@ -210,5 +210,25 @@ resizes retain native frame batching.
 
 Pointer/Wayland fixtures and software EGL verify these normal-window paths. Touch
 and tablet lifecycle hooks are connected but their device-specific behavior still
-needs qualification. Book lock-axis expansion and continuation of that same grab
-through restoration remain under development.
+needs qualification.
+
+## Resizing a spine
+
+Dragging along the free axis keeps the window collapsed. Growing along its locked
+axis inserts its normal content at the current slot, using this motion's sizing
+intent and native client/column constraints. It retains the window ID and native
+owner, without restoring a saved pre-shrink size.
+
+The same ResizeGrab continues after expansion. Its size and cumulative-delta origin
+are rebased at the form change so the next motion continues from the new normal
+allocation. Floating left/top resizing retains the opposite edge. The expanded
+client remains behind the existing finite commit/deadline input barrier; later
+resize requests update that allocation without extending the original deadline.
+Once the barrier settles, dragging smaller can enter spatial Shrink again, and a
+valid release collapses the window. Keyboard dimension commands keep their
+existing focus requirements and do not expand a committed spine.
+
+Selecting the restored scrolling column preserves only this owned resize; ordinary
+column navigation retains its usual cancellation rule. Native MoveGrab thresholds,
+detachment and insertion remain unchanged. A last unframed locked-axis grow is
+processed at release, while ordinary and feature-off release batching is preserved.

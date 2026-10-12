@@ -175,7 +175,16 @@ niri_render_elements! {
 pub(super) struct InteractiveResize<W: LayoutElement> {
     pub window: W::Id,
     pub original_window_size: Size<f64, Logical>,
+    /// Cumulative device delta at the most recent same-grab form change.
+    pub delta_origin: Point<f64, Logical>,
     pub data: InteractiveResizeData,
+}
+
+/// Read-only native resize basis, including a same-grab form-change origin.
+pub(super) struct ResizeComponents {
+    pub original: Size<f64, Logical>,
+    pub gain: Point<f64, Logical>,
+    pub delta_origin: Point<f64, Logical>,
 }
 
 /// Resolved width or height in logical pixels.
@@ -859,6 +868,70 @@ impl<W: LayoutElement> Workspace<W> {
         self.floating
             .commit_normal_restore(&plans, transaction, settle_matching);
         plans.into_iter().map(|(id, _)| id).collect()
+    }
+
+    /// Restore only the spine owned by the current resize, using this motion's intent.
+    /// The original native grab stays alive; its cumulative delta is rebased once.
+    pub(crate) fn restore_spine_for_resize(
+        &mut self,
+        id: &W::Id,
+        delta: Point<f64, Logical>,
+    ) -> bool {
+        let Some(intent) = self.spatial_resize_intent(id, delta) else {
+            return false;
+        };
+        let Some(axis) = self
+            .tiles()
+            .find(|tile| tile.window().id() == id)
+            .and_then(|tile| match tile.form() {
+                super::shrink_expand::WindowForm::Spine(axis) => Some(axis),
+                super::shrink_expand::WindowForm::Normal => None,
+            })
+        else {
+            return false;
+        };
+        if !intent.grows_locked_axis(axis) {
+            return false;
+        }
+        let floating = self.floating.has_window(id);
+        let requests = self.normal_spine_requests(std::slice::from_ref(id));
+        let plans = if floating {
+            self.floating
+                .normal_spine_plans_with_resize(std::slice::from_ref(id), Some((id, intent)))
+        } else {
+            self.scrolling
+                .normal_spine_plans_with_resize(&requests, Some((id, intent)))
+        };
+        let Some((_, plan)) = plans.first() else {
+            return false;
+        };
+        let plan = *plan;
+        if floating {
+            self.floating.anchor_spine_restore(id, plan);
+        }
+        let tile = self.tiles_mut().find(|t| t.window().id() == id).unwrap();
+        if !tile.prepare_normal_restore(plan) {
+            return false;
+        }
+        let transaction = Transaction::new();
+        if floating {
+            self.floating
+                .commit_normal_restore(&plans, transaction, true);
+            self.activate_window(id);
+            self.floating.rebase_spine_resize(id, delta, plan);
+        } else {
+            self.scrolling.commit_normal_restore_with_resize(
+                &plans,
+                &requests,
+                transaction,
+                true,
+                Some((id, intent)),
+            );
+            self.scrolling.activate_window_during_resize(id);
+            self.floating_is_active = FloatingActive::No;
+            self.scrolling.rebase_spine_resize(id, delta, plan);
+        }
+        true
     }
 
     pub(super) fn spines_for_mode_request(&self, id: &W::Id, column_mode: bool) -> Vec<W::Id> {

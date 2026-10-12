@@ -5,6 +5,176 @@ use crate::layout::shrink_expand::{ShrinkAxis, SpineGeometry, WindowForm};
 use crate::layout::workspace::{Workspace, WorkspaceAddWindowTarget};
 
 #[test]
+fn spine_resize_normal_insertion_reuses_shared_constraints_and_native_gain() {
+    use crate::utils::ResizeEdge;
+    for scale in [1., 1.25] {
+        for centered in [false, true] {
+            for axis in [ShrinkAxis::Horizontal, ShrinkAxis::Vertical] {
+                let mut options = Options::default();
+                options.layout.border.off = false;
+                options.layout.border.width = 2.5;
+                options.layout.center_focused_column = if centered {
+                    niri_config::CenterFocusedColumn::Always
+                } else {
+                    niri_config::CenterFocusedColumn::Never
+                };
+                let options = Rc::new(options);
+                let mut space = scrolling(scale, options.clone());
+                let mut params = TestWindowParams::new(1);
+                params.min_max_size = ((500, 100).into(), (0, 0).into());
+                let mut ordinary = Tile::new(
+                    TestWindow::new(params),
+                    (1280., 720.).into(),
+                    scale,
+                    Clock::with_time(Duration::ZERO),
+                    options.clone(),
+                );
+                ordinary.clock = space.clock().clone();
+                space.add_tile(None, ordinary, true, ColumnWidth::Fixed(800.), false, None);
+                let mut params = TestWindowParams::new(2);
+                params.min_max_size = ((150, 120).into(), (900, 500).into());
+                let client = TestWindow::new(params);
+                let mut book = Tile::new(
+                    client.clone(),
+                    (1280., 720.).into(),
+                    scale,
+                    Clock::with_time(Duration::ZERO),
+                    options,
+                );
+                book.clock = space.clock().clone();
+                assert!(book.set_spine(axis, 40.1));
+                space.add_tile_to_column(0, None, book, false);
+                let edges = match axis {
+                    ShrinkAxis::Horizontal => ResizeEdge::LEFT,
+                    ShrinkAxis::Vertical => ResizeEdge::TOP,
+                };
+                assert!(space.interactive_resize_begin(2, edges));
+                let delta = (-180., -180.).into();
+                let intent = space.spatial_resize_intent(&2, delta).unwrap();
+                assert!(intent.grows_locked_axis(axis));
+                let requests = [(2, ColumnWidth::Fixed(760.))];
+                let plans = space.normal_spine_plans_with_resize(&requests, Some((&2, intent)));
+                let plan = plans[0].1;
+                assert!(
+                    plan.client_size.w >= 500,
+                    "shared ordinary minimum must survive"
+                );
+                assert!(plan.client_size.h >= 120 && plan.client_size.h <= 500);
+                assert!(space
+                    .tiles_mut()
+                    .find(|t| t.window().id() == &2)
+                    .unwrap()
+                    .prepare_normal_restore(plan));
+                space.commit_normal_restore_with_resize(
+                    &plans,
+                    &requests,
+                    Transaction::new(),
+                    true,
+                    Some((&2, intent)),
+                );
+                space.rebase_spine_resize(&2, delta, plan);
+                assert_eq!(client.requested_size(), Some(plan.client_size));
+                space.interactive_resize_update(&2, delta);
+                assert_eq!(
+                    client.requested_size(),
+                    Some(plan.client_size),
+                    "same pointer position must not jump"
+                );
+                let raw = space
+                    .spatial_resize_intent(&2, (-200., -200.).into())
+                    .unwrap();
+                match axis {
+                    ShrinkAxis::Horizontal => {
+                        assert!(
+                            (raw.requested.w - plan.allocation.w + 20. * intent.gain.x).abs()
+                                < 1e-6
+                        )
+                    }
+                    ShrinkAxis::Vertical => {
+                        assert!(
+                            (raw.requested.h - plan.allocation.h + 20. * intent.gain.y).abs()
+                                < 1e-6
+                        )
+                    }
+                }
+                settle(&mut space);
+                space.verify_invariants();
+                assert_eq!(space.columns().count(), 1);
+                assert_eq!(
+                    space.tiles().map(|t| *t.window().id()).collect::<Vec<_>>(),
+                    vec![1, 2]
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn spine_resize_floating_normal_constraints_keep_opposite_edges_without_double_shift() {
+    use crate::utils::ResizeEdge;
+    for scale in [1., 1.25] {
+        for axis in [ShrinkAxis::Horizontal, ShrinkAxis::Vertical] {
+            let mut options = Options::default();
+            options.layout.border.off = false;
+            options.layout.border.width = 2.5;
+            let options = Rc::new(options);
+            let mut params = TestWindowParams::new(1);
+            params.min_max_size = ((150, 120).into(), (400, 300).into());
+            let client = TestWindow::new(params);
+            let mut book = Tile::new(
+                client.clone(),
+                (1280., 720.).into(),
+                scale,
+                Clock::with_time(Duration::ZERO),
+                options.clone(),
+            );
+            assert!(book.set_spine(axis, 40.1));
+            let mut space = FloatingSpace::new(
+                (1280., 720.).into(),
+                Rectangle::from_size((1280., 720.).into()),
+                scale,
+                Clock::with_time(Duration::ZERO),
+                options,
+            );
+            book.clock = space.clock().clone();
+            space.add_tile(book, false);
+            assert!(space.interactive_resize_begin(1, ResizeEdge::LEFT | ResizeEdge::TOP));
+            let (old_size, old_pos) = space
+                .tiles_with_offsets()
+                .map(|(t, p)| (t.tile_size(), p))
+                .next()
+                .unwrap();
+            let delta = (-700., -700.).into();
+            let intent = space.spatial_resize_intent(&1, delta).unwrap();
+            let plans = space.normal_spine_plans_with_resize(&[1], Some((&1, intent)));
+            let plan = plans[0].1;
+            assert_eq!(plan.client_size, (400, 300).into());
+            space.anchor_spine_restore(&1, plan);
+            assert!(space
+                .tiles_mut()
+                .next()
+                .unwrap()
+                .prepare_normal_restore(plan));
+            space.commit_normal_restore(&plans, Transaction::new(), true);
+            space.rebase_spine_resize(&1, delta, plan);
+            let (_, new_pos) = space.tiles_with_offsets().next().unwrap();
+            assert!((old_pos.x + old_size.w - new_pos.x - plan.allocation.w).abs() < 1e-6);
+            assert!((old_pos.y + old_size.h - new_pos.y - plan.allocation.h).abs() < 1e-6);
+            space.interactive_resize_update(&1, delta);
+            assert_eq!(space.tiles_with_offsets().next().unwrap().1, new_pos);
+            assert_eq!(client.requested_size(), Some(plan.client_size));
+            for _ in 0..4 {
+                if client.communicate() {
+                    space.update_window(&1, None);
+                }
+            }
+            assert_eq!(space.tiles_with_offsets().next().unwrap().1, new_pos);
+            space.verify_invariants();
+        }
+    }
+}
+
+#[test]
 fn spatial_raw_query_preserves_native_edges_centering_and_topmost_restriction() {
     for centered in [false, true] {
         let mut options = Options::default();
@@ -59,6 +229,7 @@ fn spatial_zone_zero_is_strict_and_corner_selection_has_stable_ties() {
         requested: (100., 100.).into(),
         minimum: (100., 100.).into(),
         gain: (1., 1.).into(),
+        delta_origin: (0., 0.).into(),
     };
     assert_eq!(raw.choose_axis(0., [true, true], None), None);
     assert_eq!(
@@ -79,6 +250,12 @@ fn spatial_zone_zero_is_strict_and_corner_selection_has_stable_ties() {
     raw.requested.h = 90.;
     assert_eq!(
         raw.choose_axis(0., [true, true], None),
+        Some(ShrinkAxis::Vertical)
+    );
+    raw.gain = (1., 1.).into();
+    raw.requested = (-500., -600.).into();
+    assert_eq!(
+        raw.choose_axis(24., [true, true], None),
         Some(ShrinkAxis::Vertical)
     );
 }

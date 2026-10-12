@@ -12,7 +12,7 @@ use super::closing_window::{ClosingWindow, ClosingWindowRenderElement};
 use super::scrolling::ColumnWidth;
 use super::shrink_expand::NormalSizePlan;
 use super::tile::{Tile, TileRenderElement, TileRenderSnapshot};
-use super::workspace::{InteractiveResize, ResolvedSize};
+use super::workspace::{InteractiveResize, ResizeComponents, ResolvedSize};
 use super::{
     ConfigureIntent, InteractiveResizeData, LayoutElement, Options, RemovedTile, SizeFrac,
 };
@@ -462,6 +462,14 @@ impl<W: LayoutElement> FloatingSpace<W> {
     /// Plan normal insertion sizes at the current positions without restoring floating memory,
     /// reordering the stack, recentering, configuring clients or changing spine geometry.
     pub fn normal_spine_plans(&self, ids: &[W::Id]) -> Vec<(W::Id, NormalSizePlan)> {
+        self.normal_spine_plans_with_resize(ids, None)
+    }
+
+    pub(super) fn normal_spine_plans_with_resize(
+        &self,
+        ids: &[W::Id],
+        resize: Option<(&W::Id, super::shrink_expand::SpatialResizeIntent)>,
+    ) -> Vec<(W::Id, NormalSizePlan)> {
         self.tiles
             .iter()
             .filter_map(|tile| {
@@ -470,11 +478,21 @@ impl<W: LayoutElement> FloatingSpace<W> {
                 }
                 let win = tile.window();
                 let rules = win.rules();
-                let size = self.new_window_size(
+                let mut size = self.new_window_size(
                     rules.default_width.flatten(),
                     rules.default_height.flatten(),
                     rules,
                 );
+                if let Some((_, intent)) = resize.filter(|(id, _)| *id == win.id()) {
+                    let requested =
+                        tile.normal_window_size_for_tile_size(intent.requested.normal_size());
+                    if intent.gain.x != 0. {
+                        size.w = requested.w.clamp(1, 100000);
+                    }
+                    if intent.gain.y != 0. {
+                        size.h = requested.h.clamp(1, 100000);
+                    }
+                }
                 let client_size = constrain_normal_size(win, size);
                 let mut estimate = client_size;
                 let current = win.size();
@@ -517,6 +535,25 @@ impl<W: LayoutElement> FloatingSpace<W> {
             data.update(tile);
             data.set_logical_pos(pos);
         }
+    }
+
+    pub(super) fn anchor_spine_restore(&mut self, id: &W::Id, plan: NormalSizePlan) {
+        let idx = self.idx_of(id).unwrap();
+        let edges = self.interactive_resize.as_ref().unwrap().data.edges;
+        let data = &mut self.data[idx];
+        let offset = Point::from((
+            if edges.contains(ResizeEdge::LEFT) {
+                data.size.w - plan.allocation.w
+            } else {
+                0.
+            },
+            if edges.contains(ResizeEdge::TOP) {
+                data.size.h - plan.allocation.h
+            } else {
+                0.
+            },
+        ));
+        data.set_logical_pos(data.logical_pos + offset);
     }
 
     pub fn add_tile(&mut self, tile: Tile<W>, activate: bool) {
@@ -960,7 +997,10 @@ impl<W: LayoutElement> FloatingSpace<W> {
         let win_height = ensure_min_max_size(win_height, min_size.h, max_size.h);
 
         let win_size = Size::from((win_width, win_height));
-        win.request_size_once(win_size, animate);
+        tile.request_normal_resize_once(win_size, animate);
+        if tile.has_normal_restore_allocation() {
+            self.update_pending_resize_allocation(idx);
+        }
     }
 
     pub fn set_window_height(&mut self, id: Option<&W::Id>, change: SizeChange, animate: bool) {
@@ -994,7 +1034,36 @@ impl<W: LayoutElement> FloatingSpace<W> {
         let win_width = ensure_min_max_size(win_width, min_size.w, max_size.w);
 
         let win_size = Size::from((win_width, win_height));
-        win.request_size_once(win_size, animate);
+        tile.request_normal_resize_once(win_size, animate);
+        if tile.has_normal_restore_allocation() {
+            self.update_pending_resize_allocation(idx);
+        }
+    }
+
+    fn update_pending_resize_allocation(&mut self, idx: usize) {
+        let tile = &self.tiles[idx];
+        let data = &mut self.data[idx];
+        let previous = data.size;
+        data.update(tile);
+        if let Some(resize) = self
+            .interactive_resize
+            .as_ref()
+            .filter(|r| &r.window == tile.window().id())
+        {
+            let offset = Point::from((
+                if resize.data.edges.contains(ResizeEdge::LEFT) {
+                    previous.w - data.size.w
+                } else {
+                    0.
+                },
+                if resize.data.edges.contains(ResizeEdge::TOP) {
+                    previous.h - data.size.h
+                } else {
+                    0.
+                },
+            ));
+            data.set_logical_pos(data.logical_pos + offset);
+        }
     }
 
     fn request_spine_size(&mut self, idx: usize, size: Size<f64, Logical>) {
@@ -1303,6 +1372,7 @@ impl<W: LayoutElement> FloatingSpace<W> {
         let resize = InteractiveResize {
             window,
             original_window_size,
+            delta_origin: (0., 0.).into(),
             data: InteractiveResizeData { edges },
         };
         self.interactive_resize = Some(resize);
@@ -1310,10 +1380,7 @@ impl<W: LayoutElement> FloatingSpace<W> {
         true
     }
 
-    fn resize_components(
-        &self,
-        window: &W::Id,
-    ) -> Option<(Size<f64, Logical>, Point<f64, Logical>)> {
+    fn resize_components(&self, window: &W::Id) -> Option<ResizeComponents> {
         let resize = self
             .interactive_resize
             .as_ref()
@@ -1335,7 +1402,11 @@ impl<W: LayoutElement> FloatingSpace<W> {
                 1.
             },
         ));
-        Some((resize.original_window_size, gain))
+        Some(ResizeComponents {
+            original: resize.original_window_size,
+            gain,
+            delta_origin: resize.delta_origin,
+        })
     }
 
     pub(super) fn spatial_resize_intent(
@@ -1344,13 +1415,24 @@ impl<W: LayoutElement> FloatingSpace<W> {
         delta: Point<f64, Logical>,
     ) -> Option<super::shrink_expand::SpatialResizeIntent> {
         use super::shrink_expand::ShrinkAxis;
-        let (original, gain) = self.resize_components(window)?;
+        let ResizeComponents {
+            original,
+            gain,
+            delta_origin,
+        } = self.resize_components(window)?;
+        let delta = delta - delta_origin;
         let tile = self
             .tiles
             .iter()
             .find(|tile| tile.window().id() == window)?;
         if tile.is_spine() {
-            return None;
+            return Some(super::shrink_expand::SpatialResizeIntent {
+                original,
+                requested: (original.w + gain.x * delta.x, original.h + gain.y * delta.y).into(),
+                minimum: tile.tile_size(),
+                gain,
+                delta_origin,
+            });
         }
         let minimum = Size::from((
             self.keyboard_resize_intent(
@@ -1362,8 +1444,8 @@ impl<W: LayoutElement> FloatingSpace<W> {
             self.keyboard_resize_intent(window, ShrinkAxis::Vertical, SizeChange::AdjustFixed(0))?
                 .minimum,
         ));
-        let requested: Size<f64, Logical> =
-            Size::from((original.w + gain.x * delta.x, original.h + gain.y * delta.y));
+        let requested: super::shrink_expand::RawResizeSize =
+            (original.w + gain.x * delta.x, original.h + gain.y * delta.y).into();
         Some(super::shrink_expand::SpatialResizeIntent {
             original: (
                 tile.tile_width_for_window_width(original.w),
@@ -1377,7 +1459,23 @@ impl<W: LayoutElement> FloatingSpace<W> {
                 .into(),
             minimum,
             gain,
+            delta_origin,
         })
+    }
+
+    pub(super) fn rebase_spine_resize(
+        &mut self,
+        id: &W::Id,
+        delta: Point<f64, Logical>,
+        plan: NormalSizePlan,
+    ) {
+        let resize = self
+            .interactive_resize
+            .as_mut()
+            .filter(|r| &r.window == id)
+            .unwrap();
+        resize.original_window_size = plan.client_size.to_f64();
+        resize.delta_origin = delta;
     }
 
     pub fn interactive_resize_update(
@@ -1385,9 +1483,15 @@ impl<W: LayoutElement> FloatingSpace<W> {
         window: &W::Id,
         delta: Point<f64, Logical>,
     ) -> bool {
-        let Some((original_window_size, gain)) = self.resize_components(window) else {
+        let Some(ResizeComponents {
+            original: original_window_size,
+            gain,
+            delta_origin,
+        }) = self.resize_components(window)
+        else {
             return false;
         };
+        let delta = delta - delta_origin;
 
         if gain.x != 0. {
             let window_width = (original_window_size.w + gain.x * delta.x).round() as i32;
