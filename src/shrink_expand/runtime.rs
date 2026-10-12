@@ -8,6 +8,7 @@ use smithay::wayland::input_method::InputMethodKeyboardGrab;
 
 use super::{Kind, Record, TargetState, Ticket};
 use crate::layout::shrink_expand::ShrinkAxis;
+use crate::layout::spine_search::SpineSearchMode;
 use crate::layout::LayoutElement as _;
 use crate::niri::{KeyboardFocus, State};
 
@@ -54,6 +55,18 @@ pub(crate) struct ExpandFocusLease {
     workspace: u64,
     output: Option<Output>,
     resize_input: Option<SpatialInput>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct ExpandSelectionLease {
+    workspace: u64,
+    output: Output,
+    origin: Option<Window>,
+    mode: SpineSearchMode,
+    selected: Window,
+    candidates: Vec<(Window, u64)>,
+    overview_open: bool,
+    overview_generation: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -717,10 +730,17 @@ impl State {
             .filter(|(_, w)| actual.contains(&w.window))
             .filter_map(|(_, w)| w.normal_restore_deadline())
             .min();
-        let record = self
-            .niri
-            .shrink_expand
-            .submit_immediate(workspace, targets, kind, deadline);
+        let record = if kind == Kind::ExpandSelection {
+            let ticket = self.niri.shrink_expand.preview().unwrap().record.ticket();
+            self.niri
+                .shrink_expand
+                .submit(ticket, targets, deadline)
+                .unwrap()
+        } else {
+            self.niri
+                .shrink_expand
+                .submit_immediate(workspace, targets, kind, deadline)
+        };
         self.ipc_refresh_shrink_expand();
         if let Some(window) = focus {
             self.cancel_expand_focus_lease();
@@ -842,6 +862,161 @@ impl State {
             && !self.niri.exit_confirm_dialog.is_open()
     }
 
+    fn expand_selection_candidates(
+        &self,
+        lease: &ExpandSelectionLease,
+    ) -> Option<Vec<(Window, u64)>> {
+        if !self.niri.config.borrow().shrink_expand.enabled
+            || !self.can_expand_spines()
+            || self.niri.layout.active_output() != Some(&lease.output)
+            || self.niri.layout.is_overview_open() != lease.overview_open
+            || self.niri.layout.overview_generation() != lease.overview_generation
+            || self.niri.layout.focus().map(|win| &win.window) != lease.origin.as_ref()
+        {
+            return None;
+        }
+        let ws = self.niri.layout.active_workspace()?;
+        if ws.id().get() != lease.workspace {
+            return None;
+        }
+        let search = ws.spine_candidates(lease.origin.as_ref(), |a, b| {
+            a.id().get().cmp(&b.id().get())
+        })?;
+        if search.mode != lease.mode || search.candidates.is_empty() {
+            return None;
+        }
+        let candidates = search
+            .candidates
+            .into_iter()
+            .map(|candidate| {
+                let tile = ws
+                    .tiles()
+                    .find(|tile| tile.window().window == candidate.id)
+                    .unwrap();
+                (candidate.id, tile.window().id().get())
+            })
+            .collect::<Vec<_>>();
+        candidates
+            .iter()
+            .any(|(window, _)| window == &lease.selected)
+            .then_some(candidates)
+    }
+
+    /// Internal selection entry; the public command awaits its content presentation adapter.
+    #[doc(hidden)]
+    pub fn begin_expand_selection(&mut self) -> Result<Record, Rejected> {
+        if !self.niri.config.borrow().shrink_expand.enabled {
+            return Err(Rejected::Disabled);
+        }
+        if let Some(preview) = self.niri.shrink_expand.preview() {
+            if preview.record.kind != Kind::ExpandSelection || !self.shrink_preview_valid() {
+                return Ok(self.cancel_shrink_expand_preview().unwrap());
+            }
+        }
+        if !self.can_expand_spines() {
+            return Err(Rejected::Blocked);
+        }
+        let lease = if let Some(lease) = self.niri.expand_selection_lease.as_ref() {
+            let mut lease = lease.clone();
+            let candidates = self.expand_selection_candidates(&lease).unwrap();
+            let index = candidates
+                .iter()
+                .position(|(window, _)| window == &lease.selected)
+                .unwrap();
+            lease.selected = candidates[(index + 1) % candidates.len()].0.clone();
+            lease.candidates = candidates;
+            lease
+        } else {
+            let ws = self
+                .niri
+                .layout
+                .active_workspace()
+                .ok_or(Rejected::NoTarget)?;
+            let origin = self.niri.layout.focus().map(|win| win.window.clone());
+            let search = ws
+                .spine_candidates(origin.as_ref(), |a, b| a.id().get().cmp(&b.id().get()))
+                .ok_or(Rejected::NoTarget)?;
+            let candidates = search
+                .candidates
+                .into_iter()
+                .map(|candidate| {
+                    let tile = ws
+                        .tiles()
+                        .find(|tile| tile.window().window == candidate.id)
+                        .unwrap();
+                    (candidate.id, tile.window().id().get())
+                })
+                .collect::<Vec<_>>();
+            let selected = candidates.first().ok_or(Rejected::NoTarget)?.0.clone();
+            ExpandSelectionLease {
+                workspace: ws.id().get(),
+                output: self
+                    .niri
+                    .layout
+                    .active_output()
+                    .ok_or(Rejected::NoTarget)?
+                    .clone(),
+                origin,
+                mode: search.mode,
+                selected,
+                candidates,
+                overview_open: self.niri.layout.is_overview_open(),
+                overview_generation: self.niri.layout.overview_generation(),
+            }
+        };
+        let selected_id = lease
+            .candidates
+            .iter()
+            .find(|(window, _)| window == &lease.selected)
+            .unwrap()
+            .1;
+        let delay = Duration::from_millis(u64::from(
+            self.niri.config.borrow().shrink_expand.expand_buffer_ms,
+        ));
+        let now = Instant::now();
+        let record = if self.niri.shrink_expand.preview().is_some() {
+            self.niri
+                .shrink_expand
+                .revise(Kind::ExpandSelection, vec![selected_id], now, delay)
+                .unwrap()
+        } else {
+            self.niri.shrink_expand.start(
+                lease.workspace,
+                vec![selected_id],
+                Kind::ExpandSelection,
+                now,
+                delay,
+            )
+        };
+        // Store soft identities only; no layout/window ownership is transferred by selection.
+        self.niri.expand_selection_lease = Some(lease);
+        self.arm_shrink_preview_timer();
+        self.ipc_refresh_shrink_expand();
+        self.niri.queue_redraw_all();
+        Ok(record)
+    }
+
+    fn confirm_expand_selection(&mut self, ticket: Ticket) -> Option<Record> {
+        if !self.shrink_preview_valid() {
+            return self.cancel_shrink_expand_preview();
+        }
+        let lease = self.niri.expand_selection_lease.take().unwrap();
+        if let Some((token, _)) = self.niri.shrink_preview_timer.take() {
+            self.niri.event_loop.remove(token);
+        }
+        // The validated preview record is submitted by the same native restoration path.
+        debug_assert!(self.niri.shrink_expand.matches(ticket));
+        self.submit_spine_expansion(
+            lease.workspace,
+            vec![lease.selected.clone()],
+            Kind::ExpandSelection,
+            Some(lease.selected),
+        )
+        .ok()
+        .flatten()
+        .or_else(|| self.cancel_shrink_expand_preview())
+    }
+
     /// Internal timed entry. Public actions are added only with their presentation/IPC adapter.
     #[doc(hidden)]
     pub fn begin_shrink_preview(&mut self, axis: Option<ShrinkAxis>) -> Result<Record, Rejected> {
@@ -927,6 +1102,21 @@ impl State {
         let Some(preview) = self.niri.shrink_expand.preview() else {
             return false;
         };
+        if preview.record.kind == Kind::ExpandSelection {
+            return self
+                .niri
+                .expand_selection_lease
+                .as_ref()
+                .is_some_and(|lease| {
+                    self.expand_selection_candidates(lease).is_some()
+                        && lease.workspace == preview.record.workspace
+                        && lease
+                            .candidates
+                            .iter()
+                            .find(|(window, _)| window == &lease.selected)
+                            .is_some_and(|(_, id)| preview.record.targets.as_slice() == [*id])
+                });
+        }
         let Some(lease) = &self.niri.shrink_preview_lease else {
             return false;
         };
@@ -998,6 +1188,7 @@ impl State {
             self.niri.event_loop.remove(token);
         }
         self.niri.shrink_preview_lease = None;
+        self.niri.expand_selection_lease = None;
         self.niri.layout.clear_shrink_previews();
         let record = self.niri.shrink_expand.cancel();
         if record.is_some() {
@@ -1011,6 +1202,9 @@ impl State {
     pub fn confirm_shrink_preview(&mut self, ticket: Ticket) -> Option<Record> {
         if !self.niri.shrink_expand.matches(ticket) {
             return None;
+        }
+        if self.niri.shrink_expand.preview().unwrap().record.kind == Kind::ExpandSelection {
+            return self.confirm_expand_selection(ticket);
         }
         if self
             .niri
@@ -1081,6 +1275,15 @@ impl State {
     pub(crate) fn refresh_shrink_expand_operations(&mut self) {
         if self.niri.shrink_expand.preview().is_some() && !self.shrink_preview_valid() {
             self.cancel_shrink_expand_preview();
+        }
+        if let Some(lease) = self.niri.expand_selection_lease.as_ref() {
+            if let Some(candidates) = self.expand_selection_candidates(lease) {
+                self.niri
+                    .expand_selection_lease
+                    .as_mut()
+                    .unwrap()
+                    .candidates = candidates;
+            }
         }
         if let Some(preview) = self.niri.shrink_expand.preview() {
             if let Kind::ShrinkTimed(axis) = preview.record.kind {

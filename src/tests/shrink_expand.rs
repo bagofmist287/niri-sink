@@ -2439,6 +2439,423 @@ fn actual_session_lock_cancels_deferred_expand_focus_without_rearming_the_deadli
     }
 }
 
+struct SelectionFixture {
+    fixture: Fixture,
+    client: super::client::ClientId,
+    surfaces: Vec<wayland_client::protocol::wl_surface::WlSurface>,
+    windows: Vec<(u64, smithay::desktop::Window)>,
+}
+
+fn selection_fixture(all: bool, floating: bool) -> SelectionFixture {
+    let (mut fixture, client, surfaces) = timed_shrink_fixture(4, floating, 60000);
+    fixture
+        .niri()
+        .config
+        .borrow_mut()
+        .shrink_expand
+        .expand_buffer_ms = 60000;
+    let mut windows = fixture
+        .niri()
+        .layout
+        .windows()
+        .map(|(_, window)| (window.id().get(), window.window.clone()))
+        .collect::<Vec<_>>();
+    windows.sort_by_key(|(id, _)| *id);
+    for (index, (_, window)) in windows.iter().enumerate() {
+        if all || index > 0 {
+            assert!(fixture
+                .niri()
+                .layout
+                .commit_shrink(window, ShrinkAxis::Horizontal, 32.));
+        }
+        if floating {
+            use niri_ipc::PositionChange;
+            fixture.niri().layout.move_floating_window(
+                Some(window),
+                PositionChange::SetFixed(100. + index as f64 * 100.),
+                PositionChange::SetFixed(150.),
+                false,
+            );
+        }
+    }
+    if !all {
+        fixture.niri_state().focus_window(&windows[0].1);
+    }
+    fixture.double_roundtrip(client);
+    fixture.niri_complete_animations();
+    SelectionFixture {
+        fixture,
+        client,
+        surfaces,
+        windows,
+    }
+}
+
+#[test]
+fn expand_selection_cycles_without_configuring_or_replacing_the_original_focus() {
+    use crate::shrink_expand::{Kind, Phase};
+    for all in [false, true] {
+        for floating in [false, true] {
+            let SelectionFixture {
+                mut fixture,
+                client,
+                surfaces,
+                windows,
+            } = selection_fixture(all, floating);
+            if floating && !all {
+                assert_eq!(
+                    fixture.niri_state().begin_expand_selection(),
+                    Err(crate::shrink_expand::Rejected::NoTarget)
+                );
+                continue;
+            }
+            let old_focus = fixture.niri().keyboard_focus.surface().cloned();
+            let before = surfaces
+                .iter()
+                .map(|surface| {
+                    fixture
+                        .client(client)
+                        .window(surface)
+                        .configures_received
+                        .len()
+                })
+                .collect::<Vec<_>>();
+            let candidate_ids = windows
+                .iter()
+                .skip(if all { 0 } else { 1 })
+                .map(|(id, _)| *id)
+                .collect::<Vec<_>>();
+            let first = fixture.niri_state().begin_expand_selection().unwrap();
+            assert_eq!(first.kind, Kind::ExpandSelection);
+            assert_eq!(first.phase, Phase::Previewing);
+            assert_eq!(first.targets, vec![candidate_ids[0]]);
+            for expected in candidate_ids
+                .iter()
+                .skip(1)
+                .chain(std::iter::once(&candidate_ids[0]))
+            {
+                let repeated = fixture.niri_state().begin_expand_selection().unwrap();
+                assert_eq!(repeated.id, first.id);
+                assert!(repeated.revision > first.revision);
+                assert_eq!(repeated.targets, vec![*expected]);
+                assert!(fixture
+                    .niri_state()
+                    .confirm_shrink_preview(first.ticket())
+                    .is_none());
+            }
+            fixture.double_roundtrip(client);
+            assert_eq!(fixture.niri().keyboard_focus.surface().cloned(), old_focus);
+            assert_eq!(
+                surfaces
+                    .iter()
+                    .map(|surface| fixture
+                        .client(client)
+                        .window(surface)
+                        .configures_received
+                        .len())
+                    .collect::<Vec<_>>(),
+                before
+            );
+            assert_eq!(
+                fixture
+                    .niri_state()
+                    .begin_shrink_preview(None)
+                    .unwrap()
+                    .phase,
+                Phase::Cancelled
+            );
+            assert!(fixture.niri().expand_selection_lease.is_none());
+            assert!(fixture.niri().shrink_preview_timer.is_none());
+            assert_eq!(fixture.niri().keyboard_focus.surface().cloned(), old_focus);
+            for (_, window) in windows.iter().skip(if all { 0 } else { 1 }) {
+                assert!(fixture.niri().layout.is_spine(window));
+            }
+        }
+    }
+}
+
+#[test]
+fn expand_selection_keeps_selected_identity_when_other_candidates_close() {
+    let SelectionFixture {
+        mut fixture,
+        client,
+        surfaces,
+        windows,
+    } = selection_fixture(false, false);
+    fixture.niri_state().begin_expand_selection().unwrap();
+    let selected = fixture.niri_state().begin_expand_selection().unwrap();
+    assert_eq!(selected.targets, vec![windows[2].0]);
+    let deadline = fixture.niri().shrink_expand.preview().unwrap().deadline;
+    let window = fixture.client(client).window(&surfaces[1]);
+    window.xdg_toplevel.destroy();
+    window.xdg_surface.destroy();
+    window.surface.destroy();
+    fixture.double_roundtrip(client);
+    let current = fixture.niri().shrink_expand.preview().unwrap();
+    assert_eq!(current.record.ticket(), selected.ticket());
+    assert_eq!(current.record.targets, selected.targets);
+    assert_eq!(current.deadline, deadline);
+    assert_eq!(
+        fixture
+            .niri_state()
+            .begin_expand_selection()
+            .unwrap()
+            .targets,
+        vec![windows[3].0]
+    );
+    assert_eq!(fixture.niri().layout.focus().unwrap().window, windows[0].1);
+}
+
+#[test]
+fn expand_selection_invalidations_cancel_without_substituting_a_new_target() {
+    use crate::shrink_expand::Phase;
+    for reason in [
+        "selected-close",
+        "selected-normal",
+        "workspace",
+        "lock",
+        "disable",
+    ] {
+        let SelectionFixture {
+            mut fixture,
+            client,
+            surfaces,
+            windows,
+        } = selection_fixture(false, false);
+        let first = fixture.niri_state().begin_expand_selection().unwrap();
+        assert_eq!(first.targets, vec![windows[1].0]);
+        let mut lock = None;
+        match reason {
+            "selected-close" => {
+                let window = fixture.client(client).window(&surfaces[1]);
+                window.xdg_toplevel.destroy();
+                window.xdg_surface.destroy();
+                window.surface.destroy();
+            }
+            "selected-normal" => {
+                let ws = fixture
+                    .niri()
+                    .layout
+                    .workspaces_mut()
+                    .find(|ws| ws.has_window(&windows[1].1))
+                    .unwrap();
+                ws.restore_normal_spines(std::slice::from_ref(&windows[1].1));
+            }
+            "workspace" => fixture.niri().layout.switch_workspace_down(),
+            "lock" => lock = Some(super::sink::lock_fixture(&mut fixture, client)),
+            "disable" => fixture.niri().config.borrow_mut().shrink_expand.enabled = false,
+            _ => unreachable!(),
+        }
+        fixture.double_roundtrip(client);
+        assert!(fixture.niri().shrink_expand.preview().is_none(), "{reason}");
+        assert!(fixture.niri().expand_selection_lease.is_none(), "{reason}");
+        assert!(fixture.niri().shrink_preview_timer.is_none(), "{reason}");
+        assert!(fixture
+            .niri_state()
+            .confirm_shrink_preview(first.ticket())
+            .is_none());
+        assert!(fixture
+            .niri()
+            .shrink_expand
+            .records()
+            .any(|record| record.id == first.id && record.phase == Phase::Cancelled));
+        assert!(fixture.niri().layout.is_spine(&windows[2].1));
+        assert!(fixture.niri().layout.is_spine(&windows[3].1));
+        if let Some(lock) = lock {
+            lock.unlock_and_destroy();
+            fixture.double_roundtrip(client);
+        }
+    }
+    // A formerly all-spine scope never silently changes into a local search.
+    let SelectionFixture {
+        mut fixture,
+        client,
+        surfaces,
+        windows,
+    } = selection_fixture(true, false);
+    let first = fixture.niri_state().begin_expand_selection().unwrap();
+    let ws = fixture
+        .niri()
+        .layout
+        .workspaces_mut()
+        .find(|ws| ws.has_window(&windows[3].1))
+        .unwrap();
+    ws.restore_normal_spines(std::slice::from_ref(&windows[3].1));
+    let window = fixture.client(client).window(&surfaces[3]);
+    window.ack_last_and_commit();
+    fixture.double_roundtrip(client);
+    assert!(fixture.niri().shrink_expand.preview().is_none());
+    assert!(fixture
+        .niri_state()
+        .confirm_shrink_preview(first.ticket())
+        .is_none());
+}
+
+#[test]
+fn expand_selection_confirmation_restores_only_the_selected_window_and_operation_id() {
+    use crate::shrink_expand::{FinishReason, Kind, Phase};
+    for floating in [false, true] {
+        let SelectionFixture {
+            mut fixture,
+            client,
+            surfaces,
+            windows,
+        } = selection_fixture(true, floating);
+        let mut config = expand_test_config();
+        config.shrink_expand.expand_buffer_ms = 60000;
+        fixture.niri_state().reload_config(Ok(config));
+        let first = fixture.niri_state().begin_expand_selection().unwrap();
+        let selected = fixture.niri_state().begin_expand_selection().unwrap();
+        assert_eq!(selected.targets, vec![windows[1].0]);
+        assert!(fixture
+            .niri_state()
+            .confirm_shrink_preview(first.ticket())
+            .is_none());
+        let submitted = fixture
+            .niri_state()
+            .confirm_shrink_preview(selected.ticket())
+            .unwrap();
+        assert_eq!(submitted.id, first.id);
+        assert_eq!(submitted.kind, Kind::ExpandSelection);
+        assert_eq!(submitted.phase, Phase::Submitted);
+        assert!(!fixture.niri().layout.is_spine(&windows[1].1));
+        assert!(fixture.niri().expand_selection_lease.is_none());
+        assert!(fixture.niri().shrink_preview_timer.is_none());
+        for index in [0, 2, 3] {
+            assert!(fixture.niri().layout.is_spine(&windows[index].1));
+        }
+        fixture.double_roundtrip(client);
+        assert!(fixture.niri().keyboard_focus.surface().is_none());
+        let window = fixture.client(client).window(&surfaces[1]);
+        let size = window.configures_received.last().unwrap().1.size;
+        window.set_size(size.0 as u16, size.1 as u16);
+        window.ack_last_and_commit();
+        fixture.double_roundtrip(client);
+        assert_eq!(fixture.niri().layout.focus().unwrap().window, windows[1].1);
+        assert!(fixture
+            .niri()
+            .shrink_expand
+            .records()
+            .any(|record| record.id == first.id
+                && record.kind == Kind::ExpandSelection
+                && record.phase == Phase::Settled
+                && record.reason == Some(FinishReason::Ready)));
+        assert_eq!(fixture.niri().layout.windows().count(), 4);
+    }
+}
+
+#[test]
+fn expand_selection_zero_timer_confirms_the_current_identity_only() {
+    use crate::shrink_expand::{Kind, Phase};
+    let SelectionFixture {
+        mut fixture,
+        client,
+        windows,
+        ..
+    } = selection_fixture(true, false);
+    fixture
+        .niri()
+        .config
+        .borrow_mut()
+        .shrink_expand
+        .expand_buffer_ms = 0;
+    let preview = fixture.niri_state().begin_expand_selection().unwrap();
+    assert_eq!(preview.targets, vec![windows[0].0]);
+    fixture.double_roundtrip(client);
+    assert!(!fixture.niri().layout.is_spine(&windows[0].1));
+    assert!(windows
+        .iter()
+        .skip(1)
+        .all(|(_, window)| fixture.niri().layout.is_spine(window)));
+    assert!(fixture.niri().expand_selection_lease.is_none());
+    assert!(fixture.niri().shrink_preview_timer.is_none());
+    assert!(fixture
+        .niri()
+        .shrink_expand
+        .records()
+        .any(|record| record.id == preview.id
+            && record.kind == Kind::ExpandSelection
+            && matches!(record.phase, Phase::Submitted | Phase::Settled)));
+}
+
+#[test]
+fn expand_selection_keeps_normal_client_keys_and_balances_escape_cancellation() {
+    use super::client::KeyboardEvent;
+    use super::test_input_backend::{TestInputBackend, TestKeyboardKeyEvent};
+    use smithay::backend::input::{InputEvent, InputTime, KeyState};
+    let SelectionFixture {
+        mut fixture,
+        client,
+        surfaces,
+        windows,
+    } = selection_fixture(false, false);
+    let surface = &surfaces[0];
+    let _ = fixture
+        .client(client)
+        .state
+        .recent_keyboard_events(surface)
+        .count();
+    let preview = fixture.niri_state().begin_expand_selection().unwrap();
+    let send = |fixture: &mut Fixture, name: &str, state: KeyState| {
+        let keyboard = fixture.niri().seat.get_keyboard().unwrap();
+        let code = keyboard.with_xkb_state(fixture.niri_state(), |xkb| {
+            let xkb = xkb.xkb().lock().unwrap();
+            unsafe { xkb.keymap() }.key_by_name(name).unwrap()
+        });
+        fixture
+            .niri_state()
+            .process_input_event(InputEvent::<TestInputBackend>::Keyboard {
+                event: TestKeyboardKeyEvent {
+                    time: InputTime::from_micros(0),
+                    code,
+                    state,
+                    count: 1,
+                },
+            });
+        fixture.double_roundtrip(client);
+    };
+    send(&mut fixture, "AC01", KeyState::Pressed);
+    send(&mut fixture, "AC01", KeyState::Released);
+    assert_eq!(
+        fixture
+            .client(client)
+            .state
+            .recent_keyboard_events(surface)
+            .filter(|event| matches!(event, KeyboardEvent::Key { .. }))
+            .count(),
+        2
+    );
+    assert_eq!(
+        fixture
+            .niri()
+            .shrink_expand
+            .preview()
+            .unwrap()
+            .record
+            .ticket(),
+        preview.ticket()
+    );
+    send(&mut fixture, "ESC", KeyState::Pressed);
+    send(&mut fixture, "ESC", KeyState::Released);
+    assert!(fixture.niri().shrink_expand.preview().is_none());
+    assert!(fixture.niri().expand_selection_lease.is_none());
+    assert!(fixture.niri().suppressed_keys.is_empty());
+    assert_eq!(
+        fixture
+            .client(client)
+            .state
+            .recent_keyboard_events(surface)
+            .filter(|event| matches!(event, KeyboardEvent::Key { .. }))
+            .count(),
+        0
+    );
+    assert_eq!(fixture.niri().layout.focus().unwrap().window, windows[0].1);
+    assert!(windows
+        .iter()
+        .skip(1)
+        .all(|(_, window)| fixture.niri().layout.is_spine(window)));
+}
+
 fn expand_test_config() -> niri_config::Config {
     niri_config::Config::parse_mem(
         r#"

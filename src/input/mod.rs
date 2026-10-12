@@ -593,7 +593,11 @@ impl State {
                         }
                     }
 
-                    if pressed && this.niri.shrink_expand.preview().is_some() {
+                    if pressed
+                        && this.niri.shrink_expand.preview().is_some_and(|preview| {
+                            preview.record.kind != crate::shrink_expand::Kind::ExpandSelection
+                        })
+                    {
                         // Use the native suppression set so release stays consumed after cancellation.
                         this.niri.suppressed_keys.insert(key_code);
                         return FilterResult::Intercept(None);

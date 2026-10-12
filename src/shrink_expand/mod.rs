@@ -1,6 +1,7 @@
 //! Seat operation coordination. Records contain identities/results, never layout history.
 mod runtime;
 pub(crate) use runtime::ExpandFocusLease;
+pub(crate) use runtime::ExpandSelectionLease;
 pub(crate) use runtime::PreviewLease;
 pub use runtime::Rejected;
 pub(crate) use runtime::SpineClick;
