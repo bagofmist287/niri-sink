@@ -3,6 +3,8 @@ use std::time::{Duration, Instant};
 use calloop::timer::{TimeoutAction, Timer};
 use smithay::desktop::Window;
 use smithay::output::Output;
+use smithay::utils::{Logical, Point};
+use smithay::wayland::input_method::InputMethodKeyboardGrab;
 
 use super::{Kind, Record, TargetState, Ticket};
 use crate::layout::shrink_expand::ShrinkAxis;
@@ -14,6 +16,25 @@ pub(crate) struct PreviewLease {
     output: Output,
     thickness: f64,
     border: Option<f64>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SpatialInput {
+    Pointer,
+    Touch,
+    Tablet,
+}
+
+#[derive(Debug)]
+pub(crate) struct SpatialSession {
+    window: Window,
+    output: Output,
+    workspace: u64,
+    input: SpatialInput,
+    delta: Point<f64, Logical>,
+    zone: f64,
+    selected: Option<ShrinkAxis>,
+    inhibited: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -32,6 +53,278 @@ pub enum Rejected {
 }
 
 impl State {
+    fn can_shrink_spatial(&self, input: SpatialInput) -> bool {
+        !self.niri.is_locked()
+            && self.niri.popup_grab.is_none()
+            && !self.niri.window_mru_ui.is_open()
+            && !self.niri.screenshot_ui.is_open()
+            && !self.niri.exit_confirm_dialog.is_open()
+            && matches!(self.niri.keyboard_focus, KeyboardFocus::Layout { .. })
+            && self.niri.layout.can_transfer_sink()
+            && !self.niri.seat.get_keyboard().is_some_and(|keyboard| {
+                keyboard.is_grabbed()
+                    && !keyboard
+                        .with_grab(|_, grab| grab.is::<InputMethodKeyboardGrab>())
+                        .unwrap_or(false)
+            })
+            && (input == SpatialInput::Pointer
+                || !self
+                    .niri
+                    .seat
+                    .get_pointer()
+                    .is_some_and(|pointer| pointer.is_grabbed()))
+            && (input == SpatialInput::Touch
+                || !self
+                    .niri
+                    .seat
+                    .get_touch()
+                    .is_some_and(|touch| touch.is_grabbed()))
+    }
+
+    /// Called only by the compositor's existing ResizeGrab, while its own grab may be borrowed.
+    pub(crate) fn spatial_resize_frame(
+        &mut self,
+        window: &Window,
+        delta: Point<f64, Logical>,
+        input: SpatialInput,
+    ) -> bool {
+        let behavior = self.niri.config.borrow().shrink_expand;
+        if !behavior.enabled {
+            if self
+                .niri
+                .shrink_spatial_session
+                .as_ref()
+                .is_some_and(|session| &session.window == window)
+            {
+                self.cancel_shrink_expand_preview();
+            }
+            return self.niri.layout.interactive_resize_update(window, delta);
+        }
+        let raw = self.niri.layout.spatial_resize_intent(window, delta);
+        if !self.can_shrink_spatial(input) || raw.is_none() {
+            if self
+                .niri
+                .shrink_spatial_session
+                .as_ref()
+                .is_some_and(|session| &session.window == window)
+            {
+                self.cancel_shrink_expand_preview();
+            }
+            return self.niri.layout.interactive_resize_update(window, delta);
+        }
+        let raw = raw.unwrap();
+        let Some(output) = self.niri.layout.active_output().cloned() else {
+            return self.niri.layout.interactive_resize_update(window, delta);
+        };
+        let Some(workspace) = self.niri.layout.active_workspace() else {
+            return self.niri.layout.interactive_resize_update(window, delta);
+        };
+        if !workspace.has_window(window) {
+            return self.niri.layout.interactive_resize_update(window, delta);
+        }
+        let workspace_id = workspace.id().get();
+        let id = workspace
+            .tiles()
+            .find(|tile| &tile.window().window == window)
+            .unwrap()
+            .window()
+            .id()
+            .get();
+        let border = workspace
+            .tiles()
+            .find(|tile| &tile.window().window == window)
+            .unwrap()
+            .effective_border_width();
+        if self.niri.shrink_spatial_session.is_none() {
+            self.cancel_shrink_expand_preview();
+            self.niri.shrink_spatial_session = Some(SpatialSession {
+                window: window.clone(),
+                output,
+                workspace: workspace_id,
+                input,
+                delta,
+                zone: behavior.mouse_zone_px,
+                selected: None,
+                inhibited: false,
+            });
+        }
+        let session = self.niri.shrink_spatial_session.as_mut().unwrap();
+        if &session.window != window {
+            return false;
+        }
+        session.delta = delta;
+        let plans = self.niri.layout.shrink_plans(window, behavior.thickness);
+        let legal = plans.map_or([false; 2], |plans| {
+            [
+                plans.get(ShrinkAxis::Horizontal).fits,
+                plans.get(ShrinkAxis::Vertical).fits,
+            ]
+        });
+        let chosen = raw.choose_axis(behavior.mouse_zone_px, legal, session.selected);
+        if chosen.is_none() {
+            session.selected = None;
+            if self.niri.shrink_expand.preview().is_some() {
+                self.cancel_shrink_expand_preview();
+            }
+            let session = self.niri.shrink_spatial_session.as_mut().unwrap();
+            session.inhibited = false;
+            session.zone = behavior.mouse_zone_px;
+            return self.niri.layout.interactive_resize_update(window, delta);
+        }
+        if session.inhibited {
+            return self.niri.layout.interactive_resize_update(window, delta);
+        }
+        let axis = chosen.unwrap();
+        session.selected = Some(axis);
+        if !self
+            .niri
+            .layout
+            .interactive_resize_update(window, raw.held_delta(delta, axis, behavior.mouse_zone_px))
+        {
+            return false;
+        }
+        let kind = Kind::ShrinkSpatial(axis);
+        if self.niri.shrink_expand.preview().is_none() {
+            self.niri.shrink_expand.start(
+                workspace_id,
+                vec![id],
+                kind,
+                Instant::now(),
+                Duration::ZERO,
+            );
+        } else if self.niri.shrink_expand.preview().unwrap().record.kind != kind {
+            self.niri
+                .shrink_expand
+                .revise(kind, vec![id], Instant::now(), Duration::ZERO);
+        }
+        self.niri.shrink_preview_lease = Some(PreviewLease {
+            output: self.niri.layout.active_output().unwrap().clone(),
+            thickness: behavior.thickness,
+            border,
+        });
+        let geometry = self
+            .niri
+            .layout
+            .shrink_plans(window, behavior.thickness)
+            .unwrap()
+            .get(axis)
+            .geometry;
+        let mut pose = geometry.outer_size();
+        match axis {
+            ShrinkAxis::Horizontal => {
+                pose.w = raw
+                    .requested
+                    .w
+                    .clamp(pose.w, (raw.minimum.w + behavior.mouse_zone_px).max(pose.w))
+            }
+            ShrinkAxis::Vertical => {
+                pose.h = raw
+                    .requested
+                    .h
+                    .clamp(pose.h, (raw.minimum.h + behavior.mouse_zone_px).max(pose.h))
+            }
+        }
+        if self.niri.layout.set_shrink_preview(window, pose, false) {
+            self.niri.queue_redraw_all();
+        }
+        self.niri.layout.set_shrink_preview_anchor(
+            window,
+            Point::from((
+                if raw.gain.x.abs() == 2. {
+                    0.5
+                } else if raw.gain.x < 0. {
+                    1.
+                } else {
+                    0.
+                },
+                if raw.gain.y < 0. { 1. } else { 0. },
+            )),
+        );
+        self.ipc_refresh_shrink_expand();
+        true
+    }
+
+    pub(crate) fn spatial_release_needs_update(
+        &self,
+        window: &Window,
+        delta: Point<f64, Logical>,
+    ) -> bool {
+        let behavior = self.niri.config.borrow().shrink_expand;
+        if !behavior.enabled {
+            return false;
+        }
+        if self
+            .niri
+            .shrink_expand
+            .preview()
+            .is_some_and(|preview| matches!(preview.record.kind, Kind::ShrinkSpatial(_)))
+        {
+            return true;
+        }
+        if self
+            .niri
+            .shrink_spatial_session
+            .as_ref()
+            .is_some_and(|session| &session.window == window && session.inhibited)
+        {
+            return false;
+        }
+        let Some(raw) = self.niri.layout.spatial_resize_intent(window, delta) else {
+            return false;
+        };
+        let Some(plans) = self.niri.layout.shrink_plans(window, behavior.thickness) else {
+            return false;
+        };
+        raw.choose_axis(
+            behavior.mouse_zone_px,
+            [
+                plans.get(ShrinkAxis::Horizontal).fits,
+                plans.get(ShrinkAxis::Vertical).fits,
+            ],
+            None,
+        )
+        .is_some()
+    }
+
+    pub(crate) fn finish_spatial_resize(&mut self, window: &Window, released: bool) {
+        let owned = self
+            .niri
+            .shrink_spatial_session
+            .as_ref()
+            .is_some_and(|session| &session.window == window);
+        let submit = released
+            && owned
+            && self.shrink_preview_valid()
+            && self
+                .niri
+                .shrink_expand
+                .preview()
+                .is_some_and(|preview| matches!(preview.record.kind, Kind::ShrinkSpatial(_)));
+        let record = submit.then(|| self.niri.shrink_expand.preview().unwrap().record.clone());
+        let thickness = self.niri.config.borrow().shrink_expand.thickness;
+        self.niri.layout.interactive_resize_end(window);
+        self.niri.shrink_spatial_session = None;
+        if let Some(record) = record {
+            let Kind::ShrinkSpatial(axis) = record.kind else {
+                unreachable!()
+            };
+            if self.niri.layout.commit_shrink(window, axis, thickness) {
+                self.niri.shrink_preview_lease = None;
+                self.niri
+                    .shrink_expand
+                    .submit(record.ticket(), record.targets, None)
+                    .unwrap();
+                self.ipc_refresh_shrink_expand();
+                self.refresh_shrink_expand_operations();
+                self.niri.queue_redraw_all();
+                return;
+            }
+        }
+        if owned {
+            self.cancel_shrink_expand_preview();
+        }
+    }
+
     /// Intercepts only eligible boundary/repeated Shrink intent before common grab side effects.
     pub(crate) fn handle_keyboard_shrink_boundary(&mut self, action: &niri_config::Action) -> bool {
         use niri_config::Action;
@@ -425,11 +718,28 @@ impl State {
         let Some(lease) = &self.niri.shrink_preview_lease else {
             return false;
         };
-        let Kind::ShrinkTimed(axis) = preview.record.kind else {
-            return false;
+        let (axis, permitted) = match preview.record.kind {
+            Kind::ShrinkTimed(axis) => (axis, self.can_start_shrink_preview()),
+            Kind::ShrinkSpatial(axis) => {
+                let Some(session) = &self.niri.shrink_spatial_session else {
+                    return false;
+                };
+                let valid = !session.inhibited
+                    && self.can_shrink_spatial(session.input)
+                    && self.niri.layout.active_output() == Some(&session.output)
+                    && session.workspace == preview.record.workspace
+                    && session.zone == self.niri.config.borrow().shrink_expand.mouse_zone_px
+                    && self
+                        .niri
+                        .layout
+                        .spatial_resize_intent(&session.window, session.delta)
+                        .is_some();
+                (axis, valid)
+            }
+            _ => return false,
         };
         if !self.niri.config.borrow().shrink_expand.enabled
-            || !self.can_start_shrink_preview()
+            || !permitted
             || self.niri.config.borrow().shrink_expand.thickness != lease.thickness
             || self.niri.layout.active_output() != Some(&lease.output)
         {
@@ -462,6 +772,16 @@ impl State {
     }
 
     pub(crate) fn cancel_shrink_expand_preview(&mut self) -> Option<Record> {
+        if self
+            .niri
+            .shrink_expand
+            .preview()
+            .is_some_and(|preview| matches!(preview.record.kind, Kind::ShrinkSpatial(_)))
+        {
+            if let Some(session) = &mut self.niri.shrink_spatial_session {
+                session.inhibited = true;
+            }
+        }
         if let Some((token, _)) = self.niri.shrink_preview_timer.take() {
             self.niri.event_loop.remove(token);
         }
@@ -478,6 +798,14 @@ impl State {
     #[doc(hidden)]
     pub fn confirm_shrink_preview(&mut self, ticket: Ticket) -> Option<Record> {
         if !self.niri.shrink_expand.matches(ticket) {
+            return None;
+        }
+        if self
+            .niri
+            .shrink_expand
+            .preview()
+            .is_some_and(|preview| matches!(preview.record.kind, Kind::ShrinkSpatial(_)))
+        {
             return None;
         }
         if !self.shrink_preview_valid() {

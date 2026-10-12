@@ -2,7 +2,7 @@
 
 The `shrink/development` branch provides the five base commands below when
 `enabled true`, with independent spine rendering and compositor-owned hit regions.
-Mouse buffering, adjacent selection, complete expansion visuals and disable-time
+Book lock-axis drag expansion, adjacent selection, complete expansion visuals and disable-time
 restoration remain under development. This is a partial development candidate;
 the installed Sink session has not been replaced by this branch.
 
@@ -116,7 +116,7 @@ changes that shape immediately without changing the buffer timer. Cancellation
 removes the preview; a successful form commit also clears it. Output, screencast
 and screenshot rendering use separate caches, and capture passes preserve the
 output's presentation-feedback mapping. CPU, Wayland fixture and software EGL
-checks cover these paths; mouse buffering remains under development.
+checks cover these paths; normal-window spatial buffering is described below.
 
 Internal direct and workspace-wide expansion now use the current native slot's
 normal size plan. Direct expansion selects that window, but waits for the
@@ -184,4 +184,31 @@ Changes on the other axis continue as native resize and update the ghost's shape
 without restarting the buffer deadline. These paths retain the original client
 identity/focus context; they do not expand an already committed spine. Existing
 size-command IPC replies remain `Handled`; operation state/events expose any
-boundary-triggered preview. Mouse spatial buffering is still pending.
+boundary-triggered preview.
+
+## Normal-window spatial resize buffering
+
+The existing ResizeGrab reads its raw dimension request before native clamping.
+For a normal window, moving into the minimum-plus-`mouse-zone-px` region continues
+the drag with gray content and a solid virtual window. The normal allocation stays
+at that legal entry boundary; the virtual extent follows the raw pointer request,
+with spine thickness as its lower limit. There is no Shrink timer. Zero zone means
+only a request strictly beyond the native minimum enters the preview.
+
+Leaving the region removes the preview and resumes the same native resize. A valid
+release submits the spine immediately, then uses the usual normal-window focus
+handoff. Forced ungrab, touch cancellation and tablet proximity-out do not commit.
+Escape or an opposite command cancels only the preview; resizing continues and
+cannot immediately reenter that same region until the pointer leaves it first.
+This does not add generic Escape cancellation to ordinary ResizeGrab or MoveGrab.
+
+Edge signs, centered horizontal doubling and the topmost scrolling tile's top-edge
+restriction use the shared native calculation. Virtual left/top-edge resizing keeps
+the opposite edge anchored, and centered resizing keeps the virtual center. Only a
+spatial candidate flushes a final unframed motion at release; ordinary and feature-off
+resizes retain native frame batching.
+
+Pointer/Wayland fixtures and software EGL verify these normal-window paths. Touch
+and tablet lifecycle hooks are connected but their device-specific behavior still
+needs qualification. Book lock-axis expansion and continuation of that same grab
+through restoration remain under development.

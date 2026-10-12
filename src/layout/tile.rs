@@ -1004,6 +1004,12 @@ impl<W: LayoutElement> Tile<W> {
         self.shrink_preview = None;
     }
 
+    pub(crate) fn set_shrink_preview_anchor(&mut self, anchor: Point<f64, Logical>) {
+        if let Some(preview) = &mut self.shrink_preview {
+            preview.set_anchor(anchor);
+        }
+    }
+
     pub fn shrink_preview_pose(&self) -> Option<Size<f64, Logical>> {
         self.shrink_preview.as_ref().map(ShrinkPreview::pose)
     }
@@ -1938,7 +1944,7 @@ impl<W: LayoutElement> Tile<W> {
                 };
                 preview.render(
                     ctx.renderer,
-                    location + self.bob_offset(),
+                    location + self.bob_offset() + preview.offset(self.animated_tile_size()),
                     blocked,
                     alpha * tile_alpha,
                     &mut |e| {

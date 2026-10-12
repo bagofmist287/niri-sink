@@ -5,11 +5,12 @@ use smithay::utils::{Logical, Size};
 use super::SizingMode;
 
 /// Read-only intent for a native keyboard dimension command, before any layout mutation.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) struct KeyboardResizeIntent {
     pub axis: ShrinkAxis,
     pub at_minimum: bool,
     pub direction: std::cmp::Ordering,
+    pub minimum: f64,
 }
 
 impl KeyboardResizeIntent {
@@ -32,7 +33,80 @@ impl KeyboardResizeIntent {
             axis,
             at_minimum: current <= minimum + 1e-6,
             direction: a.partial_cmp(&b).unwrap_or(std::cmp::Ordering::Equal),
+            minimum,
         }
+    }
+}
+
+/// Raw native resize geometry; ephemeral input for one motion, never restoration history.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct SpatialResizeIntent {
+    pub original: Size<f64, Logical>,
+    pub requested: Size<f64, Logical>,
+    pub minimum: Size<f64, Logical>,
+    /// Native edge signs and centering factors; zero means that edge is disallowed.
+    pub gain: smithay::utils::Point<f64, Logical>,
+}
+
+impl SpatialResizeIntent {
+    pub fn choose_axis(
+        &self,
+        zone: f64,
+        legal: [bool; 2],
+        previous: Option<ShrinkAxis>,
+    ) -> Option<ShrinkAxis> {
+        let originals = [self.original.w, self.original.h];
+        let requests = [self.requested.w, self.requested.h];
+        let mins = [self.minimum.w, self.minimum.h];
+        let gains = [self.gain.x, self.gain.y];
+        let eligible = std::array::from_fn::<_, 2, _>(|i| {
+            legal[i]
+                && gains[i] != 0.
+                && requests[i] < originals[i]
+                && if zone == 0. {
+                    requests[i] < mins[i]
+                } else {
+                    requests[i] <= mins[i] + zone
+                }
+        });
+        match eligible {
+            [true, false] => Some(ShrinkAxis::Horizontal),
+            [false, true] => Some(ShrinkAxis::Vertical),
+            [true, true] => {
+                let reductions = [originals[0] - requests[0], originals[1] - requests[1]];
+                let cmp = reductions[0].partial_cmp(&reductions[1]).unwrap();
+                let cmp = if cmp.is_eq() {
+                    ((mins[0] + zone - requests[0]) / (mins[0] + zone).max(1.))
+                        .partial_cmp(&((mins[1] + zone - requests[1]) / (mins[1] + zone).max(1.)))
+                        .unwrap()
+                } else {
+                    cmp
+                };
+                match cmp {
+                    std::cmp::Ordering::Greater => Some(ShrinkAxis::Horizontal),
+                    std::cmp::Ordering::Less => Some(ShrinkAxis::Vertical),
+                    std::cmp::Ordering::Equal => Some(previous.unwrap_or(ShrinkAxis::Horizontal)),
+                }
+            }
+            _ => None,
+        }
+    }
+
+    pub fn held_delta(
+        &self,
+        mut delta: smithay::utils::Point<f64, Logical>,
+        axis: ShrinkAxis,
+        zone: f64,
+    ) -> smithay::utils::Point<f64, Logical> {
+        match axis {
+            ShrinkAxis::Horizontal => {
+                delta.x = (self.minimum.w + zone - self.original.w) / self.gain.x
+            }
+            ShrinkAxis::Vertical => {
+                delta.y = (self.minimum.h + zone - self.original.h) / self.gain.y
+            }
+        }
+        delta
     }
 }
 

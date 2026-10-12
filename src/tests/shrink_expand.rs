@@ -9,6 +9,272 @@ use crate::layout::SizingMode;
 
 struct ShrinkIpcClient(std::io::BufReader<std::os::unix::net::UnixStream>);
 
+fn spatial_test_pointer(
+    fixture: &mut Fixture,
+    edges: crate::utils::ResizeEdge,
+) -> (
+    smithay::desktop::Window,
+    smithay::input::pointer::PointerHandle<crate::niri::State>,
+) {
+    use crate::input::{resize_grab::ResizeGrab, AnyStartData};
+    use smithay::input::pointer::{ButtonEvent, Focus, GrabStartData};
+    use smithay::utils::Serial;
+    let window = fixture.niri().layout.focus().unwrap().window.clone();
+    assert!(fixture
+        .niri()
+        .layout
+        .interactive_resize_begin(window.clone(), edges));
+    let pointer = fixture.niri().seat.get_pointer().unwrap();
+    pointer.button(
+        fixture.niri_state(),
+        &ButtonEvent {
+            serial: Serial::from(400),
+            time: smithay::backend::input::InputTime::now(),
+            button: 0x110,
+            state: smithay::backend::input::ButtonState::Pressed,
+        },
+    );
+    pointer.set_grab(
+        fixture.niri_state(),
+        ResizeGrab::new(
+            AnyStartData::Pointer(GrabStartData {
+                focus: None,
+                button: 0x110,
+                location: (400., 300.).into(),
+            }),
+            window.clone(),
+        ),
+        Serial::from(401),
+        Focus::Clear,
+    );
+    (window, pointer)
+}
+
+fn spatial_test_motion(
+    fixture: &mut Fixture,
+    pointer: &smithay::input::pointer::PointerHandle<crate::niri::State>,
+    delta: (f64, f64),
+) {
+    pointer.motion(
+        fixture.niri_state(),
+        None,
+        &smithay::input::pointer::MotionEvent {
+            location: (400. + delta.0, 300. + delta.1).into(),
+            serial: smithay::utils::Serial::from(402),
+            time: smithay::backend::input::InputTime::now(),
+        },
+    );
+    pointer.frame(fixture.niri_state());
+}
+
+#[test]
+fn spatial_real_pointer_enters_exits_and_release_submits_without_timer() {
+    use crate::shrink_expand::{Kind, Phase};
+    use crate::utils::ResizeEdge;
+    use smithay::input::pointer::ButtonEvent;
+    for floating in [false, true] {
+        for (edges, axis, delta) in [
+            (ResizeEdge::RIGHT, ShrinkAxis::Horizontal, (-140., 0.)),
+            (ResizeEdge::LEFT, ShrinkAxis::Horizontal, (140., 0.)),
+            (ResizeEdge::BOTTOM, ShrinkAxis::Vertical, (0., -70.)),
+        ] {
+            let (mut fixture, client, surfaces) = timed_shrink_fixture(2, floating, 60000);
+            fixture
+                .client(client)
+                .window(surfaces.last().unwrap())
+                .xdg_toplevel
+                .set_min_size(150, 120);
+            fixture
+                .client(client)
+                .window(surfaces.last().unwrap())
+                .commit();
+            fixture.double_roundtrip(client);
+            let (window, pointer) = spatial_test_pointer(&mut fixture, edges);
+            spatial_test_motion(&mut fixture, &pointer, delta);
+            fixture.double_roundtrip(client);
+            let first = fixture
+                .niri()
+                .shrink_expand
+                .preview()
+                .unwrap()
+                .record
+                .clone();
+            assert_eq!(first.kind, Kind::ShrinkSpatial(axis));
+            assert!(fixture
+                .niri()
+                .shrink_expand
+                .preview()
+                .unwrap()
+                .deadline
+                .is_none());
+            assert!(fixture.niri().shrink_preview_timer.is_none());
+            assert!(pointer.is_grabbed());
+            assert!(!fixture.niri().layout.is_spine(&window));
+            spatial_test_motion(&mut fixture, &pointer, (0., 0.));
+            fixture.double_roundtrip(client);
+            assert!(fixture.niri().shrink_expand.preview().is_none());
+            assert!(pointer.is_grabbed());
+            assert!(fixture
+                .niri()
+                .shrink_expand
+                .records()
+                .any(|r| r.id == first.id && r.phase == Phase::Cancelled));
+            spatial_test_motion(&mut fixture, &pointer, delta);
+            fixture.double_roundtrip(client);
+            assert!(fixture.niri().shrink_expand.preview().is_some());
+            pointer.button(
+                fixture.niri_state(),
+                &ButtonEvent {
+                    serial: smithay::utils::Serial::from(403),
+                    time: smithay::backend::input::InputTime::now(),
+                    button: 0x110,
+                    state: smithay::backend::input::ButtonState::Released,
+                },
+            );
+            fixture.double_roundtrip(client);
+            assert!(!pointer.is_grabbed());
+            assert!(fixture.niri().layout.is_spine(&window));
+            assert!(fixture.niri().shrink_expand.preview().is_none());
+            assert!(fixture.niri().shrink_spatial_session.is_none());
+            assert!(fixture
+                .niri()
+                .layout
+                .focus()
+                .is_some_and(|w| w.window != window));
+        }
+    }
+}
+
+#[test]
+fn spatial_cancel_inhibits_current_zone_and_forced_ungrab_never_folds() {
+    use crate::utils::ResizeEdge;
+    use smithay::utils::Serial;
+    for mode in ["abort", "command", "escape"] {
+        let (mut fixture, client, surfaces) = timed_shrink_fixture(2, true, 60000);
+        fixture
+            .client(client)
+            .window(surfaces.last().unwrap())
+            .xdg_toplevel
+            .set_min_size(150, 120);
+        fixture
+            .client(client)
+            .window(surfaces.last().unwrap())
+            .commit();
+        fixture.double_roundtrip(client);
+        let (window, pointer) = spatial_test_pointer(&mut fixture, ResizeEdge::RIGHT);
+        spatial_test_motion(&mut fixture, &pointer, (-140., 0.));
+        fixture.double_roundtrip(client);
+        assert!(fixture.niri().shrink_expand.preview().is_some());
+        if mode == "abort" {
+            pointer.unset_grab(
+                fixture.niri_state(),
+                Serial::from(404),
+                smithay::backend::input::InputTime::now(),
+            );
+        } else {
+            if mode == "command" {
+                fixture
+                    .niri_state()
+                    .do_action(niri_config::Action::CancelShrinkExpand, false);
+            } else {
+                use super::test_input_backend::{TestInputBackend, TestKeyboardKeyEvent};
+                use smithay::backend::input::{InputEvent, InputTime, KeyState};
+                let keyboard = fixture.niri().seat.get_keyboard().unwrap();
+                let code = keyboard.with_xkb_state(fixture.niri_state(), |xkb| {
+                    unsafe { xkb.xkb().lock().unwrap().keymap() }
+                        .key_by_name("ESC")
+                        .unwrap()
+                });
+                for state in [KeyState::Pressed, KeyState::Released] {
+                    fixture.niri_state().process_input_event(
+                        InputEvent::<TestInputBackend>::Keyboard {
+                            event: TestKeyboardKeyEvent {
+                                time: InputTime::from_micros(0),
+                                code,
+                                state,
+                                count: 1,
+                            },
+                        },
+                    );
+                }
+                assert!(fixture.niri().suppressed_keys.is_empty());
+            }
+            assert!(pointer.is_grabbed());
+            spatial_test_motion(&mut fixture, &pointer, (-145., 0.));
+            fixture.double_roundtrip(client);
+            assert!(fixture.niri().shrink_expand.preview().is_none());
+            pointer.button(
+                fixture.niri_state(),
+                &smithay::input::pointer::ButtonEvent {
+                    serial: Serial::from(405),
+                    time: smithay::backend::input::InputTime::now(),
+                    button: 0x110,
+                    state: smithay::backend::input::ButtonState::Released,
+                },
+            );
+        }
+        fixture.double_roundtrip(client);
+        assert!(!fixture.niri().layout.is_spine(&window));
+        assert!(fixture.niri().shrink_spatial_session.is_none());
+        assert!(fixture.niri().shrink_expand.preview().is_none());
+    }
+}
+
+#[test]
+fn spatial_release_flushes_only_a_candidate_and_preserves_ordinary_frame_batching() {
+    use crate::utils::ResizeEdge;
+    use smithay::backend::input::{ButtonState, InputTime};
+    use smithay::input::pointer::{ButtonEvent, MotionEvent};
+    use smithay::utils::Serial;
+    for (enabled, delta, fold) in [
+        (false, -140., false),
+        (true, -20., false),
+        (true, -140., true),
+    ] {
+        let (mut fixture, client, surfaces) = timed_shrink_fixture(2, true, 60000);
+        fixture
+            .client(client)
+            .window(surfaces.last().unwrap())
+            .xdg_toplevel
+            .set_min_size(150, 120);
+        fixture
+            .client(client)
+            .window(surfaces.last().unwrap())
+            .commit();
+        fixture.double_roundtrip(client);
+        fixture.niri().config.borrow_mut().shrink_expand.enabled = enabled;
+        let (window, pointer) = spatial_test_pointer(&mut fixture, ResizeEdge::RIGHT);
+        let before = fixture.niri().layout.focus().unwrap().requested_size();
+        // No frame between final motion and release.
+        pointer.motion(
+            fixture.niri_state(),
+            None,
+            &MotionEvent {
+                location: (400. + delta, 300.).into(),
+                serial: Serial::from(406),
+                time: InputTime::now(),
+            },
+        );
+        pointer.button(
+            fixture.niri_state(),
+            &ButtonEvent {
+                serial: Serial::from(407),
+                time: InputTime::now(),
+                button: 0x110,
+                state: ButtonState::Released,
+            },
+        );
+        assert_eq!(fixture.niri().layout.is_spine(&window), fold);
+        if !fold {
+            assert_eq!(
+                fixture.niri().layout.focus().unwrap().requested_size(),
+                before
+            );
+        }
+        assert!(!pointer.is_grabbed());
+    }
+}
+
 #[test]
 fn keyboard_minimum_boundary_repeats_keep_axis_and_grow_restores_native_resize() {
     use crate::shrink_expand::{Kind, Phase};

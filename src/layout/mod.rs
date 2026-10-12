@@ -1783,6 +1783,16 @@ impl<W: LayoutElement> Layout<W> {
         }
     }
 
+    pub(crate) fn set_shrink_preview_anchor(&mut self, id: &W::Id, anchor: Point<f64, Logical>) {
+        if let Some(tile) = self
+            .workspaces_mut()
+            .flat_map(|ws| ws.tiles_mut())
+            .find(|tile| tile.window().id() == id)
+        {
+            tile.set_shrink_preview_anchor(anchor);
+        }
+    }
+
     /// Moves the active normal tile to its workspace's Sink owner.
     /// The action layer is responsible for feature, seat, lock and popup-grab permission.
     pub fn sink_window(&mut self) -> bool {
@@ -4835,6 +4845,17 @@ impl<W: LayoutElement> Layout<W> {
         }
 
         false
+    }
+
+    pub(crate) fn spatial_resize_intent(
+        &self,
+        id: &W::Id,
+        delta: Point<f64, Logical>,
+    ) -> Option<shrink_expand::SpatialResizeIntent> {
+        self.workspaces()
+            .find(|(_, _, ws)| ws.has_window(id))?
+            .2
+            .spatial_resize_intent(id, delta)
     }
 
     pub fn interactive_resize_end(&mut self, window: &W::Id) {

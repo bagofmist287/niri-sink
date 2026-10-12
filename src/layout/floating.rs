@@ -1310,39 +1310,92 @@ impl<W: LayoutElement> FloatingSpace<W> {
         true
     }
 
+    fn resize_components(
+        &self,
+        window: &W::Id,
+    ) -> Option<(Size<f64, Logical>, Point<f64, Logical>)> {
+        let resize = self
+            .interactive_resize
+            .as_ref()
+            .filter(|resize| &resize.window == window)?;
+        let edges = resize.data.edges;
+        let gain = Point::from((
+            if !edges.intersects(ResizeEdge::LEFT_RIGHT) {
+                0.
+            } else if edges.contains(ResizeEdge::LEFT) {
+                -1.
+            } else {
+                1.
+            },
+            if !edges.intersects(ResizeEdge::TOP_BOTTOM) {
+                0.
+            } else if edges.contains(ResizeEdge::TOP) {
+                -1.
+            } else {
+                1.
+            },
+        ));
+        Some((resize.original_window_size, gain))
+    }
+
+    pub(super) fn spatial_resize_intent(
+        &self,
+        window: &W::Id,
+        delta: Point<f64, Logical>,
+    ) -> Option<super::shrink_expand::SpatialResizeIntent> {
+        use super::shrink_expand::ShrinkAxis;
+        let (original, gain) = self.resize_components(window)?;
+        let tile = self
+            .tiles
+            .iter()
+            .find(|tile| tile.window().id() == window)?;
+        if tile.is_spine() {
+            return None;
+        }
+        let minimum = Size::from((
+            self.keyboard_resize_intent(
+                window,
+                ShrinkAxis::Horizontal,
+                SizeChange::AdjustFixed(0),
+            )?
+            .minimum,
+            self.keyboard_resize_intent(window, ShrinkAxis::Vertical, SizeChange::AdjustFixed(0))?
+                .minimum,
+        ));
+        let requested: Size<f64, Logical> =
+            Size::from((original.w + gain.x * delta.x, original.h + gain.y * delta.y));
+        Some(super::shrink_expand::SpatialResizeIntent {
+            original: (
+                tile.tile_width_for_window_width(original.w),
+                tile.tile_height_for_window_height(original.h),
+            )
+                .into(),
+            requested: (
+                tile.tile_width_for_window_width(requested.w),
+                tile.tile_height_for_window_height(requested.h),
+            )
+                .into(),
+            minimum,
+            gain,
+        })
+    }
+
     pub fn interactive_resize_update(
         &mut self,
         window: &W::Id,
         delta: Point<f64, Logical>,
     ) -> bool {
-        let Some(resize) = &self.interactive_resize else {
+        let Some((original_window_size, gain)) = self.resize_components(window) else {
             return false;
         };
 
-        if window != &resize.window {
-            return false;
-        }
-
-        let original_window_size = resize.original_window_size;
-        let edges = resize.data.edges;
-
-        if edges.intersects(ResizeEdge::LEFT_RIGHT) {
-            let mut dx = delta.x;
-            if edges.contains(ResizeEdge::LEFT) {
-                dx = -dx;
-            };
-
-            let window_width = (original_window_size.w + dx).round() as i32;
+        if gain.x != 0. {
+            let window_width = (original_window_size.w + gain.x * delta.x).round() as i32;
             self.set_window_width(Some(window), SizeChange::SetFixed(window_width), false);
         }
 
-        if edges.intersects(ResizeEdge::TOP_BOTTOM) {
-            let mut dy = delta.y;
-            if edges.contains(ResizeEdge::TOP) {
-                dy = -dy;
-            };
-
-            let window_height = (original_window_size.h + dy).round() as i32;
+        if gain.y != 0. {
+            let window_height = (original_window_size.h + gain.y * delta.y).round() as i32;
             self.set_window_height(Some(window), SizeChange::SetFixed(window_height), false);
         }
 

@@ -23,6 +23,7 @@ pub struct ResizeGrab {
 
     // Accumulated and applied in frame().
     new_location: Point<f64, Logical>,
+    released: bool,
 }
 
 impl ResizeGrab {
@@ -33,11 +34,12 @@ impl ResizeGrab {
             start_data,
             window,
             new_location: location,
+            released: false,
         }
     }
 
     fn on_ungrab(&mut self, state: &mut State) {
-        state.niri.layout.interactive_resize_end(&self.window);
+        state.finish_spatial_resize(&self.window, self.released);
 
         if !self.start_data.is_touch() {
             state
@@ -53,9 +55,22 @@ impl ResizeGrab {
         }
 
         let delta = self.new_location - self.start_data.location();
-        data.niri
-            .layout
-            .interactive_resize_update(&self.window, delta)
+        let input = if self.start_data.is_pointer() {
+            crate::shrink_expand::SpatialInput::Pointer
+        } else if self.start_data.is_touch() {
+            crate::shrink_expand::SpatialInput::Touch
+        } else {
+            crate::shrink_expand::SpatialInput::Tablet
+        };
+        data.spatial_resize_frame(&self.window, delta, input)
+    }
+
+    fn prepare_release(&mut self, state: &mut State) {
+        let delta = self.new_location - self.start_data.location();
+        // Only a spatial candidate needs the last unframed motion. Ordinary native release
+        // preserves its existing frame batching, including when the feature is disabled.
+        self.released =
+            !state.spatial_release_needs_update(&self.window, delta) || self.on_frame(state);
     }
 }
 
@@ -93,6 +108,7 @@ impl PointerGrab<State> for ResizeGrab {
         handle.button(data, event);
 
         if handle.current_pressed().is_empty() {
+            self.prepare_release(data);
             // No more buttons are pressed, release the grab.
             handle.unset_grab(self, data, event.serial, event.time, true);
         }
@@ -225,7 +241,7 @@ impl TouchGrab<State> for ResizeGrab {
         if event.slot != self.start_data.unwrap_touch().slot {
             return;
         }
-
+        self.prepare_release(data);
         handle.unset_grab(self, data);
     }
 
@@ -329,6 +345,7 @@ impl TabletToolGrab<State> for ResizeGrab {
         event: &tablet::tool::UpEvent,
     ) {
         handle.up(data, event);
+        self.prepare_release(data);
         handle.unset_grab(self, data, event.serial, event.time, true);
     }
 

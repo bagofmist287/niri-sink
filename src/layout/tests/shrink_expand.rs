@@ -5,6 +5,85 @@ use crate::layout::shrink_expand::{ShrinkAxis, SpineGeometry, WindowForm};
 use crate::layout::workspace::{Workspace, WorkspaceAddWindowTarget};
 
 #[test]
+fn spatial_raw_query_preserves_native_edges_centering_and_topmost_restriction() {
+    for centered in [false, true] {
+        let mut options = Options::default();
+        options.layout.center_focused_column = if centered {
+            niri_config::CenterFocusedColumn::Always
+        } else {
+            niri_config::CenterFocusedColumn::Never
+        };
+        let options = Rc::new(options);
+        let mut space = scrolling(1.25, options.clone());
+        let tile = scrolling_tile(1, &space, options);
+        space.add_tile(None, tile, true, ColumnWidth::Fixed(900.), false, None);
+        settle(&mut space);
+        assert!(space.interactive_resize_begin(
+            1,
+            crate::utils::ResizeEdge::LEFT | crate::utils::ResizeEdge::TOP
+        ));
+        let before = space.tiles().next().unwrap().window().requested_size();
+        let raw = space.spatial_resize_intent(&1, (10., 100.).into()).unwrap();
+        assert_eq!(raw.gain.x, if centered { -2. } else { -1. });
+        assert_eq!(raw.gain.y, 0.);
+        assert_eq!(raw.requested.h, raw.original.h);
+        assert_eq!(
+            raw.original.w - raw.requested.w,
+            if centered { 20. } else { 10. }
+        );
+        assert_eq!(
+            space.tiles().next().unwrap().window().requested_size(),
+            before
+        );
+        space.interactive_resize_update(&1, (10., 100.).into());
+        assert_eq!(
+            space
+                .tiles()
+                .next()
+                .unwrap()
+                .window()
+                .requested_size()
+                .unwrap()
+                .w as f64,
+            raw.requested.w.round()
+        );
+        space.verify_invariants();
+    }
+}
+
+#[test]
+fn spatial_zone_zero_is_strict_and_corner_selection_has_stable_ties() {
+    use crate::layout::shrink_expand::SpatialResizeIntent;
+    let mut raw = SpatialResizeIntent {
+        original: (300., 300.).into(),
+        requested: (100., 100.).into(),
+        minimum: (100., 100.).into(),
+        gain: (1., 1.).into(),
+    };
+    assert_eq!(raw.choose_axis(0., [true, true], None), None);
+    assert_eq!(
+        raw.choose_axis(24., [true, true], None),
+        Some(ShrinkAxis::Horizontal)
+    );
+    assert_eq!(
+        raw.choose_axis(24., [true, true], Some(ShrinkAxis::Vertical)),
+        Some(ShrinkAxis::Vertical)
+    );
+    raw.requested.w = 99.;
+    assert_eq!(
+        raw.choose_axis(0., [true, true], None),
+        Some(ShrinkAxis::Horizontal)
+    );
+    raw.gain.x = 0.;
+    assert_eq!(raw.choose_axis(0., [true, true], None), None);
+    raw.requested.h = 90.;
+    assert_eq!(
+        raw.choose_axis(0., [true, true], None),
+        Some(ShrinkAxis::Vertical)
+    );
+}
+
+#[test]
 fn keyboard_boundary_query_uses_shared_column_tab_constraints_without_mutation() {
     use std::cmp::Ordering;
     for scale in [1., 1.25] {
@@ -1957,6 +2036,30 @@ fn shrink_preview_gray_source_constant_gradient_and_capture_cache_are_independen
             next.iter()
                 .map(|e| (e.id().clone(), e.current_commit()))
                 .collect::<Vec<_>>()
+        );
+        // Left-edge spatial resize retains the right edge of the normal source.
+        window.set_shrink_preview_anchor((1., 0.).into());
+        let anchored = collect(&window, &mut renderer, RenderTarget::Output);
+        let download = render_and_download(
+            &mut renderer,
+            physical,
+            Scale::from(scale),
+            Transform::Normal,
+            Fourcc::Abgr8888,
+            anchored.into_iter().rev(),
+        )
+        .unwrap();
+        let data = renderer.map_texture(&download).unwrap();
+        let pixel = |x: f64| {
+            let x = (x * scale).round() as usize;
+            let y = (5. * scale).round() as usize;
+            &data[(y * physical.w as usize + x) * 4..][..4]
+        };
+        assert!(pixel(5.)[0].abs_diff(182) <= 1 && pixel(5.)[0] == pixel(5.)[1]);
+        assert!(
+            pixel(100.)[0].abs_diff(186) <= 1
+                && pixel(100.)[1] == 0
+                && pixel(100.)[2].abs_diff(186) <= 1
         );
         window.clear_shrink_preview();
         assert!(window.shrink_preview_pose().is_none());

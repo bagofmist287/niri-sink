@@ -2918,6 +2918,18 @@ impl<W: LayoutElement> Workspace<W> {
         }
     }
 
+    pub(super) fn spatial_resize_intent(
+        &self,
+        id: &W::Id,
+        delta: Point<f64, Logical>,
+    ) -> Option<super::shrink_expand::SpatialResizeIntent> {
+        if self.floating.has_window(id) {
+            self.floating.spatial_resize_intent(id, delta)
+        } else {
+            self.scrolling.spatial_resize_intent(id, delta)
+        }
+    }
+
     pub fn interactive_resize_end(&mut self, window: Option<&W::Id>) {
         if window.is_some_and(|id| self.sink.depth(id).is_some()) {
             return;

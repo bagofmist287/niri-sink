@@ -17,6 +17,7 @@ pub struct ShrinkPreview {
     to: Size<f64, Logical>,
     animation: Option<Animation>,
     clock: Clock,
+    anchor: Point<f64, Logical>,
     offscreen: [OffscreenBuffer; 3],
     fill: BorderRenderElement,
     fallback: SolidColorBuffer,
@@ -30,6 +31,7 @@ impl ShrinkPreview {
             to: from,
             animation: None,
             clock,
+            anchor: Point::from((0., 0.)),
             offscreen: std::array::from_fn(|_| OffscreenBuffer::default()),
             fill: BorderRenderElement::empty_with_program(ProgramType::ShrinkGhost),
             fallback: SolidColorBuffer::default(),
@@ -64,6 +66,18 @@ impl ShrinkPreview {
         Size::from((
             self.from.w + (self.to.w - self.from.w) * p,
             self.from.h + (self.to.h - self.from.h) * p,
+        ))
+    }
+
+    pub fn set_anchor(&mut self, anchor: Point<f64, Logical>) {
+        self.anchor = anchor;
+    }
+
+    pub fn offset(&self, source: Size<f64, Logical>) -> Point<f64, Logical> {
+        let pose = self.pose();
+        Point::from((
+            (source.w - pose.w) * self.anchor.x,
+            (source.h - pose.h) * self.anchor.y,
         ))
     }
 

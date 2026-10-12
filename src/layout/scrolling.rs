@@ -4042,20 +4042,90 @@ impl<W: LayoutElement> ScrollingSpace<W> {
         true
     }
 
+    fn resize_components(
+        &self,
+        window: &W::Id,
+    ) -> Option<(Size<f64, Logical>, Point<f64, Logical>)> {
+        let resize = self
+            .interactive_resize
+            .as_ref()
+            .filter(|resize| &resize.window == window)?;
+        let (col_idx, _) = self.column_and_tile_idx(Some(window));
+        let idx = self.columns[col_idx]
+            .tiles
+            .iter()
+            .position(|tile| tile.window().id() == window)?;
+        let edges = resize.data.edges;
+        let mut gain = Point::from((0., 0.));
+        if edges.intersects(ResizeEdge::LEFT_RIGHT) {
+            gain.x = if edges.contains(ResizeEdge::LEFT) {
+                -1.
+            } else {
+                1.
+            };
+            if self.is_centering_focused_column() {
+                gain.x *= 2.;
+            }
+        }
+        // Preserve the original topmost-tile restriction, including for corner resizes.
+        if edges.intersects(ResizeEdge::TOP_BOTTOM)
+            && !(edges.contains(ResizeEdge::TOP) && idx == 0)
+        {
+            gain.y = if edges.contains(ResizeEdge::TOP) {
+                -1.
+            } else {
+                1.
+            };
+        }
+        Some((resize.original_window_size, gain))
+    }
+
+    pub(super) fn spatial_resize_intent(
+        &self,
+        window: &W::Id,
+        delta: Point<f64, Logical>,
+    ) -> Option<super::shrink_expand::SpatialResizeIntent> {
+        let (original, gain) = self.resize_components(window)?;
+        let tile = self.tiles().find(|tile| tile.window().id() == window)?;
+        if tile.is_spine() {
+            return None;
+        }
+        let minimum = Size::from((
+            self.keyboard_resize_intent(
+                window,
+                ShrinkAxis::Horizontal,
+                SizeChange::AdjustFixed(0),
+            )?
+            .minimum,
+            self.keyboard_resize_intent(window, ShrinkAxis::Vertical, SizeChange::AdjustFixed(0))?
+                .minimum,
+        ));
+        let requested: Size<f64, Logical> =
+            Size::from((original.w + gain.x * delta.x, original.h + gain.y * delta.y));
+        Some(super::shrink_expand::SpatialResizeIntent {
+            original: (
+                tile.tile_width_for_window_width(original.w),
+                tile.tile_height_for_window_height(original.h),
+            )
+                .into(),
+            requested: (
+                tile.tile_width_for_window_width(requested.w),
+                tile.tile_height_for_window_height(requested.h),
+            )
+                .into(),
+            minimum,
+            gain,
+        })
+    }
+
     pub fn interactive_resize_update(
         &mut self,
         window: &W::Id,
         delta: Point<f64, Logical>,
     ) -> bool {
-        let Some(resize) = &self.interactive_resize else {
+        let Some((original, gain)) = self.resize_components(window) else {
             return false;
         };
-
-        if window != &resize.window {
-            return false;
-        }
-
-        let is_centering = self.is_centering_focused_column();
 
         let (col_idx, _) = self.column_and_tile_idx(Some(window));
         let col = &mut self.columns[col_idx];
@@ -4066,35 +4136,14 @@ impl<W: LayoutElement> ScrollingSpace<W> {
             .position(|tile| tile.window().id() == window)
             .unwrap();
 
-        if resize.data.edges.intersects(ResizeEdge::LEFT_RIGHT) {
-            let mut dx = delta.x;
-            if resize.data.edges.contains(ResizeEdge::LEFT) {
-                dx = -dx;
-            };
-
-            if is_centering {
-                dx *= 2.;
-            }
-
-            let window_width = (resize.original_window_size.w + dx).round() as i32;
+        if gain.x != 0. {
+            let window_width = (original.w + gain.x * delta.x).round() as i32;
             col.set_column_width(SizeChange::SetFixed(window_width), Some(tile_idx), false);
         }
 
-        if resize.data.edges.intersects(ResizeEdge::TOP_BOTTOM) {
-            // Prevent the simplest case of weird resizing (top edge when this is the topmost
-            // window).
-            if !(resize.data.edges.contains(ResizeEdge::TOP) && tile_idx == 0) {
-                let mut dy = delta.y;
-                if resize.data.edges.contains(ResizeEdge::TOP) {
-                    dy = -dy;
-                };
-
-                // FIXME: some smarter height distribution would be nice here so that vertical
-                // resizes work as expected in more cases.
-
-                let window_height = (resize.original_window_size.h + dy).round() as i32;
-                col.set_window_height(SizeChange::SetFixed(window_height), Some(tile_idx), false);
-            }
+        if gain.y != 0. {
+            let window_height = (original.h + gain.y * delta.y).round() as i32;
+            col.set_window_height(SizeChange::SetFixed(window_height), Some(tile_idx), false);
         }
 
         self.data[col_idx].update(col);
