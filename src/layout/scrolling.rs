@@ -2468,6 +2468,22 @@ impl<W: LayoutElement> ScrollingSpace<W> {
         self.columns.iter()
     }
 
+    pub(super) fn spine_search_slots(&self) -> Vec<super::spine_search::SpineSlot<W::Id>> {
+        let mut slots = Vec::new();
+        for (col, x) in zip(&self.columns, self.column_xs(self.data.iter().copied())) {
+            for (index, ((tile, offset), data)) in zip(col.tiles(), &col.data).enumerate() {
+                slots.push(super::spine_search::SpineSlot {
+                    id: tile.window().id().clone(),
+                    area: Rectangle::new(Point::from((x, 0.)) + offset, data.size),
+                    form: tile.form(),
+                    visible: col.display_mode != ColumnDisplay::Tabbed
+                        || index == col.active_tile_idx,
+                });
+            }
+        }
+        slots
+    }
+
     fn columns_mut(&mut self) -> impl Iterator<Item = (&mut Column<W>, f64)> + '_ {
         let offsets = self.column_xs(self.data.iter().copied());
         zip(&mut self.columns, offsets)

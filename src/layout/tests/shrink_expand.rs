@@ -5,6 +5,139 @@ use crate::layout::shrink_expand::{ShrinkAxis, SpineGeometry, WindowForm};
 use crate::layout::workspace::{Workspace, WorkspaceAddWindowTarget};
 
 #[test]
+fn spine_search_uses_native_slots_and_keeps_scope_separate_from_floating_and_sink() {
+    use crate::layout::spine_search::SpineSearchMode;
+    for scale in [1., 1.25] {
+        let mut options = Options::default();
+        options.sink.enabled = true;
+        let mut clock = Clock::with_time(Duration::ZERO);
+        let mut layout = Layout::with_options(clock.clone(), options);
+        Op::AddScaledOutput {
+            id: 1,
+            scale,
+            layout_config: None,
+        }
+        .apply(&mut layout);
+        for id in [1, 2, 3] {
+            Op::AddWindow {
+                params: TestWindowParams::new(id),
+            }
+            .apply(&mut layout);
+            Op::Communicate(id).apply(&mut layout);
+        }
+        assert!(layout.commit_shrink(&2, ShrinkAxis::Horizontal, 40.));
+        assert!(layout.commit_shrink(&3, ShrinkAxis::Horizontal, 40.));
+        let query = |layout: &Layout<TestWindow>, origin| {
+            layout
+                .active_workspace()
+                .unwrap()
+                .spine_candidates(origin, |a, b| a.id().cmp(b.id()))
+        };
+        let requests = layout
+            .windows()
+            .map(|(_, w)| (*w.id(), w.requested_size()))
+            .collect::<Vec<_>>();
+        let result = query(&layout, Some(&1)).unwrap();
+        assert_eq!(result.mode, SpineSearchMode::Adjacent);
+        assert_eq!(result.origin, Some(1));
+        assert_eq!(
+            result
+                .candidates
+                .iter()
+                .map(|c| (c.id, c.distance))
+                .collect::<Vec<_>>(),
+            [(2, 1), (3, 2)]
+        );
+        assert!(query(&layout, None).is_none());
+        assert!(query(&layout, Some(&2)).is_none());
+        clock.set_unadjusted(Duration::from_millis(100));
+        layout.advance_animations();
+        assert_eq!(query(&layout, Some(&1)), Some(result));
+        assert_eq!(
+            layout
+                .windows()
+                .map(|(_, w)| (*w.id(), w.requested_size()))
+                .collect::<Vec<_>>(),
+            requests
+        );
+        layout.set_window_floating(Some(&1), true);
+        assert!(query(&layout, Some(&1)).is_none());
+        layout.activate_window(&1);
+        assert!(layout.sink_window());
+        assert_eq!(layout.active_workspace().unwrap().sink_count(), 1);
+        assert!(query(&layout, None).is_none());
+        assert_eq!(layout.windows().count(), 3);
+        layout.verify_invariants();
+    }
+}
+
+#[test]
+fn all_spine_search_includes_hidden_tabs_then_spatial_floats_with_stable_id_ties() {
+    use crate::layout::spine_search::SpineSearchMode;
+    use niri_ipc::PositionChange;
+    let mut layout = Layout::with_options(Clock::with_time(Duration::ZERO), Options::default());
+    Op::AddOutput(1).apply(&mut layout);
+    for id in 1..=4 {
+        Op::AddWindow {
+            params: TestWindowParams::new(id),
+        }
+        .apply(&mut layout);
+        Op::Communicate(id).apply(&mut layout);
+    }
+    layout.consume_or_expel_window_left(Some(&2));
+    layout.activate_window(&1);
+    layout.set_column_display(ColumnDisplay::Tabbed);
+    for id in [3, 4] {
+        layout.set_window_floating(Some(&id), true);
+        Op::Communicate(id).apply(&mut layout);
+        layout.move_floating_window(
+            Some(&id),
+            PositionChange::SetFixed(300.),
+            PositionChange::SetFixed(500.),
+            false,
+        );
+        assert!(layout.commit_shrink(&id, ShrinkAxis::Horizontal, 40.));
+    }
+    assert!(layout.commit_shrink(&1, ShrinkAxis::Horizontal, 40.));
+    layout.activate_window(&1);
+    let query = |layout: &Layout<TestWindow>| {
+        layout
+            .active_workspace()
+            .unwrap()
+            .spine_candidates(None, |a, b| a.id().cmp(b.id()))
+    };
+    // A hidden Normal tab still prevents a workspace-wide all-spine scope.
+    assert!(query(&layout).is_none());
+    assert!(layout.commit_shrink(&2, ShrinkAxis::Horizontal, 40.));
+    let result = query(&layout).unwrap();
+    assert_eq!(result.mode, SpineSearchMode::All);
+    assert_eq!(result.origin, None);
+    assert_eq!(
+        result.candidates.iter().map(|c| c.id).collect::<Vec<_>>(),
+        [1, 2, 3, 4]
+    );
+    assert!(result.candidates.iter().all(|c| c.distance == 0));
+    layout.move_floating_window(
+        Some(&4),
+        PositionChange::SetFixed(200.),
+        PositionChange::SetFixed(500.),
+        false,
+    );
+    assert_eq!(
+        query(&layout)
+            .unwrap()
+            .candidates
+            .iter()
+            .map(|c| c.id)
+            .collect::<Vec<_>>(),
+        [1, 2, 4, 3]
+    );
+    assert!(layout.focus().is_none());
+    assert_eq!(layout.windows().count(), 4);
+    layout.verify_invariants();
+}
+
+#[test]
 fn pending_normal_resize_client_choice_keeps_positive_allocation() {
     let mut params = TestWindowParams::new(1);
     params.bbox = Rectangle::from_size((300, 200).into());

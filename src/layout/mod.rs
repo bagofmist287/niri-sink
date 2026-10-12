@@ -87,6 +87,7 @@ pub mod shrink_expand;
 pub mod sink;
 pub mod sink_overview;
 pub mod sink_presentation;
+pub mod spine_search;
 pub mod tab_indicator;
 pub mod tile;
 pub mod workspace;

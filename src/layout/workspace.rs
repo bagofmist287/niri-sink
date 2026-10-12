@@ -821,6 +821,46 @@ impl<W: LayoutElement> Workspace<W> {
             .map(|(tile, _, _)| tile.window())
     }
 
+    /// Read-only candidates; the caller supplies the stable window-ID tie break for floats.
+    /// No new Hash/Ord bounds are imposed on the native window handle.
+    pub fn spine_candidates(
+        &self,
+        origin: Option<&W::Id>,
+        compare_ids: impl Fn(&W, &W) -> std::cmp::Ordering,
+    ) -> Option<super::spine_search::SpineSearch<W::Id>> {
+        use super::spine_search::{SpineCandidate, SpineSearch, SpineSearchMode};
+        let slots = self.scrolling.spine_search_slots();
+        let all_spines = self.sink_count() == 0
+            && self.tiles().next().is_some()
+            && self.tiles().all(Tile::is_spine);
+        if all_spines {
+            let mut floating = self.floating.tiles_with_offsets().collect::<Vec<_>>();
+            floating.sort_by(|(a, a_pos), (b, b_pos)| {
+                a_pos
+                    .y
+                    .total_cmp(&b_pos.y)
+                    .then_with(|| a_pos.x.total_cmp(&b_pos.x))
+                    .then_with(|| compare_ids(a.window(), b.window()))
+            });
+            let ids = slots.into_iter().map(|slot| slot.id).chain(
+                floating
+                    .into_iter()
+                    .map(|(tile, _)| tile.window().id().clone()),
+            );
+            return Some(SpineSearch {
+                mode: SpineSearchMode::All,
+                origin: None,
+                candidates: ids.map(|id| SpineCandidate { id, distance: 0 }).collect(),
+            });
+        }
+        super::spine_search::adjacent_candidates(
+            &slots,
+            origin?,
+            self.options.layout.gaps,
+            0.5 / self.scale.fractional_scale() + 1e-6,
+        )
+    }
+
     /// Read-only normal insertion requests for a batch, resolved from one native snapshot.
     /// IDs absent from this workspace, normal windows and Sink members are omitted.
     pub fn normal_spine_plans(
