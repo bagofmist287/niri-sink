@@ -1075,6 +1075,15 @@ impl<W: LayoutElement> Tile<W> {
         loc
     }
 
+    /// Native moving anchors the visible geometry, which is independent of a spine's client.
+    pub(super) fn move_anchor_geometry(&self) -> Rectangle<f64, Logical> {
+        if self.is_spine() {
+            Rectangle::from_size(self.tile_size())
+        } else {
+            Rectangle::new(self.window_loc(), self.window_size())
+        }
+    }
+
     pub fn tile_size(&self) -> Size<f64, Logical> {
         if let Some(spine) = &self.spine {
             return spine.outer_size();

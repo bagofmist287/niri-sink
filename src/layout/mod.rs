@@ -647,13 +647,14 @@ impl<W: LayoutElement> InteractiveMoveState<W> {
 impl<W: LayoutElement> InteractiveMoveData<W> {
     fn tile_render_location(&self, zoom: f64) -> Point<f64, Logical> {
         let scale = Scale::from(self.output.current_scale().fractional_scale());
-        let window_size = self.tile.window_size();
+        let geometry = self.tile.move_anchor_geometry();
+        let window_size = geometry.size;
         let pointer_offset_within_window = Point::from((
             window_size.w * self.pointer_ratio_within_window.0,
             window_size.h * self.pointer_ratio_within_window.1,
         ));
         let pos = self.pointer_pos_within_output
-            - (pointer_offset_within_window + self.tile.window_loc() - self.tile.render_offset())
+            - (pointer_offset_within_window + geometry.loc - self.tile.render_offset())
                 .upscale(zoom);
         // Round to physical pixels.
         pos.to_physical_precise_round(scale).to_logical(scale)
@@ -3307,20 +3308,22 @@ impl<W: LayoutElement> Layout<W> {
 
                 // When going to floating, restore the floating window size.
                 if move_.is_floating {
-                    let floating_size = move_.tile.floating_window_size;
-                    let win = move_.tile.window_mut();
-                    let mut size =
-                        floating_size.unwrap_or_else(|| win.expected_size().unwrap_or_default());
+                    if !move_.tile.is_spine() {
+                        let floating_size = move_.tile.floating_window_size;
+                        let win = move_.tile.window_mut();
+                        let mut size = floating_size
+                            .unwrap_or_else(|| win.expected_size().unwrap_or_default());
 
-                    // Apply min/max size window rules. If requesting a concrete size, apply
-                    // completely; if requesting (0, 0), apply only when min/max results in a fixed
-                    // size.
-                    let min_size = win.min_size();
-                    let max_size = win.max_size();
-                    size.w = ensure_min_max_size_maybe_zero(size.w, min_size.w, max_size.w);
-                    size.h = ensure_min_max_size_maybe_zero(size.h, min_size.h, max_size.h);
+                        // Apply min/max size window rules. If requesting a concrete size, apply
+                        // completely; if requesting (0, 0), apply only when min/max results in a fixed
+                        // size.
+                        let min_size = win.min_size();
+                        let max_size = win.max_size();
+                        size.w = ensure_min_max_size_maybe_zero(size.w, min_size.w, max_size.w);
+                        size.h = ensure_min_max_size_maybe_zero(size.h, min_size.h, max_size.h);
 
-                    win.request_size_once(size, true);
+                        win.request_size_once(size, true);
+                    }
 
                     // Animate the tile back to opaque.
                     move_.tile.animate_alpha(
@@ -4130,13 +4133,14 @@ impl<W: LayoutElement> Layout<W> {
         if tile.client_input_blocked() {
             return false;
         }
-        let window_offset = tile.window_loc();
+        let geometry = tile.move_anchor_geometry();
+        let window_offset = geometry.loc;
 
         let tile_pos = ws_geo.loc + tile_offset.upscale(zoom);
 
         let pointer_offset_within_window =
             start_pos_within_output - tile_pos - window_offset.upscale(zoom);
-        let window_size = tile.window_size().upscale(zoom);
+        let window_size = geometry.size.upscale(zoom);
         let pointer_ratio_within_window = (
             f64::clamp(pointer_offset_within_window.x / window_size.w, 0., 1.),
             f64::clamp(pointer_offset_within_window.y / window_size.h, 0., 1.),

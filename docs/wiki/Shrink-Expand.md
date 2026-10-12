@@ -71,3 +71,10 @@ The internal spine model also excludes spines from `focus-window-previous`.
 They remain in window inventory and keep their collapsed form; when every
 window is a spine, this navigation action retains no client focus. Explicit
 spine activation and MRU confirmation still await runtime integration.
+
+Internal native movement uses a spine's own outer rectangle as its pointer
+anchor and keeps the spine collapsed. Switching a moving spine to floating
+placement skips the hidden client's normal floating size request. Focus-based
+cursor warping excludes spines in both tiled and floating spaces. These layout
+paths are tested; spine input hit regions and drag-time direction adaptation
+still await integration.

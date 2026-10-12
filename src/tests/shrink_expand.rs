@@ -785,6 +785,110 @@ fn previous_window_navigation_skips_spines_without_changing_inventory() {
 }
 
 #[test]
+fn moving_book_keeps_client_geometry_when_toggled_to_floating() {
+    use niri_config::Action;
+
+    for axis in [ShrinkAxis::Horizontal, ShrinkAxis::Vertical] {
+        let (mut fixture, client, surfaces, ids) = explicit_mode_fixture();
+        let id = &ids[1];
+        {
+            let ws = fixture
+                .niri()
+                .layout
+                .workspaces_mut()
+                .find(|ws| ws.has_window(id))
+                .unwrap();
+            let tile = ws
+                .tiles_mut()
+                .find(|tile| tile.window().window == *id)
+                .unwrap();
+            assert!(tile.set_spine(axis, 40.));
+            ws.update_window(id, None);
+        }
+        fixture.niri().layout.activate_window(id);
+        fixture.double_roundtrip(client);
+        let pointer = fixture.niri().seat.get_pointer().unwrap();
+        let location = pointer.current_location();
+        assert!(!fixture
+            .niri_state()
+            .move_cursor_to_focused_tile(crate::niri::CenterCoords::BothAlways));
+        assert_eq!(pointer.current_location(), location);
+        let configured_size = fixture
+            .client(client)
+            .window(&surfaces[1])
+            .configures_received
+            .last()
+            .unwrap()
+            .1
+            .size;
+        for surface in &surfaces {
+            let _ = fixture.client(client).window(surface).recent_configures();
+        }
+        let ipc_id = fixture
+            .niri()
+            .layout
+            .windows()
+            .find(|(_, mapped)| mapped.window == *id)
+            .unwrap()
+            .1
+            .id()
+            .get();
+        let output = fixture.niri().layout.active_output().unwrap().clone();
+        assert!(fixture.niri().layout.interactive_move_begin(
+            id.clone(),
+            &output,
+            (30., 100.).into()
+        ));
+        assert!(fixture.niri().layout.interactive_move_update(
+            id,
+            (300., 0.).into(),
+            output,
+            (330., 100.).into()
+        ));
+        fixture.double_roundtrip(client);
+        // A real hidden buffer commit must not turn the outer geometry into client geometry.
+        let window = fixture.client(client).window(&surfaces[1]);
+        window.attach_new_buffer();
+        window.set_size(1500, 1100);
+        window.commit();
+        fixture.double_roundtrip(client);
+        fixture
+            .niri_state()
+            .do_action(Action::ToggleWindowFloatingById(ipc_id), false);
+        fixture.double_roundtrip(client);
+        fixture.niri().layout.interactive_move_end(id);
+        fixture.double_roundtrip(client);
+        let ws = fixture
+            .niri()
+            .layout
+            .workspaces()
+            .find(|(_, _, ws)| ws.has_window(id))
+            .unwrap()
+            .2;
+        assert!(ws.is_floating(id));
+        let tile = ws.tiles().find(|tile| tile.window().window == *id).unwrap();
+        assert_eq!(tile.form(), WindowForm::Spine(axis));
+        let size = tile.tile_size();
+        assert_eq!(
+            if axis == ShrinkAxis::Horizontal {
+                size.w
+            } else {
+                size.h
+            },
+            40.
+        );
+        assert_eq!(tile.window().size(), (1500, 1100).into());
+        assert_eq!(fixture.niri().layout.windows().count(), 3);
+        assert!(fixture.niri().layout.is_spine(&ids[2]));
+        let window = fixture.client(client).window(&surfaces[1]);
+        for configure in window.recent_configures() {
+            assert_eq!(configure.size, configured_size);
+            assert!(!configure.states.contains(&xdg_toplevel::State::Activated));
+        }
+    }
+}
+
+#[test]
 fn explicit_xdg_duplicate_mode_and_early_unset_restore_every_affected_tab() {
     for mode in [SizingMode::Fullscreen, SizingMode::Maximized] {
         for all_spines in [false, true] {

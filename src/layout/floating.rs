@@ -366,6 +366,10 @@ impl<W: LayoutElement> FloatingSpace<W> {
             .tiles_with_offsets()
             .find(|(tile, _)| tile.window().id() == active_id)?;
 
+        if tile.is_spine() {
+            return None;
+        }
+
         let window_pos = offset + tile.window_loc();
         let window_size = tile.window_size();
         let window_rect = Rectangle::new(window_pos, window_size);

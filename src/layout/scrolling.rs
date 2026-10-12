@@ -2678,6 +2678,10 @@ impl<W: LayoutElement> ScrollingSpace<W> {
 
         let (tile, tile_off) = col.tiles().nth(col.active_tile_idx).unwrap();
 
+        if tile.is_spine() {
+            return None;
+        }
+
         let window_pos = view_off + tile_off + tile.window_loc();
         let window_size = tile.window_size();
         let window_rect = Rectangle::new(window_pos, window_size);

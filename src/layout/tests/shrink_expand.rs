@@ -1136,6 +1136,250 @@ fn moving_spine_retains_native_owner_without_client_focus() {
 }
 
 #[test]
+fn native_move_anchor_tracks_spine_outer_geometry_and_preserves_normal_geometry() {
+    for axis in [
+        None,
+        Some(ShrinkAxis::Horizontal),
+        Some(ShrinkAxis::Vertical),
+    ] {
+        for floating in [false, true] {
+            for scale in [1., 1.25] {
+                for overview in [false, true] {
+                    let mut options = Options::default();
+                    options.layout.border.off = false;
+                    options.layout.border.width = 7.3;
+                    let mut layout = Layout::<TestWindow>::with_options(
+                        Clock::with_time(Duration::ZERO),
+                        options,
+                    );
+                    layout.clock.set_complete_instantly(true);
+                    Op::AddScaledOutput {
+                        id: 1,
+                        scale,
+                        layout_config: None,
+                    }
+                    .apply(&mut layout);
+                    let mut params = TestWindowParams::new(1);
+                    params.is_floating = floating;
+                    Op::AddWindow { params }.apply(&mut layout);
+                    Op::Communicate(1).apply(&mut layout);
+                    let window = {
+                        let ws = layout
+                            .workspaces_mut()
+                            .find(|ws| ws.has_window(&1))
+                            .unwrap();
+                        let tile = ws
+                            .tiles_mut()
+                            .find(|tile| tile.window().id() == &1)
+                            .unwrap();
+                        if let Some(axis) = axis {
+                            assert!(tile.set_spine(axis, 40.3));
+                        }
+                        tile.window().clone()
+                    };
+                    layout.update_window(&1, None);
+                    if overview {
+                        layout.open_overview();
+                    }
+                    layout.advance_animations();
+                    let output = layout.outputs().next().unwrap().clone();
+                    let zoom = layout.overview_zoom();
+                    let ratio = (0.23, 0.67);
+                    let start = layout
+                        .monitors()
+                        .find_map(|mon| {
+                            mon.workspaces_with_render_geo().find_map(|(ws, geo)| {
+                                let (tile, pos, _) = ws
+                                    .tiles_with_render_positions()
+                                    .find(|(tile, _, _)| tile.window().id() == &1)?;
+                                let (size, offset) = if axis.is_some() {
+                                    (tile.tile_size(), Point::from((0., 0.)))
+                                } else {
+                                    (tile.window_size(), tile.window_loc())
+                                };
+                                Some(
+                                    geo.loc
+                                        + (pos
+                                            + offset
+                                            + Point::from((size.w * ratio.0, size.h * ratio.1)))
+                                        .upscale(zoom),
+                                )
+                            })
+                        })
+                        .unwrap();
+                    let requested = window.requested_size();
+                    assert!(layout.interactive_move_begin(1, &output, start));
+                    let Some(InteractiveMoveState::Starting {
+                        pointer_ratio_within_window,
+                        ..
+                    }) = &layout.interactive_move
+                    else {
+                        panic!("expected native Starting owner")
+                    };
+                    approx::assert_abs_diff_eq!(
+                        pointer_ratio_within_window.0,
+                        ratio.0,
+                        epsilon = 1e-9
+                    );
+                    approx::assert_abs_diff_eq!(
+                        pointer_ratio_within_window.1,
+                        ratio.1,
+                        epsilon = 1e-9
+                    );
+                    let mut pointer = start + Point::from((255. * zoom, 0.));
+                    assert!(layout.interactive_move_update(
+                        &1,
+                        (255. * zoom, 0.).into(),
+                        output.clone(),
+                        pointer
+                    ));
+                    if !floating {
+                        assert!(matches!(
+                            layout.interactive_move,
+                            Some(InteractiveMoveState::Starting { .. })
+                        ));
+                        pointer.x += zoom;
+                        assert!(layout.interactive_move_update(
+                            &1,
+                            (zoom, 0.).into(),
+                            output,
+                            pointer
+                        ));
+                    }
+                    layout.advance_animations();
+                    let Some(InteractiveMoveState::Moving(move_)) = &layout.interactive_move else {
+                        panic!("expected native Moving owner")
+                    };
+                    let (size, offset) = if axis.is_some() {
+                        (move_.tile.tile_size(), Point::from((0., 0.)))
+                    } else {
+                        (move_.tile.window_size(), move_.tile.window_loc())
+                    };
+                    let anchor = move_.tile_render_location(zoom)
+                        + (Point::from((size.w * ratio.0, size.h * ratio.1)) + offset
+                            - move_.tile.render_offset())
+                        .upscale(zoom);
+                    approx::assert_abs_diff_eq!(anchor.x, pointer.x, epsilon = 0.5 / scale + 1e-9);
+                    approx::assert_abs_diff_eq!(anchor.y, pointer.y, epsilon = 0.5 / scale + 1e-9);
+                    if axis.is_some() {
+                        let pose = move_.tile_render_location(zoom);
+                        let size = move_.tile.tile_size();
+                        window.0.forced_size.set(Some((1500, 1100).into()));
+                        assert!(window.communicate());
+                        layout.update_window(&1, None);
+                        let Some(InteractiveMoveState::Moving(move_)) = &layout.interactive_move
+                        else {
+                            unreachable!()
+                        };
+                        assert_eq!(move_.tile.tile_size(), size);
+                        assert_eq!(move_.tile_render_location(zoom), pose);
+                        assert_eq!(window.requested_size(), requested);
+                    }
+                    layout.verify_invariants();
+                    layout.interactive_move_end(&1);
+                    assert_eq!(layout.is_spine(&1), axis.is_some());
+                    assert_eq!(layout.windows().count(), 1);
+                    layout.verify_invariants();
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn native_moving_floating_toggle_does_not_resize_spine_client() {
+    for axis in [
+        None,
+        Some(ShrinkAxis::Horizontal),
+        Some(ShrinkAxis::Vertical),
+    ] {
+        let mut layout = Layout::<TestWindow>::default();
+        Op::AddOutput(1).apply(&mut layout);
+        Op::AddWindow {
+            params: TestWindowParams::new(1),
+        }
+        .apply(&mut layout);
+        Op::Communicate(1).apply(&mut layout);
+        let window = {
+            let ws = layout
+                .workspaces_mut()
+                .find(|ws| ws.has_window(&1))
+                .unwrap();
+            let tile = ws
+                .tiles_mut()
+                .find(|tile| tile.window().id() == &1)
+                .unwrap();
+            if let Some(axis) = axis {
+                assert!(tile.set_spine(axis, 40.));
+            }
+            tile.window().clone()
+        };
+        layout.update_window(&1, None);
+        let output = layout.outputs().next().unwrap().clone();
+        assert!(layout.interactive_move_begin(1, &output, (30., 100.).into()));
+        assert!(layout.interactive_move_update(&1, (300., 0.).into(), output, (330., 100.).into()));
+        let Some(InteractiveMoveState::Moving(move_)) = &mut layout.interactive_move else {
+            unreachable!()
+        };
+        move_.tile.floating_window_size = Some((1111, 777).into());
+        let before = window.requested_size();
+        let outer = move_.tile.tile_size();
+        layout.toggle_window_floating(Some(&1));
+        let Some(InteractiveMoveState::Moving(move_)) = &layout.interactive_move else {
+            unreachable!()
+        };
+        assert!(move_.is_floating);
+        if axis.is_some() {
+            assert_eq!(window.requested_size(), before);
+            assert_eq!(move_.tile.tile_size(), outer);
+        } else {
+            assert_eq!(window.requested_size(), Some((1111, 777).into()));
+        }
+        layout.interactive_move_end(&1);
+        assert!(layout.active_workspace().unwrap().is_floating(&1));
+        assert_eq!(layout.is_spine(&1), axis.is_some());
+        let retained = layout.windows().find(|(_, w)| w.id() == &1).unwrap().1;
+        assert!(Rc::ptr_eq(&retained.0, &window.0));
+        layout.verify_invariants();
+    }
+}
+
+#[test]
+fn spine_is_not_a_cursor_warp_target_in_either_native_space() {
+    for floating in [false, true] {
+        for axis in [ShrinkAxis::Horizontal, ShrinkAxis::Vertical] {
+            let mut layout = Layout::<TestWindow>::default();
+            Op::AddOutput(1).apply(&mut layout);
+            let mut params = TestWindowParams::new(1);
+            params.is_floating = floating;
+            Op::AddWindow { params }.apply(&mut layout);
+            Op::Communicate(1).apply(&mut layout);
+            let ws = layout
+                .workspaces_mut()
+                .find(|ws| ws.has_window(&1))
+                .unwrap();
+            assert!(ws.active_window_visual_rectangle().is_some());
+            assert!(ws
+                .tiles_mut()
+                .find(|tile| tile.window().id() == &1)
+                .unwrap()
+                .set_spine(axis, 40.));
+            ws.update_window(&1, None);
+            assert!(ws.active_window().is_none());
+            assert!(ws.active_window_visual_rectangle().is_none());
+            // This internal form change is a control, not a user Expand action.
+            assert!(ws
+                .tiles_mut()
+                .find(|tile| tile.window().id() == &1)
+                .unwrap()
+                .clear_spine());
+            ws.update_window(&1, None);
+            assert!(ws.active_window_visual_rectangle().is_some());
+        }
+    }
+}
+
+#[test]
 fn floating_spine_resize_keeps_native_top_left_anchor_without_client_commit() {
     let mut tile = tile(1, 1., Rc::default());
     assert!(tile.set_spine(ShrinkAxis::Horizontal, 40.));
