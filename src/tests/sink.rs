@@ -1640,7 +1640,7 @@ fn pull_new_input_owner_cancels_focus_even_after_matching_commit() {
     assert_eq!(fixture.niri().keyboard_focus.surface(), Some(&windows[2].0));
 }
 
-fn lock_fixture(fixture: &mut Fixture, client: ClientId) -> smithay::reexports::wayland_protocols::ext::session_lock::v1::client::ext_session_lock_v1::ExtSessionLockV1{
+pub(super) fn lock_fixture(fixture: &mut Fixture, client: ClientId) -> smithay::reexports::wayland_protocols::ext::session_lock::v1::client::ext_session_lock_v1::ExtSessionLockV1{
     use smithay::reexports::wayland_protocols::ext::session_lock::v1::client::ext_session_lock_manager_v1::ExtSessionLockManagerV1;
     let manager: ExtSessionLockManagerV1 = fixture.client(client).bind();
     let qh = fixture.client(client).qh.clone();

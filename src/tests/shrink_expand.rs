@@ -2224,6 +2224,221 @@ fn early_shrink_confirmation_settles_and_hands_off_focus_before_visual_completio
     }
 }
 
+#[test]
+fn shrink_and_expand_preserve_the_actual_input_method_keyboard_grab() {
+    use crate::shrink_expand::{FinishReason, Phase};
+    use smithay::utils::Serial;
+    use smithay::wayland::input_method::InputMethodKeyboardGrab;
+    for floating in [false, true] {
+        let (mut fixture, client, surfaces) = timed_shrink_fixture(2, floating, 60000);
+        let target = fixture.niri().layout.focus().unwrap().window.clone();
+        let target_id = fixture.niri().layout.focus().unwrap().id().get();
+        let surface = fixture.niri().keyboard_focus.surface().unwrap().clone();
+        let keyboard = fixture.niri().seat.get_keyboard().unwrap();
+        // The actual Smithay type, without an external text-input client.
+        keyboard.set_grab(
+            fixture.niri_state(),
+            InputMethodKeyboardGrab::default(),
+            Serial::from(701),
+        );
+        let first = fixture
+            .niri_state()
+            .begin_shrink_preview(Some(ShrinkAxis::Horizontal))
+            .unwrap();
+        fixture.double_roundtrip(client);
+        assert_eq!(fixture.niri().keyboard_focus.surface(), Some(&surface));
+        assert!(keyboard
+            .with_grab(|_, grab| grab.is::<InputMethodKeyboardGrab>())
+            .unwrap());
+        let repeated = fixture.niri_state().begin_shrink_preview(None).unwrap();
+        assert_eq!(first.id, repeated.id);
+        fixture.niri_state().cancel_shrink_expand_preview().unwrap();
+        fixture.double_roundtrip(client);
+        assert!(!fixture.niri().layout.is_spine(&target));
+        assert_eq!(fixture.niri().keyboard_focus.surface(), Some(&surface));
+        assert!(keyboard
+            .with_grab(|_, grab| grab.is::<InputMethodKeyboardGrab>())
+            .unwrap());
+        let record = fixture
+            .niri_state()
+            .begin_shrink_preview(Some(ShrinkAxis::Horizontal))
+            .unwrap();
+        fixture
+            .niri_state()
+            .confirm_shrink_preview(record.ticket())
+            .unwrap();
+        fixture.double_roundtrip(client);
+        assert!(fixture.niri().layout.is_spine(&target));
+        assert_ne!(fixture.niri().keyboard_focus.surface(), Some(&surface));
+        assert!(keyboard
+            .with_grab(|_, grab| grab.is::<InputMethodKeyboardGrab>())
+            .unwrap());
+        fixture.niri_state().reload_config(Ok(expand_test_config()));
+        let expand = fixture
+            .niri_state()
+            .expand_spine_window(target_id)
+            .unwrap()
+            .unwrap();
+        fixture.double_roundtrip(client);
+        assert!(keyboard
+            .with_grab(|_, grab| grab.is::<InputMethodKeyboardGrab>())
+            .unwrap());
+        let window = fixture.client(client).window(surfaces.last().unwrap());
+        let size = window.configures_received.last().unwrap().1.size;
+        window.set_size(size.0 as u16, size.1 as u16);
+        window.ack_last_and_commit();
+        fixture.double_roundtrip(client);
+        assert_eq!(fixture.niri().keyboard_focus.surface(), Some(&surface));
+        assert!(keyboard
+            .with_grab(|_, grab| grab.is::<InputMethodKeyboardGrab>())
+            .unwrap());
+        assert!(fixture
+            .niri()
+            .shrink_expand
+            .records()
+            .any(|current| current.id == expand.id
+                && current.phase == Phase::Settled
+                && current.reason == Some(FinishReason::Ready)));
+        assert_eq!(fixture.niri().layout.windows().count(), 2);
+    }
+}
+
+#[test]
+fn actual_session_lock_cancels_shrink_preview_and_invalidates_its_old_ticket() {
+    use crate::shrink_expand::{Phase, Rejected};
+    for floating in [false, true] {
+        let (mut fixture, client, _) = timed_shrink_fixture(2, floating, 60000);
+        let target = fixture.niri().layout.focus().unwrap().window.clone();
+        let record = fixture.niri_state().begin_shrink_preview(None).unwrap();
+        let lock = super::sink::lock_fixture(&mut fixture, client);
+        assert!(fixture.niri().shrink_expand.preview().is_none());
+        assert!(fixture.niri().shrink_preview_timer.is_none());
+        assert!(!fixture.niri().layout.is_spine(&target));
+        assert!(fixture
+            .niri()
+            .layout
+            .workspaces()
+            .flat_map(|(_, _, ws)| ws.tiles())
+            .all(|tile| tile.shrink_preview_pose().is_none()));
+        assert!(fixture
+            .niri_state()
+            .confirm_shrink_preview(record.ticket())
+            .is_none());
+        assert_eq!(
+            fixture.niri_state().begin_shrink_preview(None),
+            Err(Rejected::Blocked)
+        );
+        assert!(fixture
+            .niri()
+            .shrink_expand
+            .records()
+            .any(|current| current.id == record.id && current.phase == Phase::Cancelled));
+        lock.unlock_and_destroy();
+        fixture.double_roundtrip(client);
+        assert!(!fixture.niri().is_locked());
+        assert!(fixture
+            .niri_state()
+            .confirm_shrink_preview(record.ticket())
+            .is_none());
+        assert!(!fixture.niri().layout.is_spine(&target));
+        assert_eq!(fixture.niri().layout.windows().count(), 2);
+    }
+}
+
+#[test]
+fn actual_session_lock_cancels_deferred_expand_focus_without_rearming_the_deadline() {
+    use crate::shrink_expand::{FinishReason, Phase};
+    for floating in [false, true] {
+        for reply_under_lock in [false, true] {
+            let (mut fixture, client, surfaces) = timed_shrink_fixture(2, floating, 60000);
+            let target = fixture.niri().layout.focus().unwrap().window.clone();
+            let target_id = fixture.niri().layout.focus().unwrap().id().get();
+            let target_surface = surfaces.last().unwrap().clone();
+            let target_server_surface = fixture.niri().keyboard_focus.surface().unwrap().clone();
+            let shrink = fixture
+                .niri_state()
+                .begin_shrink_preview(Some(ShrinkAxis::Horizontal))
+                .unwrap();
+            fixture
+                .niri_state()
+                .confirm_shrink_preview(shrink.ticket())
+                .unwrap();
+            fixture.double_roundtrip(client);
+            let receiver = fixture.niri().layout.focus().unwrap().window.clone();
+            fixture.niri_state().reload_config(Ok(expand_test_config()));
+            let record = fixture
+                .niri_state()
+                .expand_spine_window(target_id)
+                .unwrap()
+                .unwrap();
+            fixture.double_roundtrip(client);
+            assert!(fixture.niri().shrink_expand_focus.is_some());
+            let deadline = fixture
+                .niri()
+                .layout
+                .windows()
+                .find(|(_, win)| win.window == target)
+                .unwrap()
+                .1
+                .normal_restore_deadline()
+                .unwrap();
+            let window = fixture.client(client).window(&target_surface);
+            let size = window.configures_received.last().unwrap().1.size;
+            window.ack_last();
+            fixture.double_roundtrip(client);
+            let lock = super::sink::lock_fixture(&mut fixture, client);
+            assert!(fixture.niri().shrink_expand_focus.is_none());
+            assert_eq!(
+                fixture
+                    .niri()
+                    .layout
+                    .windows()
+                    .find(|(_, win)| win.window == target)
+                    .unwrap()
+                    .1
+                    .normal_restore_deadline(),
+                Some(deadline)
+            );
+            if !reply_under_lock {
+                lock.unlock_and_destroy();
+                fixture.double_roundtrip(client);
+                fixture.niri_state().focus_window(&receiver);
+                fixture.double_roundtrip(client);
+            }
+            let window = fixture.client(client).window(&target_surface);
+            window.set_size(size.0 as u16, size.1 as u16);
+            window.commit();
+            fixture.double_roundtrip(client);
+            assert!(fixture
+                .niri()
+                .shrink_expand
+                .records()
+                .any(|current| current.id == record.id
+                    && current.phase == Phase::Settled
+                    && current.reason == Some(FinishReason::Ready)));
+            assert_ne!(
+                fixture.niri().keyboard_focus.surface(),
+                Some(&target_server_surface)
+            );
+            if reply_under_lock {
+                lock.unlock_and_destroy();
+                fixture.double_roundtrip(client);
+            }
+            assert!(!fixture.niri().is_locked());
+            assert!(fixture.niri().shrink_expand_focus.is_none());
+            assert_ne!(
+                fixture.niri().keyboard_focus.surface(),
+                Some(&target_server_surface)
+            );
+            assert!(fixture
+                .niri_state()
+                .confirm_shrink_preview(shrink.ticket())
+                .is_none());
+            assert_eq!(fixture.niri().layout.windows().count(), 2);
+        }
+    }
+}
+
 fn expand_test_config() -> niri_config::Config {
     niri_config::Config::parse_mem(
         r#"
