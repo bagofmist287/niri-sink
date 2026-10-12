@@ -101,6 +101,11 @@ impl State {
             thickness: behavior.thickness,
             border,
         });
+        self.niri.layout.set_shrink_preview(
+            &window,
+            chosen.geometry.outer_size(),
+            behavior.animate,
+        );
         self.arm_shrink_preview_timer();
         self.niri.queue_redraw_all();
         Ok(record)
@@ -154,6 +159,7 @@ impl State {
             self.niri.event_loop.remove(token);
         }
         self.niri.shrink_preview_lease = None;
+        self.niri.layout.clear_shrink_previews();
         let record = self.niri.shrink_expand.cancel();
         if record.is_some() {
             self.niri.queue_redraw_all();

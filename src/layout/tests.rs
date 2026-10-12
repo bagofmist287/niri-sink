@@ -52,6 +52,9 @@ struct TestWindowInner {
     spine_title: RefCell<String>,
     spine_app_id: RefCell<String>,
     urgent: Cell<bool>,
+    render_solid: RefCell<Option<crate::render_helpers::solid_color::SolidColorBuffer>>,
+    render_solid_blocked: RefCell<Option<crate::render_helpers::solid_color::SolidColorBuffer>>,
+    offscreen_data: crate::render_helpers::offscreen::OffscreenDataSlot,
 }
 
 #[derive(Debug, Clone)]
@@ -112,6 +115,9 @@ impl TestWindow {
             spine_title: RefCell::new("Editor 编辑器 · mixed title — ملف".into()),
             spine_app_id: RefCell::new("org.niri.TestWindow".into()),
             urgent: Cell::new(false),
+            render_solid: RefCell::new(None),
+            render_solid_blocked: RefCell::new(None),
+            offscreen_data: Default::default(),
         }))
     }
 
@@ -196,15 +202,31 @@ impl LayoutElement for TestWindow {
 
     fn render_normal<R: NiriRenderer>(
         &self,
-        _ctx: RenderCtx<R>,
-        _location: Point<f64, Logical>,
+        ctx: RenderCtx<R>,
+        location: Point<f64, Logical>,
         _scale: Scale<f64>,
-        _alpha: f32,
-        _push: &mut dyn FnMut(LayoutElementRenderElement<R>),
+        alpha: f32,
+        push: &mut dyn FnMut(LayoutElementRenderElement<R>),
     ) {
         self.0
             .render_normal_calls
             .set(self.0.render_normal_calls.get() + 1);
+        let buffer = if ctx.target.should_block_out(self.0.rules.block_out_from) {
+            &self.0.render_solid_blocked
+        } else {
+            &self.0.render_solid
+        };
+        if let Some(buffer) = buffer.borrow().as_ref() {
+            push(
+                crate::render_helpers::solid_color::SolidColorRenderElement::from_buffer(
+                    buffer,
+                    location,
+                    alpha,
+                    smithay::backend::renderer::element::Kind::Unspecified,
+                )
+                .into(),
+            );
+        }
     }
 
     fn render_popups<R: NiriRenderer>(
@@ -312,7 +334,23 @@ impl LayoutElement for TestWindow {
             .push((output.name(), false));
     }
 
-    fn set_offscreen_data(&self, _data: Option<OffscreenData>) {}
+    fn offscreen_data_slot(&self) -> Option<crate::render_helpers::offscreen::OffscreenDataSlot> {
+        Some(self.0.offscreen_data.clone())
+    }
+
+    fn set_offscreen_data(&self, data: Option<OffscreenData>) {
+        let Some(data) = data else {
+            self.0.offscreen_data.replace(None);
+            return;
+        };
+        let mut slot = self.0.offscreen_data.borrow_mut();
+        if let Some(existing) = &mut *slot {
+            existing.id = data.id;
+            existing.states.states.extend(data.states.states);
+        } else {
+            *slot = Some(data);
+        }
+    }
 
     fn set_activated(&mut self, active: bool) {
         self.0.pending_activated.set(active);

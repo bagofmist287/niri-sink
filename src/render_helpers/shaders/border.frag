@@ -194,6 +194,9 @@ vec4 color_mix(vec4 color1, vec4 color2, float color_ratio) {
 }
 
 vec4 gradient_color(vec2 coords) {
+#ifdef NIRI_CONSTANT_GRADIENT
+    return color_mix(color_from, color_to, 0.5);
+#else
     coords = coords + grad_offset;
 
     if ((grad_vec.x < 0.0 && 0.0 <= grad_vec.y) || (0.0 <= grad_vec.x && grad_vec.y < 0.0))
@@ -206,6 +209,7 @@ vec4 gradient_color(vec2 coords) {
 
     frac = clamp(frac, 0.0, 1.0);
     return color_mix(color_from, color_to, frac);
+#endif
 }
 
 float niri_rounding_alpha(vec2 coords, vec2 size, vec4 corner_radius);

@@ -83,7 +83,11 @@ impl BorderRenderElement {
     }
 
     pub fn empty() -> Self {
-        let inner = ShaderRenderElement::empty(ProgramType::Border, Kind::Unspecified);
+        Self::empty_with_program(ProgramType::Border)
+    }
+
+    pub fn empty_with_program(program: ProgramType) -> Self {
+        let inner = ShaderRenderElement::empty(program, Kind::Unspecified);
         Self {
             inner,
             params: Parameters {

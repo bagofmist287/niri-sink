@@ -60,6 +60,7 @@ pub struct OffscreenRenderElement {
     src_size: Size<i32, Buffer>,
     alpha: f32,
     kind: Kind,
+    grayscale: bool,
 }
 
 #[derive(Debug)]
@@ -192,6 +193,7 @@ impl OffscreenBuffer {
             src_size,
             alpha: 1.,
             kind: Kind::Unspecified,
+            grayscale: false,
         };
 
         let data = OffscreenData {
@@ -213,6 +215,10 @@ impl Default for OffscreenBuffer {
 }
 
 impl OffscreenRenderElement {
+    pub fn with_grayscale(mut self) -> Self {
+        self.grayscale = true;
+        self
+    }
     pub fn texture(&self) -> &GlesTexture {
         &self.texture
     }
@@ -316,6 +322,14 @@ impl RenderElement<GlesRenderer> for OffscreenRenderElement {
             return Ok(());
         }
 
+        let shader = self
+            .grayscale
+            .then(|| {
+                super::shaders::Shaders::get_from_frame(frame)
+                    .grayscale
+                    .clone()
+            })
+            .flatten();
         frame.render_texture_from_to(
             &self.texture,
             src,
@@ -324,7 +338,7 @@ impl RenderElement<GlesRenderer> for OffscreenRenderElement {
             opaque_regions,
             Transform::Normal,
             self.alpha,
-            None,
+            shader.as_ref(),
             &[],
         )
     }

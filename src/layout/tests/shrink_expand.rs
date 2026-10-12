@@ -1695,6 +1695,187 @@ fn spine_test_renderer() -> smithay::backend::renderer::gles::GlesRenderer {
 }
 
 #[test]
+#[ignore = "requires an explicit software EGL preview rendering run"]
+fn shrink_preview_gray_source_constant_gradient_and_capture_cache_are_independent() {
+    use crate::render_helpers::solid_color::SolidColorBuffer;
+    use crate::render_helpers::{render_and_download, RenderTarget};
+    use smithay::backend::allocator::Fourcc;
+    use smithay::backend::renderer::element::Element as _;
+    use smithay::backend::renderer::ExportMem as _;
+    let mut renderer = spine_test_renderer();
+    for scale in [1., 1.25] {
+        let mut options = Options::default();
+        options.layout.border.off = true;
+        options.layout.focus_ring.off = true;
+        options.animations.off = true;
+        options.layout.spine.inactive = niri_config::SpinePaint::Gradient(niri_config::Gradient {
+            from: "#ff0000".parse().unwrap(),
+            to: "#0000ff".parse().unwrap(),
+            angle: 90,
+            relative_to: niri_config::GradientRelativeTo::WorkspaceView,
+            in_: niri_config::GradientInterpolation {
+                color_space: niri_config::GradientColorSpace::SrgbLinear,
+                ..Default::default()
+            },
+        });
+        let mut params = TestWindowParams::new(1);
+        params.bbox = Rectangle::from_size((120, 80).into());
+        params.rules = Some(ResolvedWindowRules {
+            block_out_from: Some(niri_config::BlockOutFrom::ScreenCapture),
+            ..Default::default()
+        });
+        let mut window = Tile::new(
+            TestWindow::new(params),
+            (1280., 720.).into(),
+            scale,
+            Clock::with_time(Duration::ZERO),
+            Rc::new(options),
+        );
+        *window.window().0.render_solid.borrow_mut() =
+            Some(SolidColorBuffer::new((120., 80.), [0., 1., 0., 1.]));
+        *window.window().0.render_solid_blocked.borrow_mut() =
+            Some(SolidColorBuffer::new((120., 80.), [0., 0., 0., 1.]));
+        let size = window.tile_size();
+        window.set_shrink_preview((40., 80.).into(), false);
+        window.update_render_elements(true, Rectangle::from_size((1280., 720.).into()));
+        assert_eq!(window.tile_size(), size);
+        assert_eq!(window.form(), WindowForm::Normal);
+        assert_eq!(window.window().requested_size(), None);
+        let collect = |window: &Tile<TestWindow>,
+                       renderer: &mut smithay::backend::renderer::gles::GlesRenderer,
+                       target| {
+            let mut elements = Vec::new();
+            window.render(
+                RenderCtx {
+                    renderer,
+                    target,
+                    xray: None,
+                },
+                (0., 0.).into(),
+                XrayPos::default(),
+                false,
+                &mut |e| elements.push(e),
+            );
+            elements
+        };
+        // Collect both targets before drawing: a blocked cache must not overwrite output pixels.
+        let output = collect(&window, &mut renderer, RenderTarget::Output);
+        let revisions = output
+            .iter()
+            .map(|e| (e.id().clone(), e.current_commit()))
+            .collect::<Vec<_>>();
+        let output_id = window
+            .window()
+            .0
+            .offscreen_data
+            .borrow()
+            .as_ref()
+            .unwrap()
+            .id
+            .clone();
+        assert_eq!(output_id, revisions.last().unwrap().0);
+        let blocked = collect(&window, &mut renderer, RenderTarget::ScreenCapture);
+        assert_eq!(
+            window
+                .window()
+                .0
+                .offscreen_data
+                .borrow()
+                .as_ref()
+                .unwrap()
+                .id,
+            output_id
+        );
+        let screencast = collect(&window, &mut renderer, RenderTarget::Screencast);
+        assert_eq!(
+            window
+                .window()
+                .0
+                .offscreen_data
+                .borrow()
+                .as_ref()
+                .unwrap()
+                .id,
+            output_id
+        );
+        drop(screencast);
+        let physical = size.to_physical_precise_round(scale);
+        let download = render_and_download(
+            &mut renderer,
+            physical,
+            Scale::from(scale),
+            Transform::Normal,
+            Fourcc::Abgr8888,
+            output.into_iter().rev(),
+        )
+        .unwrap();
+        let data = renderer.map_texture(&download).unwrap();
+        let at = |x: usize, y: usize| &data[(y * physical.w as usize + x) * 4..][..4];
+        // The pure ghost uses the native linear-sRGB gradient midpoint, not its first stop.
+        for point in [(5., 5.), (30., 50.)] {
+            let p = at(
+                (point.0 * scale).round() as usize,
+                (point.1 * scale).round() as usize,
+            );
+            assert!(
+                p[0].abs_diff(186) <= 1 && p[1] == 0 && p[2].abs_diff(186) <= 1 && p[3] == 255,
+                "{p:?}"
+            );
+        }
+        let gray = at(
+            (60. * scale).round() as usize,
+            (20. * scale).round() as usize,
+        );
+        assert!(
+            gray[0].abs_diff(182) <= 1
+                && gray[0] == gray[1]
+                && gray[1] == gray[2]
+                && gray[3] == 255,
+            "{gray:?}"
+        );
+        let download = render_and_download(
+            &mut renderer,
+            physical,
+            Scale::from(scale),
+            Transform::Normal,
+            Fourcc::Abgr8888,
+            blocked.into_iter().rev(),
+        )
+        .unwrap();
+        assert!(renderer
+            .map_texture(&download)
+            .unwrap()
+            .chunks_exact(4)
+            .all(|p| p == [0, 0, 0, 255]));
+        let next = collect(&window, &mut renderer, RenderTarget::Output);
+        assert_eq!(
+            revisions,
+            next.iter()
+                .map(|e| (e.id().clone(), e.current_commit()))
+                .collect::<Vec<_>>()
+        );
+        window.clear_shrink_preview();
+        assert!(window.shrink_preview_pose().is_none());
+        let elements = collect(&window, &mut renderer, RenderTarget::Output);
+        assert!(window.window().0.offscreen_data.borrow().is_none());
+        let download = render_and_download(
+            &mut renderer,
+            physical,
+            Scale::from(scale),
+            Transform::Normal,
+            Fourcc::Abgr8888,
+            elements.into_iter().rev(),
+        )
+        .unwrap();
+        assert!(renderer
+            .map_texture(&download)
+            .unwrap()
+            .chunks_exact(4)
+            .all(|p| p == [0, 255, 0, 255]));
+    }
+}
+
+#[test]
 #[ignore = "requires surfaceless EGL and the isolated desktop/icon fixture environment"]
 fn spine_application_icon_stays_upright_and_private() {
     use crate::render_helpers::{render_and_download, RenderTarget};

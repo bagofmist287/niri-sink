@@ -34,6 +34,7 @@ use crate::render_helpers::snapshot::RenderSnapshot;
 use crate::render_helpers::solid_color::{SolidColorBuffer, SolidColorRenderElement};
 use crate::render_helpers::xray::{Xray, XrayPos};
 use crate::render_helpers::{RenderCtx, RenderTarget};
+use crate::ui::shrink_preview::ShrinkPreview;
 use crate::ui::spine::{Spine, SpineRenderElement};
 use crate::utils::transaction::Transaction;
 use crate::utils::{
@@ -58,6 +59,7 @@ pub struct Tile<W: LayoutElement> {
     spine: Option<SpineGeometry>,
     spine_ui: Spine,
     spine_visual_active: bool,
+    shrink_preview: Option<ShrinkPreview>,
     /// Current-slot allocation while the original client catches up, never a restore history.
     normal_restore: Option<NormalSizePlan>,
     /// Container origin at batch insertion, retained through a subsequent pending mode change.
@@ -227,6 +229,7 @@ impl<W: LayoutElement> Tile<W> {
             spine: None,
             spine_ui: Spine::default(),
             spine_visual_active: false,
+            shrink_preview: None,
             normal_restore: None,
             normal_restore_origin_mode: SizingMode::Normal,
             normal_restore_deadline: None,
@@ -500,6 +503,9 @@ impl<W: LayoutElement> Tile<W> {
     }
 
     pub fn advance_animations(&mut self) {
+        if let Some(preview) = &mut self.shrink_preview {
+            preview.advance();
+        }
         if let Some(presentation) = &mut self.sink_overview_presentation {
             presentation.advance();
         }
@@ -610,9 +616,13 @@ impl<W: LayoutElement> Tile<W> {
     }
 
     pub fn are_transitions_ongoing(&self) -> bool {
-        self.sink_overview_presentation
+        self.shrink_preview
             .as_ref()
-            .is_some_and(|p| !p.is_done())
+            .is_some_and(ShrinkPreview::is_animating)
+            || self
+                .sink_overview_presentation
+                .as_ref()
+                .is_some_and(|p| !p.is_done())
             || self
                 .sink_presentation
                 .as_ref()
@@ -724,6 +734,20 @@ impl<W: LayoutElement> Tile<W> {
         );
 
         self.fullscreen_backdrop.resize(animated_tile_size);
+        if let Some(preview) = &mut self.shrink_preview {
+            let border = self.options.layout.border.merged_with(&rules.border);
+            let ring = self
+                .options
+                .layout
+                .focus_ring
+                .merged_with(&rules.focus_ring);
+            let gradient =
+                self.options
+                    .layout
+                    .spine
+                    .resolve(false, self.window.is_urgent(), ring, border);
+            preview.update(gradient, self.window.geometry_corner_radius(), self.scale);
+        }
         if let Some(spine) = self.spine {
             let border = self.options.layout.border.merged_with(&rules.border);
             let ring = self
@@ -918,6 +942,7 @@ impl<W: LayoutElement> Tile<W> {
             return false;
         };
         self.spine = Some(spine);
+        self.shrink_preview = None;
         self.spine_ui.clear();
         self.spine_visual_active = false;
         self.unmap_snapshot = None;
@@ -961,6 +986,26 @@ impl<W: LayoutElement> Tile<W> {
 
     pub fn set_spine_visual_active(&mut self, active: bool) {
         self.spine_visual_active = self.is_spine() && active;
+    }
+
+    pub(crate) fn set_shrink_preview(&mut self, target: Size<f64, Logical>, animate: bool) {
+        let source = self.animated_tile_size();
+        let preview = self
+            .shrink_preview
+            .get_or_insert_with(|| ShrinkPreview::new(self.clock.clone(), source));
+        preview.retarget(
+            target,
+            self.options.animations.window_movement.0,
+            animate && !self.options.animations.off,
+        );
+    }
+
+    pub(crate) fn clear_shrink_preview(&mut self) {
+        self.shrink_preview = None;
+    }
+
+    pub fn shrink_preview_pose(&self) -> Option<Size<f64, Logical>> {
+        self.shrink_preview.as_ref().map(ShrinkPreview::pose)
     }
 
     /// Batch form update, before any member is configured. The caller owns the slot snapshot.
@@ -1854,7 +1899,64 @@ impl<W: LayoutElement> Tile<W> {
             .map_or(1., |alpha| alpha.anim.clamped_value()) as f32;
 
         let mut pushed = false;
+        // Capture passes must not replace the output's presentation-feedback mapping.
+        // render_inner may also write this slot while rendering a native resize animation.
+        let capture_slot = (self.shrink_preview.is_some() && ctx.target != RenderTarget::Output)
+            .then(|| self.window.offscreen_data_slot())
+            .flatten();
+        let output_data = capture_slot
+            .as_ref()
+            .and_then(|slot| slot.borrow_mut().take());
         self.window().set_offscreen_data(None);
+
+        if let Some(preview) = &self.shrink_preview {
+            let mut ctx = ctx.as_gles();
+            let mut elements = Vec::new();
+            self.render_inner(
+                ctx.r(),
+                Point::new(0., 0.),
+                xray_pos,
+                focus_ring,
+                &mut |e| elements.push(e),
+            );
+            if let Ok((elem, _sync, data)) =
+                preview
+                    .offscreen(ctx.target)
+                    .render(ctx.renderer, scale, &elements)
+            {
+                let blocked = ctx
+                    .target
+                    .should_block_out(self.window.rules().block_out_from);
+                let alpha = if self.window.is_ignoring_opacity_window_rule() {
+                    1.
+                } else {
+                    self.window.rules().opacity.unwrap_or(1.).clamp(0., 1.)
+                };
+                preview.render(
+                    ctx.renderer,
+                    location + self.bob_offset(),
+                    blocked,
+                    alpha * tile_alpha,
+                    &mut |e| {
+                        // Ghost is above the gray source in front-to-back element ordering.
+                        push(e.into());
+                    },
+                );
+                let offset = elem.offset();
+                if let Some(slot) = &capture_slot {
+                    *slot.borrow_mut() = output_data;
+                } else {
+                    self.window().set_offscreen_data(Some(data));
+                }
+                push(
+                    elem.with_alpha(tile_alpha)
+                        .with_offset(location + offset)
+                        .with_grayscale()
+                        .into(),
+                );
+                return;
+            }
+        }
 
         if let Some(open) = &self.open_animation {
             let mut ctx = ctx.as_gles();
@@ -1910,6 +2012,9 @@ impl<W: LayoutElement> Tile<W> {
 
         if !pushed {
             self.render_inner(ctx, location, xray_pos, focus_ring, &mut |elem| push(elem));
+        }
+        if let Some(slot) = &capture_slot {
+            *slot.borrow_mut() = output_data;
         }
     }
 

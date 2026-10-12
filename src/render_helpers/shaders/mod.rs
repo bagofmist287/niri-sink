@@ -17,6 +17,8 @@ pub struct Shaders {
     pub postprocess_and_clip: Option<GlesTexProgram>,
     pub resize: Option<ShaderProgram>,
     pub gradient_fade: Option<GlesTexProgram>,
+    pub grayscale: Option<GlesTexProgram>,
+    pub shrink_ghost: Option<ShaderProgram>,
     pub blur: Option<BlurProgram>,
     pub custom_resize: RefCell<Option<ShaderProgram>>,
     pub custom_close: RefCell<Option<ShaderProgram>>,
@@ -30,6 +32,7 @@ pub enum ProgramType {
     Resize,
     Close,
     Open,
+    ShrinkGhost,
 }
 
 impl Shaders {
@@ -142,6 +145,36 @@ impl Shaders {
             })
             .ok();
 
+        let grayscale = renderer
+            .compile_custom_texture_shader(include_str!("grayscale.frag"), &[])
+            .map_err(|err| warn!("error compiling grayscale shader: {err:?}"))
+            .ok();
+        let ghost_source = format!(
+            "#define NIRI_CONSTANT_GRADIENT\n{}{}",
+            include_str!("border.frag"),
+            include_str!("rounding_alpha.frag")
+        );
+        let shrink_ghost = ShaderProgram::compile(
+            renderer,
+            &ghost_source,
+            &[
+                UniformName::new("colorspace", UniformType::_1f),
+                UniformName::new("hue_interpolation", UniformType::_1f),
+                UniformName::new("color_from", UniformType::_4f),
+                UniformName::new("color_to", UniformType::_4f),
+                UniformName::new("grad_offset", UniformType::_2f),
+                UniformName::new("grad_width", UniformType::_1f),
+                UniformName::new("grad_vec", UniformType::_2f),
+                UniformName::new("input_to_geo", UniformType::Matrix3x3),
+                UniformName::new("geo_size", UniformType::_2f),
+                UniformName::new("outer_radius", UniformType::_4f),
+                UniformName::new("border_width", UniformType::_1f),
+            ],
+            &[],
+        )
+        .map_err(|err| warn!("error compiling shrink ghost shader: {err:?}"))
+        .ok();
+
         let blur = BlurProgram::compile(renderer)
             .map_err(|err| {
                 warn!("error compiling blur shaders: {err:?}");
@@ -155,6 +188,8 @@ impl Shaders {
             postprocess_and_clip,
             resize,
             gradient_fade,
+            grayscale,
+            shrink_ghost,
             blur,
             custom_resize: RefCell::new(None),
             custom_close: RefCell::new(None),
@@ -207,6 +242,7 @@ impl Shaders {
                 .or_else(|| self.resize.clone()),
             ProgramType::Close => self.custom_close.borrow().clone(),
             ProgramType::Open => self.custom_open.borrow().clone(),
+            ProgramType::ShrinkGhost => self.shrink_ghost.clone(),
         }
     }
 }

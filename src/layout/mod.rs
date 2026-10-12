@@ -1749,6 +1749,30 @@ impl<W: LayoutElement> Layout<W> {
             .is_some_and(|ws| ws.commit_shrink(id, axis, thickness))
     }
 
+    pub(crate) fn set_shrink_preview(
+        &mut self,
+        id: &W::Id,
+        target: Size<f64, Logical>,
+        animate: bool,
+    ) {
+        if let Some(tile) = self
+            .workspaces_mut()
+            .flat_map(|ws| ws.tiles_mut())
+            .find(|tile| tile.window().id() == id)
+        {
+            tile.set_shrink_preview(target, animate);
+        }
+    }
+
+    pub(crate) fn clear_shrink_previews(&mut self) {
+        if let Some(InteractiveMoveState::Moving(move_)) = &mut self.interactive_move {
+            move_.tile.clear_shrink_preview();
+        }
+        for tile in self.workspaces_mut().flat_map(|ws| ws.tiles_mut()) {
+            tile.clear_shrink_preview();
+        }
+    }
+
     /// Moves the active normal tile to its workspace's Sink owner.
     /// The action layer is responsible for feature, seat, lock and popup-grab permission.
     pub fn sink_window(&mut self) -> bool {

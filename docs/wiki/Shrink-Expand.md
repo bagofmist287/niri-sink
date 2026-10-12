@@ -106,3 +106,14 @@ GIO and GdkPixbuf are now direct build dependencies at the already locked versio
 no additional package version was upgraded. This resolver does not register the
 optional xdg-toplevel-icon protocol. Physical device and installed-session checks
 remain pending.
+
+The internal timed Shrink preview retains its normal layout allocation and focus.
+It grays the content and draws a separate solid ghost using the effective spine
+paint; a gradient supplies its midpoint through the native interpolation shader.
+Changing axis starts from the ghost's current animated shape. Disabling animation
+changes that shape immediately without changing the buffer timer. Cancellation
+removes the preview; a successful form commit also clears it. Output, screencast
+and screenshot rendering use separate caches, and capture passes preserve the
+output's presentation-feedback mapping. CPU, Wayland fixture and software EGL
+checks cover these internal paths; public actions and mouse buffering remain
+under development.

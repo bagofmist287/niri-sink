@@ -66,6 +66,15 @@ fn timed_shrink_repeat_rejects_old_ticket_and_commits_native_focus_handoff() {
             assert!(!fixture.niri().layout.is_spine(&window));
             assert_eq!(fixture.niri().keyboard_focus.surface(), Some(&old_surface));
             assert_eq!(fixture.niri().layout.focus().unwrap().size(), before_size);
+            assert!(fixture
+                .niri()
+                .layout
+                .workspaces()
+                .flat_map(|(_, _, ws)| ws.tiles())
+                .any(
+                    |tile| crate::layout::LayoutElement::id(tile.window()) == &window
+                        && tile.shrink_preview_pose().is_some()
+                ));
             let second = fixture.niri_state().begin_shrink_preview(None).unwrap();
             assert_eq!(second.id, first.id);
             assert!(second.revision > first.revision);
@@ -82,6 +91,12 @@ fn timed_shrink_repeat_rejects_old_ticket_and_commits_native_focus_handoff() {
             assert_eq!(submitted.phase, Phase::Submitted);
             fixture.double_roundtrip(client);
             assert!(fixture.niri().layout.is_spine(&window));
+            assert!(fixture
+                .niri()
+                .layout
+                .workspaces()
+                .flat_map(|(_, _, ws)| ws.tiles())
+                .all(|tile| tile.shrink_preview_pose().is_none()));
             assert!(fixture.niri().shrink_expand.preview().is_none());
             assert!(fixture
                 .niri()
@@ -149,6 +164,14 @@ fn timed_shrink_actual_zero_timer_submits_and_scope_change_or_disable_cancels() 
         assert!(fixture.niri().shrink_expand.preview().is_none(), "{change}");
         assert!(fixture.niri().shrink_preview_timer.is_none());
         assert!(!fixture.niri().layout.is_spine(&target));
+        for tile in fixture
+            .niri()
+            .layout
+            .workspaces()
+            .flat_map(|(_, _, ws)| ws.tiles())
+        {
+            assert!(tile.shrink_preview_pose().is_none(), "{change}");
+        }
         assert!(fixture
             .niri_state()
             .confirm_shrink_preview(record.ticket())
