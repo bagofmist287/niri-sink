@@ -151,6 +151,17 @@ and screenshot rendering use separate caches, and capture passes preserve the
 output's presentation-feedback mapping. CPU, Wayland fixture and software EGL
 checks cover these paths; normal-window spatial buffering is described below.
 
+Confirming while the shrink demonstration is still moving preserves its current
+pure-color pose and continues toward the committed spine. The logical form, locked
+allocation and normal focus handoff change immediately; the remaining visual does
+not retain client input or the operation timer. Committed shrinking samples no
+client or popup. An immediate expansion starts from this visible pose. Floating
+spatial shrink commits the preview's left/top edge anchor before the native size
+update, without changing normal-window resize or move behavior. Turning animation
+off completes the visual immediately. These paths have layout, real Wayland/grab
+and software EGL evidence; physical-device and nested-session checks remain later
+qualification.
+
 Internal direct and workspace-wide expansion now use the current native slot's
 normal size plan. Direct expansion selects that window, but waits for the
 processed surface commit or the original 300 ms deadline before client input.

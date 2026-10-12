@@ -1025,11 +1025,24 @@ impl<W: LayoutElement> Workspace<W> {
             return false;
         }
         let hand_off = self.active_window().is_some_and(|window| window.id() == id);
+        let floating = self.floating.has_window(id);
         let Some(tile) = self.tiles_mut().find(|tile| tile.window().id() == id) else {
             return false;
         };
+        let offset = if floating {
+            let Some(plan) = tile.plan_spine_geometry(axis, thickness) else {
+                return false;
+            };
+            tile.shrink_commit_origin_offset(plan.outer_size())
+        } else {
+            Point::from((0., 0.))
+        };
         if tile.is_spine() || !tile.set_spine(axis, thickness) {
             return false;
+        }
+        if floating && offset != Point::from((0., 0.)) {
+            tile.relocate_committed_shrink_origin(offset);
+            self.floating.offset_spine_after_shrink(id, offset);
         }
         self.update_window(id, None);
         if hand_off {

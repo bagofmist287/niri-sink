@@ -556,6 +556,12 @@ impl<W: LayoutElement> FloatingSpace<W> {
         data.set_logical_pos(data.logical_pos + offset);
     }
 
+    pub(super) fn offset_spine_after_shrink(&mut self, id: &W::Id, offset: Point<f64, Logical>) {
+        let idx = self.idx_of(id).unwrap();
+        let data = &mut self.data[idx];
+        data.set_logical_pos(data.logical_pos + offset);
+    }
+
     pub fn add_tile(&mut self, tile: Tile<W>, activate: bool) {
         self.add_tile_at(0, tile, activate);
     }

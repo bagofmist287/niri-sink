@@ -60,6 +60,7 @@ pub struct Tile<W: LayoutElement> {
     spine_ui: Spine,
     spine_visual_active: bool,
     shrink_preview: Option<ShrinkPreview>,
+    committed_shrink_presentation: Option<CommittedShrinkPresentation>,
     /// Ephemeral presentation of the current insertion, independent of its input barrier.
     normal_restore_presentation: Option<NormalRestorePresentation>,
     /// Current-slot allocation while the original client catches up, never a restore history.
@@ -171,6 +172,9 @@ pub type TileRenderSnapshot =
 #[derive(Debug)]
 struct NormalRestorePresentation {
     ghost: ShrinkPreview,
+    source_size: Size<f64, Logical>,
+    offset_from: Point<f64, Logical>,
+    position: Animation,
     // None while waiting for the existing protocol barrier, Some after it releases.
     reveal: Option<Animation>,
 }
@@ -183,7 +187,33 @@ impl NormalRestorePresentation {
     }
 
     fn is_animating(&self) -> bool {
-        self.ghost.is_animating() || self.reveal.as_ref().is_some_and(|anim| !anim.is_done())
+        self.ghost.is_animating()
+            || (self.offset_from != Point::from((0., 0.)) && !self.position.is_done())
+            || self.reveal.as_ref().is_some_and(|anim| !anim.is_done())
+    }
+
+    fn offset(&self) -> Point<f64, Logical> {
+        self.offset_from
+            .upscale(1. - self.position.clamped_value().clamp(0., 1.))
+    }
+}
+
+#[derive(Debug)]
+struct CommittedShrinkPresentation {
+    ghost: ShrinkPreview,
+    offset_from: Point<f64, Logical>,
+    position: Animation,
+}
+
+impl CommittedShrinkPresentation {
+    fn offset(&self) -> Point<f64, Logical> {
+        self.offset_from
+            .upscale(1. - self.position.clamped_value().clamp(0., 1.))
+    }
+
+    fn is_animating(&self) -> bool {
+        self.ghost.is_animating()
+            || (self.offset_from != Point::from((0., 0.)) && !self.position.is_done())
     }
 }
 
@@ -251,6 +281,7 @@ impl<W: LayoutElement> Tile<W> {
             spine_ui: Spine::default(),
             spine_visual_active: false,
             shrink_preview: None,
+            committed_shrink_presentation: None,
             normal_restore_presentation: None,
             normal_restore: None,
             normal_restore_origin_mode: SizingMode::Normal,
@@ -319,6 +350,9 @@ impl<W: LayoutElement> Tile<W> {
         self.view_size = view_size;
         self.scale = scale;
         self.options = options;
+        if !self.options.shrink_expand.animate || self.options.animations.off {
+            self.committed_shrink_presentation = None;
+        }
         if (!self.options.shrink_expand.animate || self.options.animations.off)
             && self.normal_restore.is_none()
         {
@@ -546,6 +580,12 @@ impl<W: LayoutElement> Tile<W> {
         if let Some(preview) = &mut self.shrink_preview {
             preview.advance();
         }
+        if let Some(presentation) = &mut self.committed_shrink_presentation {
+            presentation.ghost.advance();
+            if !presentation.is_animating() {
+                self.committed_shrink_presentation = None;
+            }
+        }
         if let Some(presentation) = &mut self.normal_restore_presentation {
             presentation.ghost.advance();
             if presentation.reveal.as_ref().is_some_and(Animation::is_done) {
@@ -665,6 +705,10 @@ impl<W: LayoutElement> Tile<W> {
         self.shrink_preview
             .as_ref()
             .is_some_and(ShrinkPreview::is_animating)
+            || self
+                .committed_shrink_presentation
+                .as_ref()
+                .is_some_and(CommittedShrinkPresentation::is_animating)
             || self
                 .normal_restore_presentation
                 .as_ref()
@@ -815,6 +859,27 @@ impl<W: LayoutElement> Tile<W> {
                     .layout
                     .spine
                     .resolve(false, self.window.is_urgent(), ring, border);
+            presentation
+                .ghost
+                .update(gradient, self.window.geometry_corner_radius(), self.scale);
+        }
+        if let Some(presentation) = &mut self.committed_shrink_presentation {
+            let border = self.options.layout.border.merged_with(&rules.border);
+            let ring = self
+                .options
+                .layout
+                .focus_ring
+                .merged_with(&rules.focus_ring);
+            let gradient =
+                self.options
+                    .layout
+                    .spine
+                    .resolve(false, self.window.is_urgent(), ring, border);
+            presentation.ghost.retarget(
+                animated_tile_size,
+                self.options.animations.window_movement.0,
+                self.options.shrink_expand.animate && !self.options.animations.off,
+            );
             presentation
                 .ghost
                 .update(gradient, self.window.geometry_corner_radius(), self.scale);
@@ -1012,6 +1077,23 @@ impl<W: LayoutElement> Tile<W> {
         let Some(spine) = self.plan_spine_geometry(axis, thickness) else {
             return false;
         };
+        let source_size = self.animated_tile_size();
+        self.committed_shrink_presentation = self.shrink_preview.take().and_then(|preview| {
+            let pose = preview.pose();
+            let offset_from = preview.offset(source_size);
+            let animate = self.options.shrink_expand.animate && !self.options.animations.off;
+            if !animate || (pose == spine.outer_size() && offset_from == Point::from((0., 0.))) {
+                return None;
+            }
+            let config = self.options.animations.window_movement.0;
+            let mut ghost = ShrinkPreview::new(self.clock.clone(), pose);
+            ghost.retarget(spine.outer_size(), config, true);
+            Some(CommittedShrinkPresentation {
+                ghost,
+                offset_from,
+                position: Animation::new(self.clock.clone(), 0., 1., 0., config),
+            })
+        });
         self.spine = Some(spine);
         self.shrink_preview = None;
         self.normal_restore_presentation = None;
@@ -1049,6 +1131,7 @@ impl<W: LayoutElement> Tile<W> {
     pub fn clear_spine(&mut self) -> bool {
         let cleared = self.spine.take().is_some();
         if cleared {
+            self.committed_shrink_presentation = None;
             self.spine_ui.clear();
             self.spine_visual_active = false;
             self.unmap_snapshot = None;
@@ -1086,12 +1169,37 @@ impl<W: LayoutElement> Tile<W> {
         self.shrink_preview.as_ref().map(ShrinkPreview::pose)
     }
 
+    pub(super) fn shrink_commit_origin_offset(
+        &self,
+        target: Size<f64, Logical>,
+    ) -> Point<f64, Logical> {
+        let Some(preview) = &self.shrink_preview else {
+            return Point::from((0., 0.));
+        };
+        let source = self.animated_tile_size();
+        let anchor = preview.anchor();
+        Point::from((
+            (source.w - target.w) * anchor.x,
+            (source.h - target.h) * anchor.y,
+        ))
+    }
+
+    pub(super) fn relocate_committed_shrink_origin(&mut self, offset: Point<f64, Logical>) {
+        if let Some(presentation) = &mut self.committed_shrink_presentation {
+            presentation.offset_from -= offset;
+        }
+    }
+
     /// Batch form update, before any member is configured. The caller owns the slot snapshot.
     pub(super) fn prepare_normal_restore(&mut self, plan: NormalSizePlan) -> bool {
         let Some(spine) = self.spine.take() else {
             return false;
         };
-        let mut ghost = ShrinkPreview::new(self.clock.clone(), spine.outer_size());
+        let (pose, offset_from) = self.committed_shrink_presentation.take().map_or(
+            (spine.outer_size(), Point::from((0., 0.))),
+            |presentation| (presentation.ghost.pose(), presentation.offset()),
+        );
+        let mut ghost = ShrinkPreview::new(self.clock.clone(), pose);
         ghost.retarget(
             plan.allocation,
             self.options.animations.window_resize.anim,
@@ -1099,6 +1207,20 @@ impl<W: LayoutElement> Tile<W> {
         );
         self.normal_restore_presentation = Some(NormalRestorePresentation {
             ghost,
+            source_size: spine.outer_size(),
+            offset_from,
+            position: Animation::new(
+                self.clock.clone(),
+                0.,
+                1.,
+                0.,
+                niri_config::Animation {
+                    off: !self.options.shrink_expand.animate
+                        || self.options.animations.off
+                        || self.options.animations.window_resize.anim.off,
+                    ..self.options.animations.window_resize.anim
+                },
+            ),
             reveal: None,
         });
         self.spine_ui.clear();
@@ -1113,6 +1235,11 @@ impl<W: LayoutElement> Tile<W> {
 
     pub(super) fn set_normal_restore_anchor(&mut self, anchor: Point<f64, Logical>) {
         if let Some(presentation) = &mut self.normal_restore_presentation {
+            let pose = presentation.ghost.pose();
+            presentation.offset_from += Point::from((
+                (pose.w - presentation.source_size.w) * anchor.x,
+                (pose.h - presentation.source_size.h) * anchor.y,
+            ));
             presentation.ghost.set_anchor(anchor);
         }
     }
@@ -2049,6 +2176,25 @@ impl<W: LayoutElement> Tile<W> {
             .and_then(|slot| slot.borrow_mut().take());
         self.window().set_offscreen_data(None);
 
+        if let Some(presentation) = &self.committed_shrink_presentation {
+            let blocked = ctx
+                .target
+                .should_block_out(self.window.rules().block_out_from);
+            let alpha = if self.window.is_ignoring_opacity_window_rule() {
+                1.
+            } else {
+                self.window.rules().opacity.unwrap_or(1.).clamp(0., 1.)
+            };
+            presentation.ghost.render(
+                ctx.renderer,
+                location + self.bob_offset() + presentation.offset(),
+                blocked,
+                alpha * tile_alpha,
+                &mut |elem| push(elem.into()),
+            );
+            return;
+        }
+
         if let Some(presentation) = &self.normal_restore_presentation {
             let blocked = ctx
                 .target
@@ -2060,7 +2206,10 @@ impl<W: LayoutElement> Tile<W> {
             };
             presentation.ghost.render(
                 ctx.renderer,
-                location + self.bob_offset() + presentation.ghost.offset(self.animated_tile_size()),
+                location
+                    + self.bob_offset()
+                    + presentation.offset()
+                    + presentation.ghost.offset(self.animated_tile_size()),
                 blocked,
                 alpha * tile_alpha * presentation.ghost_alpha(),
                 &mut |elem| push(elem.into()),

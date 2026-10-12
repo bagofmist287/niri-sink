@@ -93,6 +93,66 @@ fn normal_restore_visual_clock_does_not_control_protocol_or_input_barrier() {
 }
 
 #[test]
+fn spatial_floating_shrink_commits_the_preview_anchor_and_preserves_native_focus() {
+    for animate in [false, true] {
+        for axis in [ShrinkAxis::Horizontal, ShrinkAxis::Vertical] {
+            for scale in [1., 1.25] {
+                let mut options = Options::default();
+                options.shrink_expand.animate = animate;
+                let mut layout = Layout::with_options(Clock::with_time(Duration::ZERO), options);
+                Op::AddScaledOutput {
+                    id: 1,
+                    scale,
+                    layout_config: None,
+                }
+                .apply(&mut layout);
+                for id in [1, 2] {
+                    Op::AddWindow {
+                        params: TestWindowParams::new(id),
+                    }
+                    .apply(&mut layout);
+                    Op::Communicate(id).apply(&mut layout);
+                }
+                layout.set_window_floating(Some(&1), true);
+                Op::Communicate(1).apply(&mut layout);
+                layout.activate_window(&1);
+                Op::CompleteAnimations.apply(&mut layout);
+                let get = |layout: &Layout<TestWindow>| {
+                    let ws = layout
+                        .workspaces()
+                        .find(|(_, _, ws)| ws.has_window(&1))
+                        .unwrap()
+                        .2;
+                    let (tile, pos, _) = ws
+                        .tiles_with_render_positions()
+                        .find(|(tile, _, _)| tile.window().id() == &1)
+                        .unwrap();
+                    (tile.tile_size(), pos, tile.window().requested_size())
+                };
+                let (source, old_pos, request) = get(&layout);
+                let target = if axis == ShrinkAxis::Horizontal {
+                    (40., source.h).into()
+                } else {
+                    (source.w, 40.).into()
+                };
+                layout.set_shrink_preview(&1, target, false);
+                layout.set_shrink_preview_anchor(&1, (1., 1.).into());
+                assert!(layout.commit_shrink(&1, axis, 40.));
+                let (actual, pos, after_request) = get(&layout);
+                assert_eq!(actual, target);
+                approx::assert_abs_diff_eq!(pos.x, old_pos.x + source.w - actual.w, epsilon = 1e-6);
+                approx::assert_abs_diff_eq!(pos.y, old_pos.y + source.h - actual.h, epsilon = 1e-6);
+                assert_eq!(request, after_request);
+                assert!(layout.is_spine(&1));
+                assert_eq!(layout.focus().map(|focus| *focus.id()), Some(2));
+                assert_eq!(layout.windows().count(), 2);
+                layout.verify_invariants();
+            }
+        }
+    }
+}
+
+#[test]
 fn disable_restore_all_workspaces_in_one_batch_keeps_slots_and_focus() {
     for all_books in [false, true] {
         for no_outputs in [false, true] {
@@ -2312,6 +2372,132 @@ fn spine_test_renderer() -> smithay::backend::renderer::gles::GlesRenderer {
     resources::init(&mut renderer);
     shaders::init(&mut renderer);
     renderer
+}
+
+#[test]
+#[ignore = "requires explicit software EGL committed-shrink rendering"]
+fn early_shrink_commit_and_immediate_expand_preserve_the_visible_pose() {
+    use crate::layout::shrink_expand::NormalSizePlan;
+    use crate::render_helpers::solid_color::SolidColorBuffer;
+    use crate::render_helpers::{render_and_download, RenderTarget};
+    use smithay::backend::allocator::Fourcc;
+    use smithay::backend::renderer::element::Element as _;
+    use smithay::backend::renderer::ExportMem as _;
+    let mut renderer = spine_test_renderer();
+    for axis in [ShrinkAxis::Horizontal, ShrinkAxis::Vertical] {
+        for anchor in [(0., 0.), (1., 1.)] {
+            for scale in [1., 1.25] {
+                let mut options = Options::default();
+                options.layout.border.off = true;
+                options.layout.focus_ring.off = true;
+                options.layout.spine.inactive =
+                    niri_config::SpinePaint::Solid("#ff0000".parse().unwrap());
+                let config = niri_config::Animation {
+                    off: false,
+                    kind: niri_config::animations::Kind::Easing(
+                        niri_config::animations::EasingParams {
+                            duration_ms: 200,
+                            curve: niri_config::animations::Curve::Linear,
+                        },
+                    ),
+                };
+                options.animations.window_movement.0 = config;
+                options.animations.window_resize.anim = config;
+                let mut params = TestWindowParams::new(1);
+                params.bbox = Rectangle::from_size((300, 200).into());
+                params.rules = Some(ResolvedWindowRules {
+                    block_out_from: Some(niri_config::BlockOutFrom::ScreenCapture),
+                    ..Default::default()
+                });
+                let client = TestWindow::new(params);
+                *client.0.render_solid.borrow_mut() =
+                    Some(SolidColorBuffer::new((300., 200.), [0., 1., 0., 1.]));
+                let mut clock = Clock::with_time(Duration::ZERO);
+                let mut tile = Tile::new(
+                    client.clone(),
+                    (1280., 720.).into(),
+                    scale,
+                    clock.clone(),
+                    Rc::new(options),
+                );
+                let target = if axis == ShrinkAxis::Horizontal {
+                    (40., 200.)
+                } else {
+                    (300., 40.)
+                };
+                tile.set_shrink_preview(target.into(), true);
+                tile.set_shrink_preview_anchor(anchor.into());
+                clock.set_unadjusted(Duration::from_millis(50));
+                tile.update_render_elements(false, Rectangle::from_size((1280., 720.).into()));
+                let collect = |tile: &Tile<TestWindow>, renderer: &mut _, target| {
+                    let mut elements = Vec::new();
+                    tile.render(
+                        RenderCtx {
+                            renderer,
+                            target,
+                            xray: None,
+                        },
+                        (0., 0.).into(),
+                        XrayPos::default(),
+                        false,
+                        &mut |elem| elements.push(elem),
+                    );
+                    elements
+                };
+                let before = collect(&tile, &mut renderer, RenderTarget::Output);
+                let before_ghost = before[0].geometry(Scale::from(scale));
+                assert!(tile.set_spine(axis, 40.));
+                assert_eq!(tile.tile_size(), Size::from(target));
+                assert_eq!(tile.form(), WindowForm::Spine(axis));
+                assert!(tile.are_transitions_ongoing());
+                assert_eq!(client.requested_size(), None);
+                let normal_calls = client.0.render_normal_calls.get();
+                let popup_calls = client.0.render_popup_calls.get();
+                tile.update_render_elements(false, Rectangle::from_size((1280., 720.).into()));
+                let committed = collect(&tile, &mut renderer, RenderTarget::Output);
+                assert_eq!(committed[0].geometry(Scale::from(scale)), before_ghost);
+                assert_eq!(client.0.render_normal_calls.get(), normal_calls);
+                assert_eq!(client.0.render_popup_calls.get(), popup_calls);
+                let blocked = collect(&tile, &mut renderer, RenderTarget::ScreenCapture);
+                let physical = Size::from((300., 200.)).to_physical_precise_round(scale);
+                let download = render_and_download(
+                    &mut renderer,
+                    physical,
+                    Scale::from(scale),
+                    Transform::Normal,
+                    Fourcc::Abgr8888,
+                    blocked.into_iter().rev(),
+                )
+                .unwrap();
+                assert!(renderer
+                    .map_texture(&download)
+                    .unwrap()
+                    .chunks_exact(4)
+                    .all(|p| p[0] == 0 && p[1] == 0 && p[2] == 0));
+                clock.set_unadjusted(Duration::from_millis(100));
+                tile.advance_animations();
+                tile.update_render_elements(false, Rectangle::from_size((1280., 720.).into()));
+                let shrinking = collect(&tile, &mut renderer, RenderTarget::Output);
+                let shrinking_ghost = shrinking[0].geometry(Scale::from(scale));
+                assert_ne!(shrinking_ghost, before_ghost);
+                // Reversing before the visual finishes must continue from what was displayed.
+                let plan = NormalSizePlan {
+                    allocation: (600., 400.).into(),
+                    client_size: (600, 400).into(),
+                    sizing_mode: SizingMode::Normal,
+                };
+                assert!(tile.prepare_normal_restore(plan));
+                tile.submit_normal_restore(false, Transaction::new(), false);
+                tile.update_render_elements(false, Rectangle::from_size((1280., 720.).into()));
+                let reversing = collect(&tile, &mut renderer, RenderTarget::Output);
+                assert_eq!(reversing[0].geometry(Scale::from(scale)), shrinking_ghost);
+                assert_eq!(tile.tile_size(), plan.allocation);
+                assert!(tile.normal_restore_input_blocked());
+                assert_eq!(client.0.render_normal_calls.get(), normal_calls);
+                assert_eq!(client.0.render_popup_calls.get(), popup_calls);
+            }
+        }
+    }
 }
 
 #[test]

@@ -2157,6 +2157,73 @@ fn timed_shrink_fixture(
     (fixture, client, surfaces)
 }
 
+#[test]
+fn early_shrink_confirmation_settles_and_hands_off_focus_before_visual_completion() {
+    use crate::shrink_expand::{FinishReason, Phase};
+    for floating in [false, true] {
+        for count in [1, 2] {
+            let (mut fixture, client, _) = timed_shrink_fixture(count, floating, 60000);
+            let mut config = niri_config::Config::default();
+            config.shrink_expand.enabled = true;
+            config.shrink_expand.shrink_buffer_ms = 60000;
+            config.animations.window_movement.0 = niri_config::Animation {
+                off: false,
+                kind: niri_config::animations::Kind::Easing(
+                    niri_config::animations::EasingParams {
+                        duration_ms: 2000,
+                        curve: niri_config::animations::Curve::Linear,
+                    },
+                ),
+            };
+            fixture.niri().layout.update_config(&config);
+            *fixture.niri().config.borrow_mut() = config;
+            let target = fixture.niri().layout.focus().unwrap().window.clone();
+            let record = fixture.niri_state().begin_shrink_preview(None).unwrap();
+            fixture
+                .niri_state()
+                .confirm_shrink_preview(record.ticket())
+                .unwrap();
+            assert!(fixture.niri().layout.is_spine(&target));
+            let ongoing = fixture
+                .niri()
+                .layout
+                .workspaces()
+                .flat_map(|(_, _, ws)| ws.tiles())
+                .find(|tile| crate::layout::LayoutElement::id(tile.window()) == &target)
+                .unwrap()
+                .are_transitions_ongoing();
+            assert!(ongoing);
+            assert!(fixture.niri().shrink_preview_timer.is_none());
+            assert!(fixture.niri().shrink_expand.preview().is_none());
+            assert!(fixture
+                .niri()
+                .shrink_expand
+                .records()
+                .any(|current| current.id == record.id
+                    && current.phase == Phase::Settled
+                    && current.reason == Some(FinishReason::Ready)));
+            fixture.double_roundtrip(client);
+            if count == 1 {
+                assert!(fixture.niri().keyboard_focus.surface().is_none());
+            } else {
+                let focus = fixture.niri().layout.focus().unwrap().window.clone();
+                assert_ne!(focus, target);
+                assert!(!fixture.niri().layout.is_spine(&focus));
+                assert!(fixture.niri().keyboard_focus.surface().is_some());
+            }
+            fixture.niri_complete_animations();
+            assert!(fixture
+                .niri()
+                .layout
+                .workspaces()
+                .flat_map(|(_, _, ws)| ws.tiles())
+                .filter(|tile| crate::layout::LayoutElement::id(tile.window()) == &target)
+                .all(|tile| !tile.are_transitions_ongoing()));
+            assert_eq!(fixture.niri().layout.windows().count(), count);
+        }
+    }
+}
+
 fn expand_test_config() -> niri_config::Config {
     niri_config::Config::parse_mem(
         r#"

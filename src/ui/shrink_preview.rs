@@ -78,6 +78,10 @@ impl ShrinkPreview {
         self.anchor = anchor;
     }
 
+    pub fn anchor(&self) -> Point<f64, Logical> {
+        self.anchor
+    }
+
     pub fn offset(&self, source: Size<f64, Logical>) -> Point<f64, Logical> {
         let pose = self.pose();
         Point::from((
