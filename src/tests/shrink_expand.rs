@@ -8,6 +8,198 @@ use crate::layout::LayoutElement as _;
 use crate::layout::SizingMode;
 
 #[test]
+fn real_spine_hit_never_forwards_to_hidden_client_and_static_refresh_stays_idle() {
+    use crate::layout::HitType;
+    use crate::niri::RedrawState;
+    use crate::utils::ResizeEdge;
+
+    for axis in [ShrinkAxis::Horizontal, ShrinkAxis::Vertical] {
+        for floating in [false, true] {
+            for scale in [1., 1.25] {
+                let mut config = niri_config::Config::default();
+                config.animations.off = true;
+                let mut fixture = Fixture::with_config(config);
+                fixture.add_output(1, (1280, 720));
+                let output = fixture.niri_output(1);
+                output.change_current_state(
+                    None,
+                    None,
+                    Some(smithay::output::Scale::Fractional(scale)),
+                    None,
+                );
+                fixture.niri().layout.update_output_size(&output);
+                let client = fixture.add_client();
+                let surface = fixture.client(client).create_window().surface.clone();
+                fixture.client(client).window(&surface).commit();
+                fixture.roundtrip(client);
+                let window = fixture.client(client).window(&surface);
+                window.attach_new_buffer();
+                window.set_size(900, 700);
+                window.ack_last_and_commit();
+                fixture.double_roundtrip(client);
+                let id = fixture
+                    .niri()
+                    .layout
+                    .windows()
+                    .next()
+                    .unwrap()
+                    .1
+                    .window
+                    .clone();
+                if floating {
+                    fixture.niri().layout.toggle_window_floating(Some(&id));
+                    fixture.double_roundtrip(client);
+                    fixture
+                        .client(client)
+                        .window(&surface)
+                        .ack_last_and_commit();
+                    fixture.double_roundtrip(client);
+                }
+                fixture.niri_complete_animations();
+                let normal_point = {
+                    let workspace = fixture.niri().layout.active_workspace().unwrap();
+                    let (tile, pos, visible) =
+                        workspace.tiles_with_render_positions().next().unwrap();
+                    assert!(visible);
+                    pos + tile.window_loc() + smithay::utils::Point::from((10., 10.))
+                };
+                assert!(fixture
+                    .niri()
+                    .contents_under(normal_point)
+                    .surface
+                    .is_some());
+                let configure_count = fixture
+                    .client(client)
+                    .window(&surface)
+                    .configures_received
+                    .len();
+                {
+                    let tile = fixture
+                        .niri()
+                        .layout
+                        .workspaces_mut()
+                        .find(|ws| ws.has_window(&id))
+                        .unwrap()
+                        .tiles_mut()
+                        .next()
+                        .unwrap();
+                    assert!(tile.set_spine(axis, 40.));
+                }
+                fixture.niri().layout.update_window(&id, None);
+                fixture.double_roundtrip(client);
+                fixture.niri_complete_animations();
+                let (pos, size) = {
+                    let workspace = fixture.niri().layout.active_workspace().unwrap();
+                    let (tile, pos, _) = workspace.tiles_with_render_positions().next().unwrap();
+                    assert!(!tile.are_animations_ongoing());
+                    (pos, tile.tile_size())
+                };
+                let body = pos + smithay::utils::Point::from((size.w / 2., size.h / 2.));
+                let under = fixture.niri().contents_under(body);
+                assert!(under.surface.is_none());
+                assert_eq!(under.window.as_ref().unwrap().0, id);
+                assert!(
+                    matches!(under.window.unwrap().1, HitType::Spine { edges } if edges.is_empty())
+                );
+                let edge = fixture
+                    .niri()
+                    .contents_under(pos + smithay::utils::Point::from((1., 1.)));
+                assert!(edge.surface.is_none());
+                assert!(
+                    matches!(edge.window.unwrap().1, HitType::Spine { edges } if edges == ResizeEdge::TOP_LEFT)
+                );
+                let outside = match axis {
+                    ShrinkAxis::Horizontal => {
+                        pos + smithay::utils::Point::from((size.w + 10., size.h / 2.))
+                    }
+                    ShrinkAxis::Vertical => {
+                        pos + smithay::utils::Point::from((size.w / 2., size.h + 10.))
+                    }
+                };
+                assert!(fixture.niri().contents_under(outside).window.is_none());
+                let extent = fixture
+                    .niri()
+                    .global_space
+                    .output_geometry(&output)
+                    .unwrap()
+                    .size;
+                let c = fixture.client(client);
+                let pointer = c
+                    .state
+                    .virtual_pointer_manager
+                    .as_ref()
+                    .unwrap()
+                    .create_virtual_pointer(None, &c.qh, ());
+                pointer.motion_absolute(
+                    1,
+                    body.x.round() as u32,
+                    body.y.round() as u32,
+                    extent.w as u32,
+                    extent.h as u32,
+                );
+                pointer.frame();
+                fixture.double_roundtrip(client);
+                assert!(fixture
+                    .niri()
+                    .seat
+                    .get_pointer()
+                    .unwrap()
+                    .current_focus()
+                    .is_none());
+                assert!(fixture.niri().keyboard_focus.surface().is_none());
+                assert_eq!(
+                    fixture
+                        .client(client)
+                        .window(&surface)
+                        .configures_received
+                        .len(),
+                    configure_count + 1
+                );
+                // The actual client may commit new geometry/title, but its input area stays hidden.
+                let window = fixture.client(client).window(&surface);
+                window
+                    .xdg_toplevel
+                    .set_title("Updated hidden title 编辑器".into());
+                window.set_size(1500, 1100);
+                window.commit();
+                fixture.double_roundtrip(client);
+                let under = fixture.niri().contents_under(body);
+                assert!(under.surface.is_none());
+                assert!(matches!(under.window.unwrap().1, HitType::Spine { .. }));
+                assert!(fixture.niri().layout.is_spine(&id));
+                assert!(fixture.niri().keyboard_focus.surface().is_none());
+                let sequence = fixture.niri().output_state[&output].frame_callback_sequence;
+                for _ in 0..16 {
+                    fixture.double_roundtrip(client);
+                }
+                let state = &fixture.niri().output_state[&output];
+                assert!(matches!(state.redraw_state, RedrawState::Idle));
+                assert_eq!(state.frame_callback_sequence, sequence);
+                assert!(!fixture.niri().layout.are_animations_ongoing(Some(&output)));
+                assert_eq!(fixture.niri().layout.windows().count(), 1);
+                assert!(!fixture
+                    .client(client)
+                    .window(&surface)
+                    .configures_received
+                    .last()
+                    .unwrap()
+                    .1
+                    .states
+                    .contains(&xdg_toplevel::State::Activated));
+                let window = fixture.client(client).window(&surface);
+                window.xdg_toplevel.destroy();
+                window.xdg_surface.destroy();
+                window.surface.destroy();
+                fixture.double_roundtrip(client);
+                assert_eq!(fixture.niri().layout.windows().count(), 0);
+                assert!(!fixture.niri().layout.is_spine(&id));
+                assert!(fixture.niri().keyboard_focus.surface().is_none());
+            }
+        }
+    }
+}
+
+#[test]
 fn initial_shrink_waits_for_windowed_fullscreen_unset_commit() {
     let mut fixture = Fixture::new();
     fixture.add_output(1, (1280, 720));

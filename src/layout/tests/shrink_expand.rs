@@ -1955,7 +1955,15 @@ fn spine_rendering_is_independent_private_and_stable_at_fractional_scale() {
                     )
                     .unwrap();
                     let data = renderer.map_texture(&download).unwrap();
-                    assert_eq!(&data[(2 * physical.w as usize + 2) * 4..][..4], &expected);
+                    let pixel = &data[(2 * physical.w as usize + 2) * 4..][..4];
+                    // RGBA8 conversion of half alpha may round to 127 or 128.
+                    assert!(
+                        pixel
+                            .iter()
+                            .zip(expected)
+                            .all(|(actual, expected)| actual.abs_diff(expected) <= 1),
+                        "fill {pixel:?}, expected {expected:?}"
+                    );
                 };
             book.set_spine_visual_active(true);
             book.update_render_elements(false, Rectangle::from_size((1280., 720.).into()));
@@ -1975,6 +1983,86 @@ fn spine_rendering_is_independent_private_and_stable_at_fractional_scale() {
             book.update_config((1280., 720.).into(), scale, Rc::new(options));
             book.update_render_elements(true, Rectangle::from_size((1280., 720.).into()));
             check_fill(&book, &mut renderer, [48, 128, 80, 255]);
+            Rc::get_mut(&mut book.window_mut().0).unwrap().rules.opacity = Some(0.5);
+            check_fill(&book, &mut renderer, [24, 64, 40, 128]);
+            let faded = collect(&book, &mut renderer, RenderTarget::Output)
+                .iter()
+                .map(|e| (e.id().clone(), e.current_commit()))
+                .collect::<Vec<_>>();
+            assert_eq!(
+                faded,
+                collect(&book, &mut renderer, RenderTarget::Output)
+                    .iter()
+                    .map(|e| (e.id().clone(), e.current_commit()))
+                    .collect::<Vec<_>>()
+            );
+            Rc::get_mut(&mut book.window_mut().0).unwrap().rules.opacity = None;
+            let mut options = (*book.options).clone();
+            options.layout.spine.inactive =
+                niri_config::SpinePaint::Gradient(niri_config::Gradient {
+                    from: "#ff0000".parse().unwrap(),
+                    to: "#0000ff".parse().unwrap(),
+                    angle: 90,
+                    relative_to: niri_config::GradientRelativeTo::WorkspaceView,
+                    in_: Default::default(),
+                });
+            book.update_config((1280., 720.).into(), scale, Rc::new(options));
+            book.update_render_elements(
+                false,
+                Rectangle::new((-400., 0.).into(), (800., 720.).into()),
+            );
+            let elements = collect(&book, &mut renderer, RenderTarget::Output);
+            let download = render_and_download(
+                &mut renderer,
+                physical,
+                Scale::from(scale),
+                Transform::Normal,
+                Fourcc::Abgr8888,
+                elements.into_iter().rev(),
+            )
+            .unwrap();
+            let data = renderer.map_texture(&download).unwrap();
+            let left = &data[(2 * physical.w as usize + 2) * 4..][..4];
+            let right = &data[(2 * physical.w as usize + physical.w as usize - 3) * 4..][..4];
+            assert!(left[0] > right[0] && left[2] < right[2]);
+            assert!(
+                left[0] > 0 && left[2] > 0,
+                "workspace-relative fill must start midway through its gradient"
+            );
+            assert_eq!(left[3], 255);
+            // At the unlocked-axis minimum, only the centred icon remains.
+            book.request_tile_size((40., 40.).into(), false, None);
+            book.update_render_elements(false, Rectangle::from_size((1280., 720.).into()));
+            let short = collect(&book, &mut renderer, RenderTarget::Output);
+            let caption_count = |elements: &Vec<_>| {
+                elements
+                    .iter()
+                    .filter(|e| {
+                        matches!(
+                            e,
+                            crate::layout::tile::TileRenderElement::Spine(
+                                crate::ui::spine::SpineRenderElement::Caption(_)
+                            )
+                        )
+                    })
+                    .count()
+            };
+            assert_eq!(caption_count(&short), 1);
+            // A large live border still leaves one physical pixel of independent fill.
+            let rules = &mut Rc::get_mut(&mut book.window_mut().0).unwrap().rules;
+            rules.border.on = true;
+            rules.border.width = Some(niri_config::FloatOrInt(30.));
+            book.update_window();
+            book.update_render_elements(false, Rectangle::from_size((1280., 720.).into()));
+            let tiny = collect(&book, &mut renderer, RenderTarget::Output);
+            assert_eq!(caption_count(&tiny), 0);
+            assert!(tiny.iter().any(|e| matches!(
+                e,
+                crate::layout::tile::TileRenderElement::Spine(
+                    crate::ui::spine::SpineRenderElement::Fill(_)
+                )
+            )));
+            assert_eq!(book.window().requested_size(), None);
             assert_eq!(book.window().0.render_normal_calls.get(), 0);
             assert!(book.clear_spine());
             let _ = collect(&book, &mut renderer, RenderTarget::Output);
