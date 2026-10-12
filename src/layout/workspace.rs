@@ -2647,6 +2647,10 @@ impl<W: LayoutElement> Workspace<W> {
 
                 let pos_within_tile = pos - tile_pos;
 
+                if let Some(HitType::Spine { edges }) = tile.hit(pos_within_tile) {
+                    return Some(edges);
+                }
+
                 if tile.hit(pos_within_tile).is_some() {
                     let size = tile.tile_size().to_f64();
 

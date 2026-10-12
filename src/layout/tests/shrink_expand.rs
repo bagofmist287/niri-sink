@@ -1433,6 +1433,265 @@ fn spine_is_not_a_cursor_warp_target_in_either_native_space() {
 }
 
 #[test]
+fn spine_hit_is_independent_of_client_input_and_preserves_body_and_edge_identity() {
+    for axis in [ShrinkAxis::Horizontal, ShrinkAxis::Vertical] {
+        for scale in [1., 1.25, 2.] {
+            let mut tile = tile(1, scale, Rc::default());
+            assert!(tile.set_spine(axis, 40.));
+            tile.request_tile_size((400., 280.).into(), false, None);
+            let size = tile.tile_size();
+            let center = size.to_point().downscale(2.);
+            assert_eq!(
+                tile.hit(center),
+                Some(HitType::Spine {
+                    edges: ResizeEdge::empty()
+                })
+            );
+            assert_eq!(
+                tile.hit((0.5, 0.5).into()),
+                Some(HitType::Spine {
+                    edges: ResizeEdge::TOP_LEFT
+                })
+            );
+            assert_eq!(
+                tile.hit((size.w - 0.5, size.h - 0.5).into()),
+                Some(HitType::Spine {
+                    edges: ResizeEdge::BOTTOM_RIGHT
+                })
+            );
+            assert!(tile.hit((-1., center.y).into()).is_none());
+            assert!(tile.hit((size.w + 1., center.y).into()).is_none());
+            let hit = HitType::hit_tile(
+                &tile,
+                (100., 200.).into(),
+                center + Point::from((100., 200.)),
+            )
+            .unwrap()
+            .1;
+            assert_eq!(
+                hit.to_activate(),
+                HitType::Spine {
+                    edges: ResizeEdge::empty()
+                }
+            );
+        }
+    }
+}
+
+#[test]
+fn spine_rule_update_requantizes_border_without_configuring_hidden_client() {
+    for axis in [ShrinkAxis::Horizontal, ShrinkAxis::Vertical] {
+        for scale in [1., 1.25, 2.] {
+            let mut book = tile(1, scale, Rc::default());
+            assert!(book.set_spine(axis, 40.));
+            book.request_tile_size((400., 280.).into(), false, None);
+            let before = book.tile_size();
+            let rules = &mut Rc::get_mut(&mut book.window_mut().0).unwrap().rules;
+            rules.border.on = true;
+            rules.border.width = Some(niri_config::FloatOrInt(30.));
+            book.update_window();
+            let size = book.tile_size();
+            let thickness = match axis {
+                ShrinkAxis::Horizontal => size.w,
+                ShrinkAxis::Vertical => size.h,
+            };
+            assert!(thickness > 60.);
+            assert!(size.w >= thickness && size.h >= thickness);
+            assert_eq!(book.window().requested_size(), None);
+            let rules = &mut Rc::get_mut(&mut book.window_mut().0).unwrap().rules;
+            rules.border.on = false;
+            rules.border.off = true;
+            book.update_window();
+            assert_eq!(book.tile_size(), before);
+            assert_eq!(book.window().requested_size(), None);
+        }
+    }
+}
+
+#[test]
+#[ignore = "requires an explicit surfaceless EGL renderer run"]
+fn spine_rendering_is_independent_private_and_stable_at_fractional_scale() {
+    use smithay::backend::allocator::Fourcc;
+    use smithay::backend::egl::native::EGLSurfacelessDisplay;
+    use smithay::backend::egl::{EGLContext, EGLDisplay};
+    use smithay::backend::renderer::element::Element as _;
+    use smithay::backend::renderer::gles::GlesRenderer;
+    use smithay::backend::renderer::ExportMem as _;
+
+    use crate::render_helpers::{render_and_download, resources, shaders, RenderTarget};
+    let mut renderer = unsafe {
+        let display = EGLDisplay::new(EGLSurfacelessDisplay).unwrap();
+        let context = EGLContext::new(&display).unwrap();
+        GlesRenderer::new(context).unwrap()
+    };
+    resources::init(&mut renderer);
+    shaders::init(&mut renderer);
+    for axis in [ShrinkAxis::Horizontal, ShrinkAxis::Vertical] {
+        for scale in [1., 1.25] {
+            let mut options = Options::default();
+            options.layout.focus_ring.off = true;
+            options.layout.border.off = true;
+            options.layout.spine.inactive =
+                niri_config::SpinePaint::Solid("#204060".parse().unwrap());
+            options.layout.spine.active =
+                niri_config::SpinePaint::Solid("#ffa020".parse().unwrap());
+            let mut params = TestWindowParams::new(1);
+            params.rules = Some(ResolvedWindowRules {
+                block_out_from: Some(niri_config::BlockOutFrom::ScreenCapture),
+                ..Default::default()
+            });
+            let mut book = Tile::new(
+                TestWindow::new(params),
+                (1280., 720.).into(),
+                scale,
+                Clock::with_time(Duration::ZERO),
+                Rc::new(options),
+            );
+            assert!(book.set_spine(axis, 40.));
+            book.request_tile_size((400., 280.).into(), false, None);
+            let size = book.tile_size();
+            book.update_render_elements(true, Rectangle::from_size((1280., 720.).into()));
+            let collect = |book: &Tile<TestWindow>, renderer: &mut GlesRenderer, target| {
+                let mut elements = Vec::new();
+                book.render(
+                    RenderCtx {
+                        renderer,
+                        target,
+                        xray: None,
+                    },
+                    (0., 0.).into(),
+                    XrayPos::default(),
+                    false,
+                    &mut |elem| elements.push(elem),
+                );
+                elements
+            };
+            let first = collect(&book, &mut renderer, RenderTarget::Output);
+            assert!(first
+                .iter()
+                .any(|e| matches!(e, crate::layout::tile::TileRenderElement::Spine(_))));
+            let revisions = first
+                .iter()
+                .map(|e| (e.id().clone(), e.current_commit()))
+                .collect::<Vec<_>>();
+            book.update_render_elements(true, Rectangle::from_size((1280., 720.).into()));
+            let second = collect(&book, &mut renderer, RenderTarget::Output);
+            assert_eq!(
+                revisions,
+                second
+                    .iter()
+                    .map(|e| (e.id().clone(), e.current_commit()))
+                    .collect::<Vec<_>>()
+            );
+            assert_eq!(book.window().0.render_normal_calls.get(), 0);
+            assert_eq!(book.window().0.render_popup_calls.get(), 0);
+            assert_eq!(book.window().0.render_background_calls.get(), 0);
+            let physical = size.to_physical_precise_round(scale);
+            let download = render_and_download(
+                &mut renderer,
+                physical,
+                Scale::from(scale),
+                Transform::Normal,
+                Fourcc::Abgr8888,
+                first.into_iter().rev(),
+            )
+            .unwrap();
+            let data = renderer.map_texture(&download).unwrap().to_vec();
+            let at = |x: usize, y: usize| &data[(y * physical.w as usize + x) * 4..][..4];
+            assert_eq!(at(2, 2), &[32, 64, 96, 255]);
+            if let Ok(directory) = std::env::var("NIRI_SPINE_EVIDENCE_DIR") {
+                let path =
+                    std::path::Path::new(&directory).join(format!("spine-{axis:?}-{scale}.png"));
+                let file = std::fs::File::create(path).unwrap();
+                let mut encoder = png::Encoder::new(file, physical.w as u32, physical.h as u32);
+                encoder.set_color(png::ColorType::Rgba);
+                encoder.set_depth(png::BitDepth::Eight);
+                encoder
+                    .write_header()
+                    .unwrap()
+                    .write_image_data(&data)
+                    .unwrap();
+            }
+            // Sensitive title/icon pixels must not reappear from the unblocked texture cache.
+            for target in [RenderTarget::Screencast, RenderTarget::ScreenCapture] {
+                let elements = collect(&book, &mut renderer, target);
+                let download = render_and_download(
+                    &mut renderer,
+                    physical,
+                    Scale::from(scale),
+                    Transform::Normal,
+                    Fourcc::Abgr8888,
+                    elements.into_iter().rev(),
+                )
+                .unwrap();
+                let data = renderer.map_texture(&download).unwrap();
+                assert!(data.chunks_exact(4).all(|pixel| pixel == [0, 0, 0, 255]));
+            }
+            // A changed caption damages its own texture once, without waking client rendering.
+            *book.window().0.spine_title.borrow_mut() = "Updated title 更新".into();
+            let changed = collect(&book, &mut renderer, RenderTarget::Output);
+            assert_ne!(
+                revisions,
+                changed
+                    .iter()
+                    .map(|e| (e.id().clone(), e.current_commit()))
+                    .collect::<Vec<_>>()
+            );
+            let changed_revisions = changed
+                .iter()
+                .map(|e| (e.id().clone(), e.current_commit()))
+                .collect::<Vec<_>>();
+            assert_eq!(
+                changed_revisions,
+                collect(&book, &mut renderer, RenderTarget::Output)
+                    .iter()
+                    .map(|e| (e.id().clone(), e.current_commit()))
+                    .collect::<Vec<_>>()
+            );
+            let check_fill =
+                |book: &Tile<TestWindow>, renderer: &mut GlesRenderer, expected: [u8; 4]| {
+                    let elements = collect(book, renderer, RenderTarget::Output);
+                    let download = render_and_download(
+                        renderer,
+                        physical,
+                        Scale::from(scale),
+                        Transform::Normal,
+                        Fourcc::Abgr8888,
+                        elements.into_iter().rev(),
+                    )
+                    .unwrap();
+                    let data = renderer.map_texture(&download).unwrap();
+                    assert_eq!(&data[(2 * physical.w as usize + 2) * 4..][..4], &expected);
+                };
+            book.set_spine_visual_active(true);
+            book.update_render_elements(false, Rectangle::from_size((1280., 720.).into()));
+            check_fill(&book, &mut renderer, [255, 160, 32, 255]);
+            let mut options = (*book.options).clone();
+            options.layout.spine.urgent =
+                niri_config::SpinePaint::Solid("#802040".parse().unwrap());
+            book.update_config((1280., 720.).into(), scale, Rc::new(options));
+            book.window().0.urgent.set(true);
+            book.update_render_elements(false, Rectangle::from_size((1280., 720.).into()));
+            check_fill(&book, &mut renderer, [128, 32, 64, 255]);
+            book.window().0.urgent.set(false);
+            book.set_spine_visual_active(false);
+            let mut options = (*book.options).clone();
+            options.layout.spine.inactive = niri_config::SpinePaint::Inherit;
+            options.layout.border.inactive_color = "#308050".parse().unwrap();
+            book.update_config((1280., 720.).into(), scale, Rc::new(options));
+            book.update_render_elements(true, Rectangle::from_size((1280., 720.).into()));
+            check_fill(&book, &mut renderer, [48, 128, 80, 255]);
+            assert_eq!(book.window().0.render_normal_calls.get(), 0);
+            assert!(book.clear_spine());
+            let _ = collect(&book, &mut renderer, RenderTarget::Output);
+            assert!(book.window().0.render_normal_calls.get() > 0);
+            assert!(book.window().0.render_popup_calls.get() > 0);
+            assert!(book.window().0.render_background_calls.get() > 0);
+        }
+    }
+}
+
+#[test]
 fn floating_spine_resize_keeps_native_top_left_anchor_without_client_commit() {
     let mut tile = tile(1, 1., Rc::default());
     assert!(tile.set_spine(ShrinkAxis::Horizontal, 40.));

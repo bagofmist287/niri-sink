@@ -150,6 +150,11 @@ pub trait LayoutElement {
     /// Corresponds to the Wayland window geometry size.
     fn size(&self) -> Size<i32, Logical>;
 
+    /// Text for an independent spine caption. Does not expose or render a client surface.
+    fn spine_caption(&self) -> (String, String) {
+        (String::new(), String::new())
+    }
+
     /// Returns the location of the element's buffer relative to the element's visual geometry.
     ///
     /// I.e. if the element has CSD shadows, its buffer location will have negative coordinates.
@@ -585,6 +590,8 @@ pub enum HitType {
         /// Whether the hit was on the tab indicator.
         is_tab_indicator: bool,
     },
+    /// Compositor-owned spine body or resize edge; never forwards events to the client.
+    Spine { edges: ResizeEdge },
 }
 
 #[derive(Debug)]
@@ -675,7 +682,7 @@ impl HitType {
     pub fn offset_win_pos(mut self, offset: Point<f64, Logical>) -> Self {
         match &mut self {
             HitType::Input { win_pos } => *win_pos += offset,
-            HitType::Activate { .. } => (),
+            HitType::Activate { .. } | HitType::Spine { .. } => (),
         }
         self
     }
@@ -695,7 +702,7 @@ impl HitType {
             HitType::Input { .. } => HitType::Activate {
                 is_tab_indicator: false,
             },
-            HitType::Activate { .. } => self,
+            HitType::Activate { .. } | HitType::Spine { .. } => self,
         }
     }
 }
@@ -2959,6 +2966,7 @@ impl<W: LayoutElement> Layout<W> {
                     Rectangle::new(pos_within_output.upscale(-1.), output_size(&move_.output))
                         .downscale(zoom);
 
+                move_.tile.set_spine_visual_active(true);
                 move_.tile.update_render_elements(true, view_rect);
             }
         }
@@ -4446,6 +4454,7 @@ impl<W: LayoutElement> Layout<W> {
         let Some(InteractiveMoveState::Moving(mut move_)) = self.interactive_move.take() else {
             unreachable!()
         };
+        move_.tile.set_spine_visual_active(false);
 
         for mon in self.monitors_mut() {
             mon.dnd_scroll_gesture_end();

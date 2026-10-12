@@ -46,6 +46,11 @@ struct TestWindowInner {
     animation_snapshot: RefCell<Option<LayoutElementRenderSnapshot>>,
     rules: ResolvedWindowRules,
     output_events: RefCell<Vec<(String, bool)>>,
+    render_normal_calls: Cell<usize>,
+    render_popup_calls: Cell<usize>,
+    render_background_calls: Cell<usize>,
+    spine_title: RefCell<String>,
+    urgent: Cell<bool>,
 }
 
 #[derive(Debug, Clone)]
@@ -100,6 +105,11 @@ impl TestWindow {
             animation_snapshot: RefCell::new(None),
             rules: params.rules.unwrap_or_default(),
             output_events: RefCell::new(Vec::new()),
+            render_normal_calls: Cell::new(0),
+            render_popup_calls: Cell::new(0),
+            render_background_calls: Cell::new(0),
+            spine_title: RefCell::new("Editor 编辑器 · mixed title — ملف".into()),
+            urgent: Cell::new(false),
         }))
     }
 
@@ -173,6 +183,56 @@ impl LayoutElement for TestWindow {
 
     fn is_in_input_region(&self, _point: Point<f64, Logical>) -> bool {
         false
+    }
+
+    fn spine_caption(&self) -> (String, String) {
+        (
+            self.0.spine_title.borrow().clone(),
+            "org.niri.TestWindow".into(),
+        )
+    }
+
+    fn render_normal<R: NiriRenderer>(
+        &self,
+        _ctx: RenderCtx<R>,
+        _location: Point<f64, Logical>,
+        _scale: Scale<f64>,
+        _alpha: f32,
+        _push: &mut dyn FnMut(LayoutElementRenderElement<R>),
+    ) {
+        self.0
+            .render_normal_calls
+            .set(self.0.render_normal_calls.get() + 1);
+    }
+
+    fn render_popups<R: NiriRenderer>(
+        &self,
+        _ctx: RenderCtx<R>,
+        _location: Point<f64, Logical>,
+        _scale: Scale<f64>,
+        _alpha: f32,
+        _xray_pos: XrayPos,
+        _push: &mut dyn FnMut(LayoutElementRenderElement<R>),
+    ) {
+        self.0
+            .render_popup_calls
+            .set(self.0.render_popup_calls.get() + 1);
+    }
+
+    fn render_background_effect(
+        &self,
+        _ctx: RenderCtx<smithay::backend::renderer::gles::GlesRenderer>,
+        _geometry: Rectangle<f64, Logical>,
+        _scale: f64,
+        _clip_to_geometry: bool,
+        _surface_anim_scale: Scale<f64>,
+        _radius: niri_config::CornerRadius,
+        _xray_pos: XrayPos,
+        _push: &mut dyn FnMut(BackgroundEffectElement),
+    ) {
+        self.0
+            .render_background_calls
+            .set(self.0.render_background_calls.get() + 1);
     }
 
     fn request_size(
@@ -325,7 +385,7 @@ impl LayoutElement for TestWindow {
     }
 
     fn is_urgent(&self) -> bool {
-        false
+        self.0.urgent.get()
     }
 }
 

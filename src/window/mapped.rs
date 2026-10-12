@@ -688,6 +688,26 @@ impl LayoutElement for Mapped {
         self.blur_config = blur_config;
     }
 
+    fn spine_caption(&self) -> (String, String) {
+        with_toplevel_role(self.toplevel(), |role| {
+            let title = role
+                .title
+                .as_deref()
+                .unwrap_or_default()
+                .chars()
+                .take(4096)
+                .collect();
+            let app_id = role
+                .app_id
+                .as_deref()
+                .unwrap_or_default()
+                .chars()
+                .take(1024)
+                .collect();
+            (title, app_id)
+        })
+    }
+
     fn size(&self) -> Size<i32, Logical> {
         self.window.geometry().size
     }

@@ -34,9 +34,10 @@ use crate::render_helpers::snapshot::RenderSnapshot;
 use crate::render_helpers::solid_color::{SolidColorBuffer, SolidColorRenderElement};
 use crate::render_helpers::xray::{Xray, XrayPos};
 use crate::render_helpers::{RenderCtx, RenderTarget};
+use crate::ui::spine::{Spine, SpineRenderElement};
 use crate::utils::transaction::Transaction;
 use crate::utils::{
-    baba_is_float_offset, round_logical_in_physical, round_logical_in_physical_max1,
+    baba_is_float_offset, round_logical_in_physical, round_logical_in_physical_max1, ResizeEdge,
 };
 
 /// Toplevel window with decorations.
@@ -55,6 +56,8 @@ pub struct Tile<W: LayoutElement> {
 
     /// Independent outer geometry; the original client remains owned by this Tile.
     spine: Option<SpineGeometry>,
+    spine_ui: Spine,
+    spine_visual_active: bool,
     /// Current-slot allocation while the original client catches up, never a restore history.
     normal_restore: Option<NormalSizePlan>,
     /// Container origin at batch insertion, retained through a subsequent pending mode change.
@@ -154,6 +157,7 @@ niri_render_elements! {
         Offscreen = OffscreenRenderElement,
         ExtraDamage = ExtraDamage,
         BackgroundEffect = BackgroundEffectElement,
+        Spine = SpineRenderElement,
     }
 }
 
@@ -221,6 +225,8 @@ impl<W: LayoutElement> Tile<W> {
             projection_buffer: Default::default(),
             window,
             spine: None,
+            spine_ui: Spine::default(),
+            spine_visual_active: false,
             normal_restore: None,
             normal_restore_origin_mode: SizingMode::Normal,
             normal_restore_deadline: None,
@@ -284,6 +290,17 @@ impl<W: LayoutElement> Tile<W> {
         self.scale = scale;
         self.options = options;
 
+        self.update_decoration_config();
+
+        self.window.update_config(self.options.blur);
+
+        let border = self.effective_border_width().unwrap_or(0.);
+        if let Some(spine) = &mut self.spine {
+            spine.allocate(spine.outer_size(), self.scale, border);
+        }
+    }
+
+    fn update_decoration_config(&mut self) {
         let round_max1 = |logical| round_logical_in_physical_max1(self.scale, logical);
 
         let rules = self.window.rules();
@@ -302,16 +319,10 @@ impl<W: LayoutElement> Tile<W> {
 
         let shadow_config = self.options.layout.shadow.merged_with(&rules.shadow);
         self.shadow.update_config(shadow_config);
-
-        self.window.update_config(self.options.blur);
-
-        let border = self.effective_border_width().unwrap_or(0.);
-        if let Some(spine) = &mut self.spine {
-            spine.allocate(spine.outer_size(), self.scale, border);
-        }
     }
 
     pub fn update_shaders(&mut self) {
+        self.spine_ui.update_shaders();
         self.border.update_shaders();
         self.focus_ring.update_shaders();
         self.shadow.update_shaders();
@@ -334,6 +345,10 @@ impl<W: LayoutElement> Tile<W> {
         if self.is_spine() {
             // Hidden client commits must not animate or resize the independent outer geometry.
             self.window.take_animation_snapshot();
+            self.update_decoration_config();
+            let border = self.effective_border_width().unwrap_or(0.);
+            let spine = self.spine.as_mut().unwrap();
+            spine.allocate(spine.outer_size(), self.scale, border);
             return;
         }
 
@@ -456,23 +471,7 @@ impl<W: LayoutElement> Tile<W> {
             }
         }
 
-        let round_max1 = |logical| round_logical_in_physical_max1(self.scale, logical);
-
-        let rules = self.window.rules();
-        let mut border_config = self.options.layout.border.merged_with(&rules.border);
-        border_config.width = round_max1(border_config.width);
-        self.border.update_config(border_config.into());
-
-        let mut focus_ring_config = self
-            .options
-            .layout
-            .focus_ring
-            .merged_with(&rules.focus_ring);
-        focus_ring_config.width = round_max1(focus_ring_config.width);
-        self.focus_ring.update_config(focus_ring_config);
-
-        let shadow_config = self.options.layout.shadow.merged_with(&rules.shadow);
-        self.shadow.update_config(shadow_config);
+        self.update_decoration_config();
 
         let window_size = self.window_size();
         let radius = self
@@ -621,6 +620,11 @@ impl<W: LayoutElement> Tile<W> {
     }
 
     pub fn update_render_elements(&mut self, is_active: bool, view_rect: Rectangle<f64, Logical>) {
+        let is_active = if self.is_spine() {
+            self.spine_visual_active || self.interactive_move_offset != Point::from((0., 0.))
+        } else {
+            is_active
+        };
         let rules = self.window.rules();
         let animated_tile_size = self.animated_tile_size();
         let expanded_progress = self.expanded_progress();
@@ -628,6 +632,7 @@ impl<W: LayoutElement> Tile<W> {
         let draw_border_with_background = rules
             .draw_border_with_background
             .unwrap_or_else(|| !self.window.has_ssd());
+        let draw_border_with_background = draw_border_with_background && !self.is_spine();
         let border_width = self.visual_border_width().unwrap_or(0.);
 
         // Do the inverse of tile_size() in order to handle the unfullscreen animation for windows
@@ -684,7 +689,7 @@ impl<W: LayoutElement> Tile<W> {
         );
 
         let draw_focus_ring_with_background = if self.border.is_off() {
-            draw_border_with_background
+            draw_border_with_background && !self.is_spine()
         } else {
             false
         };
@@ -701,6 +706,25 @@ impl<W: LayoutElement> Tile<W> {
         );
 
         self.fullscreen_backdrop.resize(animated_tile_size);
+        if let Some(spine) = self.spine {
+            let border = self.options.layout.border.merged_with(&rules.border);
+            let ring = self
+                .options
+                .layout
+                .focus_ring
+                .merged_with(&rules.focus_ring);
+            let paint = self.options.layout.spine;
+            self.spine_ui.update(
+                animated_tile_size,
+                border_width,
+                spine.axis,
+                self.scale,
+                paint.resolve(is_active, self.window.is_urgent(), ring, border),
+                view_rect,
+                radius.expanded_by(-self.focus_ring.width() as f32),
+                paint.text_color,
+            );
+        }
     }
 
     pub fn scale(&self) -> f64 {
@@ -876,6 +900,9 @@ impl<W: LayoutElement> Tile<W> {
             return false;
         };
         self.spine = Some(spine);
+        self.spine_ui.clear();
+        self.spine_visual_active = false;
+        self.unmap_snapshot = None;
         self.normal_restore = None;
         self.normal_restore_deadline = None;
         self.window.finish_normal_restore();
@@ -905,7 +932,17 @@ impl<W: LayoutElement> Tile<W> {
 
     /// Size allocation after this must come from the current native slot.
     pub fn clear_spine(&mut self) -> bool {
-        self.spine.take().is_some()
+        let cleared = self.spine.take().is_some();
+        if cleared {
+            self.spine_ui.clear();
+            self.spine_visual_active = false;
+            self.unmap_snapshot = None;
+        }
+        cleared
+    }
+
+    pub fn set_spine_visual_active(&mut self, active: bool) {
+        self.spine_visual_active = self.is_spine() && active;
     }
 
     /// Batch form update, before any member is configured. The caller owns the slot snapshot.
@@ -913,6 +950,9 @@ impl<W: LayoutElement> Tile<W> {
         if self.spine.take().is_none() {
             return false;
         }
+        self.spine_ui.clear();
+        self.spine_visual_active = false;
+        self.unmap_snapshot = None;
         self.normal_restore = Some(plan);
         self.normal_restore_origin_mode = plan.sizing_mode;
         self.normal_restore_focus_cancelled = true;
@@ -1224,6 +1264,26 @@ impl<W: LayoutElement> Tile<W> {
     pub fn hit(&self, point: Point<f64, Logical>) -> Option<HitType> {
         let offset = self.bob_offset();
         let point = point - offset;
+        if self.is_spine() {
+            let size = self.tile_size();
+            if !Rectangle::from_size(size).contains(point) {
+                return None;
+            }
+            let band_x = 4_f64.min(size.w / 3.);
+            let band_y = 4_f64.min(size.h / 3.);
+            let mut edges = ResizeEdge::empty();
+            if point.x < band_x {
+                edges |= ResizeEdge::LEFT;
+            } else if point.x >= size.w - band_x {
+                edges |= ResizeEdge::RIGHT;
+            }
+            if point.y < band_y {
+                edges |= ResizeEdge::TOP;
+            } else if point.y >= size.h - band_y {
+                edges |= ResizeEdge::BOTTOM;
+            }
+            return Some(HitType::Spine { edges });
+        }
 
         if self.is_in_input_region(point) {
             let win_pos = self.buf_loc() + offset;
@@ -1466,6 +1526,36 @@ impl<W: LayoutElement> Tile<W> {
         let bob_offset = self.bob_offset();
         let location = location + bob_offset;
         xray_pos = xray_pos.offset(bob_offset);
+
+        if self.is_spine() {
+            let (title, app_id) = self.window.spine_caption();
+            let blocked = ctx
+                .target
+                .should_block_out(self.window.rules().block_out_from);
+            self.spine_ui.render(
+                ctx.r(),
+                location,
+                win_alpha,
+                blocked,
+                &title,
+                &app_id,
+                &mut |elem| push(elem.into()),
+            );
+            if let Some(width) = self.visual_border_width() {
+                self.border.render(
+                    ctx.renderer,
+                    location + Point::from((width, width)),
+                    &mut |elem| push(elem.into()),
+                );
+            }
+            if focus_ring {
+                self.focus_ring
+                    .render(ctx.renderer, location, &mut |elem| push(elem.into()));
+            }
+            self.shadow
+                .render(ctx.renderer, location, &mut |elem| push(elem.into()));
+            return;
+        }
 
         let window_loc = self.window_loc();
         let window_size = self.window_size();

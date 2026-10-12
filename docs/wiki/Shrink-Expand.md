@@ -1,8 +1,8 @@
 # Shrink / Expand development configuration
 
 The `shrink/development` branch currently parses the configuration below.
-Shrink / Expand commands, input buffering and independent spine rendering are
-still under development. Setting `enabled true` does not yet enable a usable
+Shrink / Expand commands and input buffering are still under development.
+Internal spines now have independent rendering and compositor-owned hit regions. Setting `enabled true` does not yet enable a usable
 feature. The installed Sink session has not been replaced by this branch.
 
 ```kdl
@@ -64,8 +64,9 @@ workspace "reading" {
 ```
 
 Inheritance remains symbolic so the renderer can read the latest layout and
-window rules. The parser and paint resolver are tested; actual rendered colors,
-reload damage and disable-time restoration still require runtime integration.
+window rules. The parser, paint resolver and internal rendering are tested, including live
+paint changes, urgency and explicit inheritance in software EGL. Runtime feature
+switching and disable-time restoration still require integration.
 
 The internal spine model also excludes spines from `focus-window-previous`.
 They remain in window inventory and keep their collapsed form; when every
@@ -76,5 +77,14 @@ Internal native movement uses a spine's own outer rectangle as its pointer
 anchor and keeps the spine collapsed. Switching a moving spine to floating
 placement skips the hidden client's normal floating size request. Focus-based
 cursor warping excludes spines in both tiled and floating spaces. These layout
-paths are tested; spine input hit regions and drag-time direction adaptation
-still await integration.
+paths are tested. Spine hit regions expose body and edge identity without
+forwarding input to the hidden client; drag-time direction adaptation and the
+complete operation dispatch still await integration.
+
+Internal spine rendering uses a separate fill and caption, without drawing the
+client surface, its popups or background effects. Vertical titles are shaped
+once and rotated clockwise; the fallback window icon remains upright. Real app
+icon resolution is still pending. Sensitive capture targets replace the inner
+fill and caption with black, including when an unblocked caption is cached.
+These checks use an explicit software EGL test, not the installed session or a
+physical input device. No user Shrink/Expand command is available yet.
