@@ -1345,6 +1345,59 @@ fn native_moving_floating_toggle_does_not_resize_spine_client() {
 }
 
 #[test]
+fn moving_book_mode_requests_do_not_partially_restore_or_change_client_intent() {
+    for axis in [ShrinkAxis::Horizontal, ShrinkAxis::Vertical] {
+        let mut layout = Layout::<TestWindow>::default();
+        Op::AddOutput(1).apply(&mut layout);
+        Op::AddWindow {
+            params: TestWindowParams::new(1),
+        }
+        .apply(&mut layout);
+        Op::Communicate(1).apply(&mut layout);
+        let ws = layout
+            .workspaces_mut()
+            .find(|ws| ws.has_window(&1))
+            .unwrap();
+        let tile = ws
+            .tiles_mut()
+            .find(|tile| tile.window().id() == &1)
+            .unwrap();
+        assert!(tile.set_spine(axis, 40.));
+        let window = tile.window().clone();
+        layout.update_window(&1, None);
+        let output = layout.outputs().next().unwrap().clone();
+        assert!(layout.interactive_move_begin(1, &output, (30., 100.).into()));
+        assert!(layout.interactive_move_update(&1, (300., 0.).into(), output, (330., 100.).into()));
+        let Some(InteractiveMoveState::Moving(move_)) = &layout.interactive_move else {
+            unreachable!()
+        };
+        let size = move_.tile.tile_size();
+        let requested = window.requested_size();
+        layout.request_fullscreen(&1, true);
+        layout.request_maximized(&1, true);
+        layout.request_fullscreen(&1, false);
+        layout.request_maximized(&1, false);
+        layout.request_toggle_fullscreen(&1);
+        layout.request_toggle_maximized(&1);
+        layout.request_toggle_windowed_fullscreen(&1);
+        let Some(InteractiveMoveState::Moving(move_)) = &layout.interactive_move else {
+            unreachable!()
+        };
+        assert_eq!(move_.tile.form(), WindowForm::Spine(axis));
+        assert_eq!(move_.tile.tile_size(), size);
+        assert!(!move_.tile.has_normal_restore_allocation());
+        assert_eq!(window.requested_size(), requested);
+        assert_eq!(window.pending_sizing_mode(), SizingMode::Normal);
+        assert!(!window.is_pending_windowed_fullscreen());
+        assert_eq!(layout.windows().count(), 1);
+        layout.verify_invariants();
+        // Deferred mode intent after drop remains an E4 task; rejection is not the final feature.
+        layout.interactive_move_end(&1);
+        assert!(layout.is_spine(&1));
+    }
+}
+
+#[test]
 fn spine_is_not_a_cursor_warp_target_in_either_native_space() {
     for floating in [false, true] {
         for axis in [ShrinkAxis::Horizontal, ShrinkAxis::Vertical] {

@@ -661,6 +661,303 @@ fn explicit_mode_fixture() -> (
     (fixture, client, surfaces, ids)
 }
 
+fn restore_lifecycle_fixture(
+    floating: bool,
+    axis: ShrinkAxis,
+) -> (
+    Fixture,
+    super::client::ClientId,
+    Vec<wayland_client::protocol::wl_surface::WlSurface>,
+    Vec<smithay::desktop::Window>,
+) {
+    let mut config = niri_config::Config::default();
+    config.animations.off = true;
+    config.layout.default_column_width = Some(niri_config::PresetSize::Fixed(100));
+    if floating {
+        config.window_rules = niri_config::Config::parse_mem(
+            r#"window-rule {
+            open-floating true
+            default-column-width { fixed 100; }
+            default-window-height { fixed 100; }
+        }"#,
+        )
+        .unwrap()
+        .window_rules;
+    }
+    let mut fixture = Fixture::with_config(config);
+    fixture.add_output(1, (1280, 720));
+    let client = fixture.add_client();
+    let mut surfaces = Vec::new();
+    let mut ids = Vec::new();
+    for _ in 0..2 {
+        let surface = fixture.client(client).create_window().surface.clone();
+        fixture.client(client).window(&surface).commit();
+        fixture.roundtrip(client);
+        let window = fixture.client(client).window(&surface);
+        window.attach_new_buffer();
+        window.set_size(100, 100);
+        window.ack_last_and_commit();
+        fixture.double_roundtrip(client);
+        let id = fixture
+            .niri()
+            .layout
+            .windows()
+            .find(|(_, mapped)| {
+                mapped.toplevel().wl_surface().id().protocol_id() == surface.id().protocol_id()
+            })
+            .unwrap()
+            .1
+            .window
+            .clone();
+        surfaces.push(surface);
+        ids.push(id);
+    }
+    {
+        let ws = fixture
+            .niri()
+            .layout
+            .workspaces_mut()
+            .find(|ws| ws.has_window(&ids[0]))
+            .unwrap();
+        assert!(ws
+            .tiles_mut()
+            .find(|tile| tile.window().window == ids[0])
+            .unwrap()
+            .set_spine(axis, 40.));
+        ws.update_window(&ids[0], None);
+    }
+    let mut config = niri_config::Config::default();
+    config.animations.off = true;
+    config.layout.default_column_width = Some(niri_config::PresetSize::Fixed(760));
+    if floating {
+        config.window_rules = niri_config::Config::parse_mem(
+            r#"window-rule {
+            open-floating true
+            default-column-width { fixed 760; }
+            default-window-height { fixed 400; }
+        }"#,
+        )
+        .unwrap()
+        .window_rules;
+    }
+    fixture.niri_state().reload_config(Ok(config));
+    {
+        let ws = fixture
+            .niri()
+            .layout
+            .workspaces_mut()
+            .find(|ws| ws.has_window(&ids[0]))
+            .unwrap();
+        assert_eq!(ws.restore_normal_spines(&ids[..1]), ids[..1]);
+        assert!(ws
+            .tiles()
+            .find(|tile| tile.window().window == ids[0])
+            .unwrap()
+            .normal_restore_input_blocked());
+    }
+    fixture.double_roundtrip(client);
+    assert_eq!(fixture.niri().layout.focus().unwrap().window, ids[1]);
+    (fixture, client, surfaces, ids)
+}
+
+#[test]
+fn normal_restore_destroy_after_ack_removes_waiter_without_stealing_focus() {
+    for floating in [false, true] {
+        for axis in [ShrinkAxis::Horizontal, ShrinkAxis::Vertical] {
+            let (mut fixture, client, surfaces, ids) = restore_lifecycle_fixture(floating, axis);
+            let (ipc_id, deadline) = fixture
+                .niri()
+                .layout
+                .windows()
+                .find(|(_, mapped)| mapped.window == ids[0])
+                .map(|(_, mapped)| (mapped.id(), mapped.normal_restore_deadline().unwrap()))
+                .unwrap();
+            fixture.client(client).window(&surfaces[0]).ack_last();
+            fixture.double_roundtrip(client);
+            assert_eq!(
+                fixture
+                    .niri()
+                    .layout
+                    .windows()
+                    .find(|(_, mapped)| mapped.window == ids[0])
+                    .unwrap()
+                    .1
+                    .normal_restore_deadline(),
+                Some(deadline)
+            );
+            let window = fixture.client(client).window(&surfaces[0]);
+            window.xdg_toplevel.destroy();
+            window.xdg_surface.destroy();
+            window.surface.destroy();
+            fixture.double_roundtrip(client);
+            assert!(fixture
+                .niri()
+                .layout
+                .windows()
+                .all(|(_, mapped)| mapped.id() != ipc_id
+                    && mapped.normal_restore_deadline().is_none()));
+            assert_eq!(fixture.niri().layout.windows().count(), 1);
+            assert_eq!(fixture.niri().layout.focus().unwrap().window, ids[1]);
+            std::thread::sleep(
+                deadline.saturating_duration_since(std::time::Instant::now())
+                    + std::time::Duration::from_millis(5),
+            );
+            fixture.double_roundtrip(client);
+            assert_eq!(fixture.niri().layout.windows().count(), 1);
+            assert_eq!(fixture.niri().layout.focus().unwrap().window, ids[1]);
+            assert_eq!(
+                fixture
+                    .niri()
+                    .keyboard_focus
+                    .surface()
+                    .map(|surface| surface.id().protocol_id()),
+                Some(surfaces[1].id().protocol_id())
+            );
+        }
+    }
+}
+
+#[test]
+fn normal_restore_output_migration_and_no_outputs_keep_original_deadline_and_identity() {
+    use crate::layout::ActivateWindow;
+    use smithay::wayland::seat::WaylandFocus as _;
+
+    for floating in [false, true] {
+        let (mut fixture, client, surfaces, ids) =
+            restore_lifecycle_fixture(floating, ShrinkAxis::Horizontal);
+        let target = &ids[0];
+        let ipc_id = fixture
+            .niri()
+            .layout
+            .windows()
+            .find(|(_, mapped)| mapped.window == *target)
+            .unwrap()
+            .1
+            .id();
+        let deadline = fixture
+            .niri()
+            .layout
+            .windows()
+            .find(|(_, mapped)| mapped.window == *target)
+            .unwrap()
+            .1
+            .normal_restore_deadline()
+            .unwrap();
+        let first_size = fixture
+            .client(client)
+            .window(&surfaces[0])
+            .configures_received
+            .last()
+            .unwrap()
+            .1
+            .size;
+        fixture.client(client).window(&surfaces[0]).ack_last();
+        fixture.double_roundtrip(client);
+        fixture.add_output(2, (640, 480));
+        let out1 = fixture.niri_output(1);
+        let out2 = fixture.niri_output(2);
+        out2.change_current_state(
+            None,
+            Some(smithay::utils::Transform::_90),
+            Some(smithay::output::Scale::Fractional(1.25)),
+            None,
+        );
+        fixture.niri().layout.update_output_size(&out2);
+        fixture
+            .niri()
+            .layout
+            .move_to_output(Some(target), &out2, None, ActivateWindow::No);
+        fixture.double_roundtrip(client);
+        let mapped = fixture
+            .niri()
+            .layout
+            .find_window_and_output(target.wl_surface().unwrap().as_ref())
+            .unwrap();
+        assert_eq!(mapped.0.id(), ipc_id);
+        assert_eq!(mapped.1, Some(&out2));
+        assert_eq!(mapped.0.normal_restore_deadline(), Some(deadline));
+        // The old ack must not satisfy a new tiled allocation on the smaller output.
+        if !floating {
+            let latest = fixture
+                .client(client)
+                .window(&surfaces[0])
+                .configures_received
+                .last()
+                .unwrap()
+                .1
+                .size;
+            assert_ne!(latest, first_size);
+            let window = fixture.client(client).window(&surfaces[0]);
+            window.set_size(first_size.0 as u16, first_size.1 as u16);
+            window.commit();
+            fixture.double_roundtrip(client);
+            assert!(!fixture
+                .niri()
+                .layout
+                .windows()
+                .find(|(_, mapped)| mapped.window == *target)
+                .unwrap()
+                .1
+                .normal_restore_ready());
+        }
+        fixture.niri().remove_output(&out1);
+        fixture.niri().remove_output(&out2);
+        fixture.double_roundtrip(client);
+        assert_eq!(fixture.niri().layout.windows().count(), 2);
+        assert!(fixture
+            .niri()
+            .layout
+            .windows()
+            .all(|(output, _)| output.is_none()));
+        assert_eq!(
+            fixture
+                .niri()
+                .layout
+                .windows()
+                .find(|(_, mapped)| mapped.window == *target)
+                .unwrap()
+                .1
+                .id(),
+            ipc_id
+        );
+        std::thread::sleep(
+            deadline.saturating_duration_since(std::time::Instant::now())
+                + std::time::Duration::from_millis(5),
+        );
+        fixture.double_roundtrip(client);
+        assert!(fixture
+            .niri()
+            .layout
+            .windows()
+            .find(|(_, mapped)| mapped.window == *target)
+            .unwrap()
+            .1
+            .normal_restore_ready());
+        fixture.add_output(1, (1280, 720));
+        fixture.double_roundtrip(client);
+        let window = fixture.client(client).window(&surfaces[0]);
+        let size = window.configures_received.last().unwrap().1.size;
+        window.set_size(size.0 as u16, size.1 as u16);
+        window.ack_last_and_commit();
+        fixture.double_roundtrip(client);
+        let mapped = fixture
+            .niri()
+            .layout
+            .windows()
+            .find(|(_, mapped)| mapped.window == *target)
+            .unwrap()
+            .1;
+        assert_eq!(mapped.id(), ipc_id);
+        assert!(mapped.normal_restore_deadline().is_none());
+        assert_eq!(fixture.niri().layout.windows().count(), 2);
+        assert!(fixture
+            .niri()
+            .layout
+            .focus()
+            .is_none_or(|mapped| mapped.window != *target));
+    }
+}
+
 #[test]
 fn previous_window_navigation_skips_spines_without_changing_inventory() {
     use std::time::Duration;
