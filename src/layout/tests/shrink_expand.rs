@@ -5,6 +5,206 @@ use crate::layout::shrink_expand::{ShrinkAxis, SpineGeometry, WindowForm};
 use crate::layout::workspace::{Workspace, WorkspaceAddWindowTarget};
 
 #[test]
+fn pending_normal_resize_client_choice_keeps_positive_allocation() {
+    let mut params = TestWindowParams::new(1);
+    params.bbox = Rectangle::from_size((300, 200).into());
+    let client = TestWindow::new(params);
+    let mut tile = Tile::new(
+        client.clone(),
+        (1280., 720.).into(),
+        1.,
+        Clock::with_time(Duration::ZERO),
+        Rc::new(Options::default()),
+    );
+    assert!(tile.set_spine(ShrinkAxis::Horizontal, 40.));
+    assert!(
+        tile.prepare_normal_restore(crate::layout::shrink_expand::NormalSizePlan {
+            allocation: (120., 200.).into(),
+            client_size: (120, 0).into(),
+            sizing_mode: SizingMode::Normal,
+        })
+    );
+    tile.submit_normal_restore(true, Transaction::new(), false);
+    let deadline = client.normal_restore_deadline();
+    tile.request_normal_resize_once((140, 0).into(), false);
+    assert_eq!(client.requested_size(), Some((140, 0).into()));
+    assert_eq!(tile.tile_size(), (140., 200.).into());
+    assert_eq!(client.normal_restore_deadline(), deadline);
+}
+
+#[test]
+fn disable_restore_all_workspaces_in_one_batch_keeps_slots_and_focus() {
+    for all_books in [false, true] {
+        for no_outputs in [false, true] {
+            let mut layout =
+                Layout::with_options(Clock::with_time(Duration::ZERO), Options::default());
+            Op::AddOutput(1).apply(&mut layout);
+            for id in 1..=6 {
+                Op::AddWindow {
+                    params: TestWindowParams::new(id),
+                }
+                .apply(&mut layout);
+                Op::Communicate(id).apply(&mut layout);
+            }
+            for id in [1, 4] {
+                layout.set_window_floating(Some(&id), true);
+            }
+            layout.consume_or_expel_window_left(Some(&3));
+            layout.activate_window(&3);
+            layout.set_column_display(ColumnDisplay::Tabbed);
+            layout.move_to_workspace(Some(&5), 1, ActivateWindow::No);
+            Op::AddOutput(2).apply(&mut layout);
+            let output2 = layout
+                .outputs()
+                .find(|output| output.name() == "output2")
+                .unwrap()
+                .clone();
+            layout.move_to_output(Some(&6), &output2, None, ActivateWindow::No);
+            layout.switch_workspace(0);
+            layout.activate_window(&3);
+            for id in 1..=6 {
+                if id == 3 && !all_books {
+                    continue;
+                }
+                let ws = layout
+                    .workspaces_mut()
+                    .find(|ws| ws.has_window(&id))
+                    .unwrap();
+                assert!(ws
+                    .tiles_mut()
+                    .find(|tile| tile.window().id() == &id)
+                    .unwrap()
+                    .set_spine(
+                        if id % 2 == 0 {
+                            ShrinkAxis::Vertical
+                        } else {
+                            ShrinkAxis::Horizontal
+                        },
+                        40.
+                    ));
+                ws.update_window(&id, None);
+            }
+            if no_outputs {
+                Op::RemoveOutput(1).apply(&mut layout);
+                Op::RemoveOutput(2).apply(&mut layout);
+            }
+            let focus = layout.focus().map(|w| *w.id());
+            let slots = layout
+                .workspaces()
+                .filter(|(_, _, ws)| ws.windows().next().is_some())
+                .map(|(_, _, ws)| {
+                    (
+                        ws.id(),
+                        ws.tiles()
+                            .map(|t| (*t.window().id(), ws.floating().has_window(t.window().id())))
+                            .collect::<Vec<_>>(),
+                    )
+                })
+                .collect::<Vec<_>>();
+            let identities = layout
+                .windows()
+                .map(|(_, w)| (*w.id(), w.clone()))
+                .collect::<Vec<_>>();
+            let batches = layout.restore_all_spines_on_disable(None);
+            assert_eq!(batches.len(), 3);
+            assert_eq!(
+                batches.iter().map(|(_, ids)| ids.len()).sum::<usize>(),
+                if all_books { 6 } else { 5 }
+            );
+            assert_eq!(layout.focus().map(|w| *w.id()), focus);
+            assert!(layout
+                .workspaces()
+                .flat_map(|(_, _, ws)| ws.tiles())
+                .all(|t| !t.is_spine()));
+            assert_eq!(
+                layout
+                    .workspaces()
+                    .filter(|(_, _, ws)| ws.windows().next().is_some())
+                    .map(|(_, _, ws)| (
+                        ws.id(),
+                        ws.tiles()
+                            .map(|t| (*t.window().id(), ws.floating().has_window(t.window().id())))
+                            .collect::<Vec<_>>()
+                    ))
+                    .collect::<Vec<_>>(),
+                slots
+            );
+            for (id, before) in identities {
+                let after = layout.windows().find(|(_, w)| w.id() == &id).unwrap().1;
+                assert!(Rc::ptr_eq(&before.0, &after.0));
+            }
+            let deadlines = layout
+                .windows()
+                .filter_map(|(_, w)| w.normal_restore_deadline())
+                .collect::<Vec<_>>();
+            assert!(deadlines.iter().all(|d| *d == deadlines[0]));
+            assert!(layout.restore_all_spines_on_disable(None).is_empty());
+            for id in 1..=6 {
+                Op::Communicate(id).apply(&mut layout);
+            }
+            layout.refresh(true);
+            assert_eq!(layout.focus().map(|w| *w.id()), focus);
+            layout.verify_invariants();
+        }
+    }
+}
+
+#[test]
+fn disable_restore_ends_only_spine_native_move_at_its_final_slot() {
+    for spine in [false, true] {
+        for floating in [false, true] {
+            for detach in [false, true] {
+                let mut layout =
+                    Layout::with_options(Clock::with_time(Duration::ZERO), Options::default());
+                Op::AddOutput(1).apply(&mut layout);
+                let mut params = TestWindowParams::new(1);
+                params.is_floating = floating;
+                Op::AddWindow { params }.apply(&mut layout);
+                Op::Communicate(1).apply(&mut layout);
+                if spine {
+                    let ws = layout
+                        .workspaces_mut()
+                        .find(|ws| ws.has_window(&1))
+                        .unwrap();
+                    assert!(ws
+                        .tiles_mut()
+                        .next()
+                        .unwrap()
+                        .set_spine(ShrinkAxis::Horizontal, 40.));
+                    ws.update_window(&1, None);
+                }
+                let output = layout.outputs().next().unwrap().clone();
+                assert!(layout.interactive_move_begin(1, &output, (25., 100.).into()));
+                let delta = if detach { (300., 100.) } else { (20., 0.) };
+                assert!(layout.interactive_move_update(
+                    &1,
+                    delta.into(),
+                    output.clone(),
+                    (25. + delta.0, 100. + delta.1).into()
+                ));
+                let focus = layout.focus().map(|w| *w.id());
+                let batches = layout.restore_all_spines_on_disable(None);
+                assert_eq!(layout.interactive_move.is_none(), spine);
+                assert_eq!(batches.is_empty(), !spine);
+                assert_eq!(layout.focus().map(|w| *w.id()), focus);
+                assert_eq!(layout.windows().count(), 1);
+                assert!(!layout.is_spine(&1));
+                if !spine {
+                    assert!(layout.interactive_move_update(
+                        &1,
+                        (10., 0.).into(),
+                        output,
+                        (335., 200.).into()
+                    ));
+                    layout.interactive_move_end(&1);
+                }
+                layout.verify_invariants();
+            }
+        }
+    }
+}
+
+#[test]
 fn spine_resize_normal_insertion_reuses_shared_constraints_and_native_gain() {
     use crate::utils::ResizeEdge;
     for scale in [1., 1.25] {

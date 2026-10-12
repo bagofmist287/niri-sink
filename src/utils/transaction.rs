@@ -81,6 +81,11 @@ impl Transaction {
         }
     }
 
+    /// Identity check for releasing only a specific staged restore batch.
+    pub(crate) fn same_batch(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.inner, &other.inner)
+    }
+
     /// Gets a blocker for this transaction.
     pub fn blocker(&self) -> TransactionBlocker {
         trace!(transaction = ?Arc::as_ptr(&self.inner), "generating blocker");

@@ -1469,11 +1469,9 @@ impl<W: LayoutElement> FloatingSpace<W> {
         delta: Point<f64, Logical>,
         plan: NormalSizePlan,
     ) {
-        let resize = self
-            .interactive_resize
-            .as_mut()
-            .filter(|r| &r.window == id)
-            .unwrap();
+        let Some(resize) = self.interactive_resize.as_mut().filter(|r| &r.window == id) else {
+            return;
+        };
         resize.original_window_size = plan.client_size.to_f64();
         resize.delta_origin = delta;
     }

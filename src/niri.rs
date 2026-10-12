@@ -1896,6 +1896,11 @@ impl State {
         };
 
         self.niri.config_error_notification.hide();
+        let shrink_expand_disabled =
+            self.niri.config.borrow().shrink_expand.enabled && !config.shrink_expand.enabled;
+        if shrink_expand_disabled {
+            self.cancel_shrink_expand_preview();
+        }
 
         // Find & orphan removed named workspaces.
         let mut removed_workspaces: Vec<String> = vec![];
@@ -2168,6 +2173,10 @@ impl State {
 
             // This won't change the systemd environment, but oh well.
             *CHILD_DISPLAY.write().unwrap() = display_name;
+        }
+
+        if shrink_expand_disabled {
+            self.restore_spines_on_disable();
         }
 
         // Can't really update xdg-decoration settings since we have to hide the globals for CSD

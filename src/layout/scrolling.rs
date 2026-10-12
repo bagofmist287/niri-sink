@@ -2912,6 +2912,17 @@ impl<W: LayoutElement> ScrollingSpace<W> {
                 col.tiles[idx].submit_normal_restore(false, transaction.clone(), settle_matching);
                 col.data[idx].update(&col.tiles[idx]);
             }
+            if settle_matching {
+                // Native allocation also stages the batch on ordinary neighbors. A column
+                // with no new configure cannot consume those clones in refresh(), so omit
+                // only that unneeded participation; existing configure transactions remain.
+                for tile in &mut col.tiles {
+                    if matches!(tile.window().configure_intent(), ConfigureIntent::NotNeeded) {
+                        tile.window_mut()
+                            .release_matching_normal_restore_transaction(&transaction);
+                    }
+                }
+            }
             self.data[col_idx].update(col);
         }
     }
@@ -4219,11 +4230,9 @@ impl<W: LayoutElement> ScrollingSpace<W> {
         delta: Point<f64, Logical>,
         plan: NormalSizePlan,
     ) {
-        let resize = self
-            .interactive_resize
-            .as_mut()
-            .filter(|r| &r.window == id)
-            .unwrap();
+        let Some(resize) = self.interactive_resize.as_mut().filter(|r| &r.window == id) else {
+            return;
+        };
         resize.original_window_size = plan.client_size.to_f64();
         resize.delta_origin = delta;
     }

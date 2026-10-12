@@ -245,6 +245,10 @@ pub trait LayoutElement {
     }
 
     fn begin_normal_restore(&mut self, _deadline: std::time::Instant) {}
+    /// A matching restore needs no new commit and must not retain a staged batch clone.
+    /// Older configure transactions remain on their native lifecycle.
+    fn release_matching_normal_restore_transaction(&mut self, _transaction: &Transaction) {}
+
     fn finish_normal_restore(&mut self) {}
     fn normal_restore_ready(&self) -> bool {
         true
@@ -1713,6 +1717,58 @@ impl<W: LayoutElement> Layout<W> {
             .flat_map(|(_, _, ws)| ws.tiles())
             .find(|tile| tile.window().id() == id)
             .and_then(axis)
+    }
+
+    /// Configuration invalidation ends only an active spine move at its native final slot,
+    /// then restores all workspaces from one snapshot under one transaction deadline.
+    pub(crate) fn restore_all_spines_on_disable(
+        &mut self,
+        last_motion: Option<(&W::Id, Point<f64, Logical>)>,
+    ) -> Vec<(u64, Vec<W::Id>)> {
+        let focus = self.focus().map(|window| window.id().clone());
+        let moving = match &self.interactive_move {
+            Some(InteractiveMoveState::Starting { window_id, .. }) if self.is_spine(window_id) => {
+                Some(window_id.clone())
+            }
+            Some(InteractiveMoveState::Moving(move_)) if move_.tile.is_spine() => {
+                Some(move_.tile.window().id().clone())
+            }
+            _ => None,
+        };
+        if let Some(id) = moving {
+            self.interactive_move_end(&id);
+        }
+        let plans = self
+            .workspaces()
+            .filter_map(|(_, _, ws)| {
+                let ids = ws
+                    .tiles()
+                    .filter(|tile| tile.is_spine())
+                    .map(|tile| tile.window().id().clone())
+                    .collect::<Vec<_>>();
+                (!ids.is_empty()).then(|| (ws.id(), ws.plan_normal_spine_restore(&ids)))
+            })
+            .collect::<Vec<_>>();
+        // All forms change before any client is configured, including hidden tabs and floats.
+        for (id, plan) in &plans {
+            self.workspaces_mut()
+                .find(|ws| ws.id() == *id)
+                .unwrap()
+                .prepare_normal_spine_restore(plan);
+        }
+        let transaction = Transaction::new();
+        for (id, plan) in &plans {
+            let ws = self.workspaces_mut().find(|ws| ws.id() == *id).unwrap();
+            ws.submit_normal_spine_restore(plan, transaction.clone(), true);
+            ws.rebase_disabled_spine_resize(plan, last_motion);
+        }
+        if let Some(focus) = focus {
+            self.activate_window(&focus);
+        }
+        plans
+            .into_iter()
+            .map(|(id, plan)| (id.get(), plan.sizes.into_iter().map(|(id, _)| id).collect()))
+            .collect()
     }
 
     /// Depth in the workspace-local Sink stack; zero is the current top.

@@ -180,6 +180,12 @@ pub(super) struct InteractiveResize<W: LayoutElement> {
     pub data: InteractiveResizeData,
 }
 
+/// One current-snapshot normal insertion batch. It is discarded after submission.
+pub(super) struct NormalSpineRestorePlan<Id> {
+    pub requests: Vec<(Id, ColumnWidth)>,
+    pub sizes: Vec<(Id, super::shrink_expand::NormalSizePlan)>,
+}
+
 /// Read-only native resize basis, including a same-grab form-change origin.
 pub(super) struct ResizeComponents {
     pub original: Size<f64, Logical>,
@@ -849,25 +855,63 @@ impl<W: LayoutElement> Workspace<W> {
         self.restore_normal_spines_inner(ids, false)
     }
 
-    fn restore_normal_spines_inner(&mut self, ids: &[W::Id], settle_matching: bool) -> Vec<W::Id> {
+    pub(super) fn plan_normal_spine_restore(&self, ids: &[W::Id]) -> NormalSpineRestorePlan<W::Id> {
         let requests = self.normal_spine_requests(ids);
-        let mut plans = self.scrolling.normal_spine_plans(&requests);
-        plans.extend(self.floating.normal_spine_plans(ids));
+        let mut sizes = self.scrolling.normal_spine_plans(&requests);
+        sizes.extend(self.floating.normal_spine_plans(ids));
+        NormalSpineRestorePlan { requests, sizes }
+    }
+
+    pub(super) fn prepare_normal_spine_restore(&mut self, plan: &NormalSpineRestorePlan<W::Id>) {
         for tile in self.tiles_mut() {
-            if let Some((_, plan)) = plans.iter().find(|(id, _)| id == tile.window().id()) {
-                assert!(tile.prepare_normal_restore(*plan));
+            if let Some((_, size)) = plan.sizes.iter().find(|(id, _)| id == tile.window().id()) {
+                assert!(tile.prepare_normal_restore(*size));
             }
         }
-        let transaction = Transaction::new();
+    }
+
+    pub(super) fn submit_normal_spine_restore(
+        &mut self,
+        plan: &NormalSpineRestorePlan<W::Id>,
+        transaction: Transaction,
+        settle_matching: bool,
+    ) {
         self.scrolling.commit_normal_restore(
-            &plans,
-            &requests,
+            &plan.sizes,
+            &plan.requests,
             transaction.clone(),
             settle_matching,
         );
         self.floating
-            .commit_normal_restore(&plans, transaction, settle_matching);
-        plans.into_iter().map(|(id, _)| id).collect()
+            .commit_normal_restore(&plan.sizes, transaction, settle_matching);
+    }
+
+    fn restore_normal_spines_inner(&mut self, ids: &[W::Id], settle_matching: bool) -> Vec<W::Id> {
+        let plan = self.plan_normal_spine_restore(ids);
+        self.prepare_normal_spine_restore(&plan);
+        self.submit_normal_spine_restore(&plan, Transaction::new(), settle_matching);
+        plan.sizes.into_iter().map(|(id, _)| id).collect()
+    }
+
+    pub(super) fn rebase_disabled_spine_resize(
+        &mut self,
+        plan: &NormalSpineRestorePlan<W::Id>,
+        last_motion: Option<(&W::Id, Point<f64, Logical>)>,
+    ) {
+        for (id, size) in &plan.sizes {
+            let delta = last_motion
+                .filter(|(target, _)| *target == id)
+                .map_or_else(|| (0., 0.).into(), |(_, delta)| delta);
+            let mut size = *size;
+            // A native (0,0) client-choice request still has a positive held allocation.
+            let tile = self.tiles().find(|tile| tile.window().id() == id).unwrap();
+            size.client_size = tile.normal_window_size_for_tile_size(size.allocation);
+            if self.floating.has_window(id) {
+                self.floating.rebase_spine_resize(id, delta, size);
+            } else {
+                self.scrolling.rebase_spine_resize(id, delta, size);
+            }
+        }
     }
 
     /// Restore only the spine owned by the current resize, using this motion's intent.

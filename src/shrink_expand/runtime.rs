@@ -622,6 +622,46 @@ impl State {
         Ok(Some(record))
     }
 
+    /// Lifecycle invalidation is allowed under lock/grabs and never activates a restored book.
+    pub(crate) fn restore_spines_on_disable(&mut self) {
+        let focus = self.niri.layout.focus().map(|window| window.window.clone());
+        self.cancel_shrink_expand_preview();
+        self.cancel_expand_focus_lease();
+        let last_motion = self
+            .niri
+            .shrink_spatial_session
+            .as_ref()
+            .map(|session| (session.window.clone(), session.delta));
+        let batches = self
+            .niri
+            .layout
+            .restore_all_spines_on_disable(last_motion.as_ref().map(|(id, delta)| (id, *delta)));
+        self.niri.shrink_spatial_session = None;
+        for (workspace, ids) in batches {
+            let windows = self
+                .niri
+                .layout
+                .windows()
+                .filter(|(_, win)| ids.contains(&win.window))
+                .map(|(_, win)| win)
+                .collect::<Vec<_>>();
+            let targets = windows.iter().map(|win| win.id().get()).collect();
+            let deadline = windows
+                .iter()
+                .filter_map(|win| win.normal_restore_deadline())
+                .min();
+            self.niri
+                .shrink_expand
+                .submit_immediate(workspace, targets, Kind::ExpandAll, deadline);
+        }
+        if let Some(focus) = focus {
+            self.niri.layout.activate_window(&focus);
+        }
+        self.ipc_refresh_shrink_expand();
+        self.refresh_shrink_expand_operations();
+        self.niri.queue_redraw_all();
+    }
+
     fn cancel_expand_focus_lease(&mut self) {
         if let Some(lease) = self.niri.shrink_expand_focus.take() {
             if let Some(tile) = self

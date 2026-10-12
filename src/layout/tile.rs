@@ -1042,16 +1042,22 @@ impl<W: LayoutElement> Tile<W> {
         self.normal_restore_deadline = Some(deadline);
         if floating {
             self.window
-                .request_restore_size_once(plan.client_size, transaction);
+                .request_restore_size_once(plan.client_size, transaction.clone());
         } else {
-            self.window
-                .request_size(plan.client_size, plan.sizing_mode, false, Some(transaction));
+            self.window.request_size(
+                plan.client_size,
+                plan.sizing_mode,
+                false,
+                Some(transaction.clone()),
+            );
         }
         self.window.begin_normal_restore(deadline);
         if settle_matching
             && self.window.normal_restore_ready()
             && self.sizing_mode == plan.sizing_mode
         {
+            self.window
+                .release_matching_normal_restore_transaction(&transaction);
             self.update_window();
         }
     }
@@ -1383,6 +1389,10 @@ impl<W: LayoutElement> Tile<W> {
         }
         let size = self.normal_window_size_for_tile_size(size);
         let allocation = self.normal_tile_size_for_window_size(size);
+        let changed_restore = self
+            .normal_restore
+            .as_ref()
+            .is_some_and(|plan| plan.client_size != size || plan.sizing_mode != SizingMode::Normal);
         if let Some(plan) = &mut self.normal_restore {
             *plan = NormalSizePlan {
                 allocation,
@@ -1393,17 +1403,36 @@ impl<W: LayoutElement> Tile<W> {
 
         self.window
             .request_size(size, SizingMode::Normal, animate, transaction);
-        self.rearm_normal_restore();
+        if changed_restore {
+            self.rearm_normal_restore();
+        }
     }
 
     pub(super) fn request_normal_resize_once(&mut self, size: Size<i32, Logical>, animate: bool) {
-        let allocation = self.normal_tile_size_for_window_size(size);
+        if self.normal_restore.is_none() {
+            self.window.request_size_once(size, animate);
+            return;
+        }
+        let changed_restore = self
+            .normal_restore
+            .as_ref()
+            .is_some_and(|plan| plan.client_size != size);
+        // Zero is a client-choice request, never the held normal preview's geometry.
+        let current = self.window.size();
+        let estimate = (
+            if size.w == 0 { current.w } else { size.w },
+            if size.h == 0 { current.h } else { size.h },
+        )
+            .into();
+        let allocation = self.normal_tile_size_for_window_size(estimate);
         if let Some(plan) = &mut self.normal_restore {
             plan.client_size = size;
             plan.allocation = allocation;
         }
         self.window.request_size_once(size, animate);
-        self.rearm_normal_restore();
+        if changed_restore {
+            self.rearm_normal_restore();
+        }
     }
 
     /// Convert a normal allocation without consulting the current spine form.

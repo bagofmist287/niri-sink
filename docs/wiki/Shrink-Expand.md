@@ -2,8 +2,7 @@
 
 The `shrink/development` branch provides the five base commands below when
 `enabled true`, with independent spine rendering and compositor-owned hit regions.
-Adjacent selection, complete expansion visuals and disable-time restoration
-remain under development. This is a partial development candidate;
+Adjacent selection and complete expansion visuals remain under development. This is a partial development candidate;
 the installed Sink session has not been replaced by this branch.
 
 ```kdl
@@ -66,8 +65,8 @@ workspace "reading" {
 
 Inheritance remains symbolic so the renderer can read the latest layout and
 window rules. The parser, paint resolver and internal rendering are tested, including live
-paint changes, urgency and explicit inheritance in software EGL. Runtime feature
-switching and disable-time restoration still require integration.
+paint changes, urgency and explicit inheritance in software EGL. Configuration
+reload supports disable-time restoration as described below.
 
 The internal spine model also excludes spines from `focus-window-previous`.
 They remain in window inventory and keep their collapsed form; when every
@@ -96,9 +95,24 @@ The layout now carries the parsed behavior settings through global configuration
 updates. Changing `thickness` reallocates existing internal spines in tiled,
 floating and native Moving ownership, without requesting that size from the
 hidden client. It also updates workspaces retained while no output is present.
-Paint-only updates preserve their current thickness. `enabled false` restoration
-still requires integration; existing spines can be expanded with the base commands
-while the feature is enabled.
+Paint-only updates preserve their current thickness.
+
+Changing `enabled true` to `enabled false` cancels previews and restores all spines
+across every workspace, output, hidden tab and floating space. Workspaces retained
+with no outputs are included. The current-slot normal insertion plans share one
+native transaction deadline, with all forms prepared before restoration requests.
+A moving spine first ends at its native final slot; the existing MoveGrab then
+cleans up normally. Ordinary moves continue. An ongoing spine resize is rebased
+and continues with its existing grab. The current ordinary focus, or absent focus,
+is preserved, and late client commits do not activate the restored books.
+
+The operation snapshot records an ExpandAll batch per affected workspace. Matching
+members settle without waiting; other members require processed commit or the
+original deadline. Closing targets leave the waiting set. Repeating the same disabled
+configuration does not start another batch or extend its deadline. Restores release
+only their own staged transaction references when no configure is needed; older
+native transactions remain on their original lifecycle. Feature admission stays
+disabled while those normal client restores settle.
 
 Icon source images are cached separately from title shaping. A changed title or
 text colour does not reread the app icon. A new app ID/physical icon size or layout

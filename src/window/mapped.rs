@@ -1021,6 +1021,19 @@ impl LayoutElement for Mapped {
         }
     }
 
+    fn release_matching_normal_restore_transaction(&mut self, transaction: &Transaction) {
+        // Called immediately after submitting a restore that is already ready. A NotNeeded
+        // configure never reaches send_pending_configure(), so that staged clone would hold
+        // every other workspace in the batch until the deadline despite this member matching.
+        if self
+            .transaction_for_next_configure
+            .as_ref()
+            .is_some_and(|next| next.same_batch(transaction))
+        {
+            self.transaction_for_next_configure = None;
+        }
+    }
+
     fn finish_normal_restore(&mut self) {
         self.normal_restore_timed_out = self.normal_restore_timed_out();
         self.normal_restore_barrier = None;

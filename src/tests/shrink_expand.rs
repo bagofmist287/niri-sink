@@ -79,6 +79,486 @@ fn spatial_test_motion(
 }
 
 #[test]
+fn matching_restore_release_keeps_a_foreign_staged_transaction() {
+    use crate::utils::transaction::Transaction;
+    let (mut fixture, _, _) = timed_shrink_fixture(1, true, 60000);
+    let id = fixture.niri().layout.focus().unwrap().window.clone();
+    let owned = Transaction::new();
+    let foreign = Transaction::new();
+    let mapped = fixture
+        .niri()
+        .layout
+        .workspaces_mut()
+        .flat_map(|ws| ws.tiles_mut())
+        .find(|tile| tile.window().window == id)
+        .unwrap()
+        .window_mut();
+    mapped.request_restore_size_once((720, 400).into(), owned.clone());
+    assert!(!owned.is_last());
+    mapped.release_matching_normal_restore_transaction(&foreign);
+    assert!(
+        !owned.is_last(),
+        "another restore's batch must not release this staged transaction"
+    );
+    mapped.release_matching_normal_restore_transaction(&owned);
+    assert!(owned.is_last());
+}
+
+#[test]
+fn floating_spine_resize_preserves_client_choice_extent_while_restore_is_pending() {
+    use crate::utils::ResizeEdge;
+    let (mut fixture, client, _) = timed_shrink_fixture(2, true, 60000);
+    let window = fixture.niri().layout.focus().unwrap().window.clone();
+    let ticket = fixture
+        .niri_state()
+        .begin_shrink_preview(Some(ShrinkAxis::Horizontal))
+        .unwrap()
+        .ticket();
+    fixture.niri_state().confirm_shrink_preview(ticket).unwrap();
+    fixture.double_roundtrip(client);
+    let (_, pointer) =
+        spatial_test_pointer_for_window(&mut fixture, ResizeEdge::RIGHT, window.clone());
+    spatial_test_motion(&mut fixture, &pointer, (80., 0.));
+    fixture.double_roundtrip(client);
+    let before = fixture
+        .niri()
+        .layout
+        .workspaces()
+        .flat_map(|(_, _, ws)| ws.tiles())
+        .find(|tile| tile.window().window == window)
+        .unwrap()
+        .tile_size();
+    spatial_test_motion(&mut fixture, &pointer, (100., 0.));
+    fixture.double_roundtrip(client);
+    let tile = fixture
+        .niri()
+        .layout
+        .workspaces()
+        .flat_map(|(_, _, ws)| ws.tiles())
+        .find(|tile| tile.window().window == window)
+        .unwrap();
+    assert!(tile.normal_restore_input_blocked());
+    assert_eq!(
+        tile.window().requested_size().unwrap().h,
+        tile.window().size().h
+    );
+    assert_eq!(tile.tile_size().h, before.h);
+    assert!(before.h > 0.);
+    assert_eq!(tile.tile_size().w - before.w, 20.);
+    assert!(pointer.is_grabbed());
+    pointer.unset_grab(
+        fixture.niri_state(),
+        smithay::utils::Serial::from(460),
+        smithay::backend::input::InputTime::now(),
+    );
+}
+
+#[test]
+fn disable_runtime_ends_book_move_through_existing_pointer_grab_but_keeps_normal_move() {
+    use crate::input::{move_grab::MoveGrab, AnyStartData};
+    use smithay::input::pointer::{ButtonEvent, Focus, GrabStartData};
+    for spine in [false, true] {
+        for floating in [false, true] {
+            for detach in [false, true] {
+                let (mut fixture, client, _) = timed_shrink_fixture(2, floating, 60000);
+                let window = fixture.niri().layout.focus().unwrap().window.clone();
+                if spine {
+                    let ticket = fixture
+                        .niri_state()
+                        .begin_shrink_preview(Some(ShrinkAxis::Horizontal))
+                        .unwrap()
+                        .ticket();
+                    fixture.niri_state().confirm_shrink_preview(ticket).unwrap();
+                    fixture.double_roundtrip(client);
+                }
+                let pointer = fixture.niri().seat.get_pointer().unwrap();
+                pointer.button(
+                    fixture.niri_state(),
+                    &ButtonEvent {
+                        serial: smithay::utils::Serial::from(500),
+                        time: smithay::backend::input::InputTime::now(),
+                        button: 0x110,
+                        state: smithay::backend::input::ButtonState::Pressed,
+                    },
+                );
+                let grab = MoveGrab::new(
+                    fixture.niri_state(),
+                    AnyStartData::Pointer(GrabStartData {
+                        focus: None,
+                        button: 0x110,
+                        location: (400., 300.).into(),
+                    }),
+                    window.clone(),
+                    false,
+                    None,
+                )
+                .unwrap();
+                pointer.set_grab(
+                    fixture.niri_state(),
+                    grab,
+                    smithay::utils::Serial::from(501),
+                    Focus::Clear,
+                );
+                let delta = if detach { (300., 0.) } else { (20., 0.) };
+                spatial_test_motion(&mut fixture, &pointer, delta);
+                fixture.double_roundtrip(client);
+                assert!(pointer.is_grabbed());
+                assert!(!fixture.niri().layout.can_transfer_sink());
+                let mut config = expand_test_config();
+                config.shrink_expand.enabled = false;
+                fixture.niri_state().reload_config(Ok(config));
+                fixture.double_roundtrip(client);
+                assert_eq!(fixture.niri().layout.can_transfer_sink(), spine);
+                assert!(!fixture.niri().layout.is_spine(&window));
+                spatial_test_motion(&mut fixture, &pointer, (delta.0 + 10., 0.));
+                fixture.double_roundtrip(client);
+                assert_eq!(pointer.is_grabbed(), !spine);
+                assert_eq!(fixture.niri().layout.windows().count(), 2);
+                if !spine {
+                    pointer.unset_grab(
+                        fixture.niri_state(),
+                        smithay::utils::Serial::from(502),
+                        smithay::backend::input::InputTime::now(),
+                    );
+                    fixture.double_roundtrip(client);
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn disable_runtime_restores_all_workspaces_tabs_and_floats_with_original_deadline() {
+    use crate::layout::ActivateWindow;
+    use crate::shrink_expand::{Kind, Phase};
+    for all_books in [false, true] {
+        for no_outputs in [false, true] {
+            let (mut fixture, client, surfaces) = timed_shrink_fixture(6, false, 60000);
+            let mut windows = fixture
+                .niri()
+                .layout
+                .windows()
+                .map(|(_, w)| (w.id().get(), w.window.clone()))
+                .collect::<Vec<_>>();
+            windows.sort_by_key(|(id, _)| *id);
+            for i in [0, 3] {
+                fixture
+                    .niri()
+                    .layout
+                    .set_window_floating(Some(&windows[i].1), true);
+            }
+            fixture
+                .niri()
+                .layout
+                .consume_or_expel_window_left(Some(&windows[2].1));
+            fixture.niri().layout.activate_window(&windows[2].1);
+            fixture
+                .niri()
+                .layout
+                .set_column_display(niri_ipc::ColumnDisplay::Tabbed);
+            fixture
+                .niri()
+                .layout
+                .move_to_workspace(Some(&windows[4].1), 1, ActivateWindow::No);
+            fixture.add_output(2, (1024, 768));
+            let output2 = fixture
+                .niri()
+                .layout
+                .outputs()
+                .find(|output| output.name() == "headless-2")
+                .unwrap()
+                .clone();
+            fixture.niri().layout.move_to_output(
+                Some(&windows[5].1),
+                &output2,
+                None,
+                ActivateWindow::No,
+            );
+            fixture.niri().layout.switch_workspace(0);
+            fixture.niri().layout.activate_window(&windows[2].1);
+            let targets = windows
+                .iter()
+                .enumerate()
+                .filter(|(i, _)| all_books || *i != 2)
+                .map(|(_, pair)| pair.clone())
+                .collect::<Vec<_>>();
+            for (i, (_, id)) in targets.iter().enumerate() {
+                let ws = fixture
+                    .niri()
+                    .layout
+                    .workspaces_mut()
+                    .find(|ws| ws.has_window(id))
+                    .unwrap();
+                assert!(ws
+                    .tiles_mut()
+                    .find(|t| &t.window().window == id)
+                    .unwrap()
+                    .set_spine(
+                        if i % 2 == 0 {
+                            ShrinkAxis::Horizontal
+                        } else {
+                            ShrinkAxis::Vertical
+                        },
+                        32.
+                    ));
+                ws.update_window(id, None);
+            }
+            fixture.double_roundtrip(client);
+            if no_outputs {
+                let outputs = fixture.niri().layout.outputs().cloned().collect::<Vec<_>>();
+                for output in outputs {
+                    fixture.niri().remove_output(&output);
+                }
+                fixture.double_roundtrip(client);
+            }
+            let focus = fixture.niri().keyboard_focus.surface().cloned();
+            assert_eq!(focus.is_none(), all_books || no_outputs);
+            let slots = fixture
+                .niri()
+                .layout
+                .workspaces()
+                .filter(|(_, _, ws)| ws.windows().next().is_some())
+                .map(|(_, _, ws)| {
+                    (
+                        ws.id(),
+                        ws.tiles()
+                            .map(|t| {
+                                (
+                                    t.window().id().get(),
+                                    ws.floating().has_window(&t.window().window),
+                                )
+                            })
+                            .collect::<Vec<_>>(),
+                    )
+                })
+                .collect::<Vec<_>>();
+            let mut config = expand_test_config();
+            config.shrink_expand.enabled = false;
+            fixture.niri_state().reload_config(Ok(config));
+            fixture.double_roundtrip(client);
+            assert!(fixture
+                .niri()
+                .layout
+                .workspaces()
+                .flat_map(|(_, _, ws)| ws.tiles())
+                .all(|tile| !tile.is_spine()));
+            assert_eq!(fixture.niri().keyboard_focus.surface().cloned(), focus);
+            assert_eq!(
+                fixture
+                    .niri()
+                    .layout
+                    .workspaces()
+                    .filter(|(_, _, ws)| ws.windows().next().is_some())
+                    .map(|(_, _, ws)| (
+                        ws.id(),
+                        ws.tiles()
+                            .map(|t| (
+                                t.window().id().get(),
+                                ws.floating().has_window(&t.window().window)
+                            ))
+                            .collect::<Vec<_>>()
+                    ))
+                    .collect::<Vec<_>>(),
+                slots
+            );
+            let records = fixture
+                .niri()
+                .shrink_expand
+                .records()
+                .filter(|r| r.kind == Kind::ExpandAll)
+                .cloned()
+                .collect::<Vec<_>>();
+            assert_eq!(records.len(), 3);
+            assert!(records.iter().all(|r| r.phase == Phase::Submitted));
+            let mut actual = records
+                .iter()
+                .flat_map(|r| r.targets.clone())
+                .collect::<Vec<_>>();
+            actual.sort();
+            let mut expected = targets.iter().map(|(id, _)| *id).collect::<Vec<_>>();
+            expected.sort();
+            assert_eq!(actual, expected);
+            let deadlines = fixture
+                .niri()
+                .layout
+                .windows()
+                .filter(|(_, w)| actual.contains(&w.id().get()))
+                .filter_map(|(_, w)| w.normal_restore_deadline())
+                .collect::<Vec<_>>();
+            assert!(!deadlines.is_empty());
+            assert!(fixture
+                .niri()
+                .layout
+                .windows()
+                .filter(|(_, w)| actual.contains(&w.id().get()))
+                .all(|(_, w)| w.normal_restore_deadline().is_some() || w.normal_restore_ready()));
+            assert!(deadlines.iter().all(|d| *d == deadlines[0]));
+            let counts = surfaces
+                .iter()
+                .map(|surface| {
+                    fixture
+                        .client(client)
+                        .window(surface)
+                        .configures_received
+                        .len()
+                })
+                .collect::<Vec<_>>();
+            let mut config = expand_test_config();
+            config.shrink_expand.enabled = false;
+            fixture.niri_state().reload_config(Ok(config));
+            fixture.double_roundtrip(client);
+            assert_eq!(
+                fixture
+                    .niri()
+                    .shrink_expand
+                    .records()
+                    .filter(|r| r.kind == Kind::ExpandAll)
+                    .count(),
+                3
+            );
+            assert_eq!(
+                fixture
+                    .niri()
+                    .layout
+                    .windows()
+                    .filter(|(_, w)| actual.contains(&w.id().get()))
+                    .filter_map(|(_, w)| w.normal_restore_deadline())
+                    .collect::<Vec<_>>(),
+                deadlines
+            );
+            assert_eq!(
+                surfaces
+                    .iter()
+                    .map(|surface| fixture
+                        .client(client)
+                        .window(surface)
+                        .configures_received
+                        .len())
+                    .collect::<Vec<_>>(),
+                counts,
+                "same-size reload must not continually publish another restore configure"
+            );
+            // The only target on output 2 closes while this global batch is pending.
+            let closed = fixture.client(client).window(surfaces.last().unwrap());
+            closed.xdg_toplevel.destroy();
+            closed.xdg_surface.destroy();
+            closed.surface.destroy();
+            fixture.double_roundtrip(client);
+            assert_eq!(fixture.niri().layout.windows().count(), 5);
+            assert!(fixture
+                .niri()
+                .shrink_expand
+                .records()
+                .any(|r| r.kind == Kind::ExpandAll
+                    && r.targets == vec![windows[5].0]
+                    && r.reason == Some(crate::shrink_expand::FinishReason::TargetsRemoved)));
+            for surface in &surfaces[..5] {
+                let window = fixture.client(client).window(surface);
+                let size = window.configures_received.last().unwrap().1.size;
+                window.set_size(size.0 as u16, size.1 as u16);
+                window.ack_last_and_commit();
+            }
+            // Commit-blocker notifications are asynchronous and can need more than two
+            // calloop cycles when several workspace transactions settle together.
+            for _ in 0..4 {
+                fixture.double_roundtrip(client);
+                if fixture
+                    .niri()
+                    .shrink_expand
+                    .records()
+                    .filter(|r| r.kind == Kind::ExpandAll)
+                    .all(|r| r.phase == Phase::Settled)
+                {
+                    break;
+                }
+            }
+            assert_eq!(fixture.niri().keyboard_focus.surface().cloned(), focus);
+            let records = fixture
+                .niri()
+                .shrink_expand
+                .records()
+                .filter(|r| r.kind == Kind::ExpandAll)
+                .cloned()
+                .collect::<Vec<_>>();
+            let states = fixture
+                .niri()
+                .layout
+                .windows()
+                .map(|(_, w)| {
+                    (
+                        w.id().get(),
+                        w.size(),
+                        w.requested_size(),
+                        w.normal_restore_ready(),
+                        w.normal_restore_deadline(),
+                    )
+                })
+                .collect::<Vec<_>>();
+            assert!(records.iter().all(|r| r.phase == Phase::Settled), "all_books={all_books} no_outputs={no_outputs}, records={records:?}, states={states:?}");
+            assert!(records
+                .iter()
+                .filter(|r| r.targets != vec![windows[5].0])
+                .all(|r| r.reason == Some(crate::shrink_expand::FinishReason::Ready)));
+        }
+    }
+}
+
+#[test]
+fn disable_runtime_rebases_book_resize_and_keeps_the_native_pointer_grab() {
+    use crate::utils::ResizeEdge;
+    for floating in [false, true] {
+        for framed in [false, true] {
+            let (mut fixture, client, _) = timed_shrink_fixture(2, floating, 60000);
+            let window = fixture.niri().layout.focus().unwrap().window.clone();
+            let ticket = fixture
+                .niri_state()
+                .begin_shrink_preview(Some(ShrinkAxis::Horizontal))
+                .unwrap()
+                .ticket();
+            fixture.niri_state().confirm_shrink_preview(ticket).unwrap();
+            fixture.double_roundtrip(client);
+            let (_, pointer) =
+                spatial_test_pointer_for_window(&mut fixture, ResizeEdge::BOTTOM, window.clone());
+            let delta = if framed { (0., 40.) } else { (0., 0.) };
+            if framed {
+                spatial_test_motion(&mut fixture, &pointer, delta);
+                fixture.double_roundtrip(client);
+            }
+            let focus = fixture.niri().keyboard_focus.surface().cloned();
+            let mut config = expand_test_config();
+            config.shrink_expand.enabled = false;
+            fixture.niri_state().reload_config(Ok(config));
+            fixture.double_roundtrip(client);
+            assert!(!fixture.niri().layout.is_spine(&window));
+            assert!(pointer.is_grabbed());
+            assert_eq!(fixture.niri().keyboard_focus.surface().cloned(), focus);
+            let before = fixture
+                .niri()
+                .layout
+                .spatial_resize_intent(&window, delta.into())
+                .unwrap();
+            spatial_test_motion(&mut fixture, &pointer, (0., delta.1 + 20.));
+            fixture.double_roundtrip(client);
+            let after = fixture
+                .niri()
+                .layout
+                .spatial_resize_intent(&window, (0., delta.1 + 20.).into())
+                .unwrap();
+            assert_eq!(after.requested.h - before.requested.h, 20.);
+            assert!(pointer.is_grabbed());
+            assert!(fixture.niri().shrink_expand.preview().is_none());
+            pointer.unset_grab(
+                fixture.niri_state(),
+                smithay::utils::Serial::from(450),
+                smithay::backend::input::InputTime::now(),
+            );
+            fixture.double_roundtrip(client);
+            assert!(!pointer.is_grabbed());
+        }
+    }
+}
+
+#[test]
 fn spine_resize_expands_rebases_same_grab_and_can_shrink_again() {
     use crate::shrink_expand::{Kind, Phase};
     use crate::utils::ResizeEdge;
