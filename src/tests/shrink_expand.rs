@@ -662,6 +662,129 @@ fn explicit_mode_fixture() -> (
 }
 
 #[test]
+fn previous_window_navigation_skips_spines_without_changing_inventory() {
+    use std::time::Duration;
+
+    use niri_config::Action;
+
+    for extra_normal in [false, true] {
+        let (mut fixture, client, mut surfaces, mut ids) = explicit_mode_fixture();
+        if extra_normal {
+            let surface = fixture.client(client).create_window().surface.clone();
+            fixture.client(client).window(&surface).commit();
+            fixture.roundtrip(client);
+            let window = fixture.client(client).window(&surface);
+            window.attach_new_buffer();
+            window.set_size(100, 100);
+            window.ack_last_and_commit();
+            fixture.double_roundtrip(client);
+            let id = fixture
+                .niri()
+                .layout
+                .windows()
+                .find(|(_, mapped)| {
+                    mapped.toplevel().wl_surface().id().protocol_id() == surface.id().protocol_id()
+                })
+                .unwrap()
+                .1
+                .window
+                .clone();
+            ids.push(id);
+            surfaces.push(surface);
+        }
+        let current = ids
+            .last()
+            .filter(|_| extra_normal)
+            .unwrap_or(&ids[0])
+            .clone();
+        fixture.niri().layout.activate_window(&current);
+        fixture.double_roundtrip(client);
+        // Give books the newest history entries: inventory must retain them,
+        // while ordinary navigation must still choose a normal client.
+        let niri = fixture.niri();
+        niri.mru_apply_keyboard_commit();
+        niri.layout.with_windows_mut(|mapped, _| {
+            let stamp = if mapped.window == ids[0] {
+                100
+            } else if mapped.window == current {
+                200
+            } else {
+                300
+            };
+            mapped.set_focus_timestamp(Duration::from_secs(stamp));
+        });
+        fixture
+            .niri_state()
+            .do_action(Action::FocusWindowPrevious, false);
+        fixture.double_roundtrip(client);
+        assert_eq!(fixture.niri().layout.focus().unwrap().window, ids[0]);
+        assert_eq!(
+            fixture
+                .niri()
+                .keyboard_focus
+                .surface()
+                .map(|surface| surface.id().protocol_id()),
+            Some(surfaces[0].id().protocol_id())
+        );
+        if extra_normal {
+            fixture
+                .niri_state()
+                .do_action(Action::FocusWindowPrevious, false);
+            fixture.double_roundtrip(client);
+            assert_eq!(fixture.niri().layout.focus().unwrap().window, current);
+            assert_eq!(
+                fixture
+                    .niri()
+                    .keyboard_focus
+                    .surface()
+                    .map(|surface| surface.id().protocol_id()),
+                Some(surfaces.last().unwrap().id().protocol_id())
+            );
+        }
+        assert!(fixture.niri().layout.is_spine(&ids[1]));
+        assert!(fixture.niri().layout.is_spine(&ids[2]));
+        assert_eq!(fixture.niri().layout.windows().count(), ids.len());
+        for surface in &surfaces[1..3] {
+            assert!(fixture
+                .client(client)
+                .window(surface)
+                .recent_configures()
+                .all(|config| !config.states.contains(&xdg_toplevel::State::Activated)));
+        }
+        // With no normal client left, history navigation retains no client focus.
+        let normal_ids = if extra_normal {
+            vec![ids[0].clone(), current]
+        } else {
+            vec![ids[0].clone()]
+        };
+        for id in normal_ids {
+            let ws = fixture
+                .niri()
+                .layout
+                .workspaces_mut()
+                .find(|ws| ws.has_window(&id))
+                .unwrap();
+            assert!(ws
+                .tiles_mut()
+                .find(|tile| tile.window().window == id)
+                .unwrap()
+                .set_spine(ShrinkAxis::Horizontal, 40.));
+            ws.update_window(&id, None);
+        }
+        fixture.double_roundtrip(client);
+        assert!(fixture.niri().layout.focus().is_none());
+        fixture
+            .niri_state()
+            .do_action(Action::FocusWindowPrevious, false);
+        fixture.double_roundtrip(client);
+        assert!(fixture.niri().layout.focus().is_none());
+        assert_eq!(fixture.niri().layout.windows().count(), ids.len());
+        assert!(fixture.niri().keyboard_focus.surface().is_none());
+        assert!(ids.iter().all(|id| fixture.niri().layout.is_spine(id)));
+    }
+}
+
+#[test]
 fn explicit_xdg_duplicate_mode_and_early_unset_restore_every_affected_tab() {
     for mode in [SizingMode::Fullscreen, SizingMode::Maximized] {
         for all_spines in [false, true] {

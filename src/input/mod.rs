@@ -719,6 +719,7 @@ impl State {
                     .windows()
                     .map(|(_, win)| win)
                     .filter(|win| Some(win.id()) != current)
+                    .filter(|win| !self.niri.layout.is_spine(&win.window))
                     .max_by_key(|win| win.get_focus_timestamp())
                     .map(|win| &win.window)
             }
@@ -949,6 +950,7 @@ impl State {
                     .windows()
                     .map(|(_, win)| win)
                     .filter(|win| Some(win.id()) != current)
+                    .filter(|win| !self.niri.layout.is_spine(&win.window))
                     .max_by_key(|win| win.get_focus_timestamp())
                     .map(|win| win.window.clone())
                 {

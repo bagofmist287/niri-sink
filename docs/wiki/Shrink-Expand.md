@@ -66,3 +66,8 @@ workspace "reading" {
 Inheritance remains symbolic so the renderer can read the latest layout and
 window rules. The parser and paint resolver are tested; actual rendered colors,
 reload damage and disable-time restoration still require runtime integration.
+
+The internal spine model also excludes spines from `focus-window-previous`.
+They remain in window inventory and keep their collapsed form; when every
+window is a spine, this navigation action retains no client focus. Explicit
+spine activation and MRU confirmation still await runtime integration.
