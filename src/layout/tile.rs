@@ -988,7 +988,7 @@ impl<W: LayoutElement> Tile<W> {
         self.spine_visual_active = self.is_spine() && active;
     }
 
-    pub(crate) fn set_shrink_preview(&mut self, target: Size<f64, Logical>, animate: bool) {
+    pub(crate) fn set_shrink_preview(&mut self, target: Size<f64, Logical>, animate: bool) -> bool {
         let source = self.animated_tile_size();
         let preview = self
             .shrink_preview
@@ -997,7 +997,7 @@ impl<W: LayoutElement> Tile<W> {
             target,
             self.options.animations.window_movement.0,
             animate && !self.options.animations.off,
-        );
+        )
     }
 
     pub(crate) fn clear_shrink_preview(&mut self) {

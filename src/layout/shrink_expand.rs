@@ -4,6 +4,38 @@ use smithay::utils::{Logical, Size};
 
 use super::SizingMode;
 
+/// Read-only intent for a native keyboard dimension command, before any layout mutation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct KeyboardResizeIntent {
+    pub axis: ShrinkAxis,
+    pub at_minimum: bool,
+    pub direction: std::cmp::Ordering,
+}
+
+impl KeyboardResizeIntent {
+    pub fn new(
+        axis: ShrinkAxis,
+        current: f64,
+        minimum: f64,
+        current_client: f64,
+        requested_proportion: f64,
+        change: niri_ipc::SizeChange,
+    ) -> Self {
+        use niri_ipc::SizeChange;
+        let (a, b) = match change {
+            SizeChange::AdjustFixed(delta) => (f64::from(delta), 0.),
+            SizeChange::AdjustProportion(delta) => (delta, 0.),
+            SizeChange::SetFixed(value) => (f64::from(value), current_client),
+            SizeChange::SetProportion(_) => (requested_proportion, current),
+        };
+        Self {
+            axis,
+            at_minimum: current <= minimum + 1e-6,
+            direction: a.partial_cmp(&b).unwrap_or(std::cmp::Ordering::Equal),
+        }
+    }
+}
+
 /// A current-slot allocation, not a saved pre-shrink size. A zero client extent retains the
 /// native client-choice request; the corresponding allocation is only a preview estimate.
 #[derive(Debug, Clone, Copy, PartialEq)]

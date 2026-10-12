@@ -862,6 +862,73 @@ impl<W: LayoutElement> FloatingSpace<W> {
         self.interactive_resize_end(Some(&id));
     }
 
+    fn dimension_change(
+        &self,
+        idx: usize,
+        axis: super::shrink_expand::ShrinkAxis,
+        change: SizeChange,
+    ) -> f64 {
+        use super::shrink_expand::ShrinkAxis;
+        let tile = &self.tiles[idx];
+        let win = tile.window();
+        let expected = win.expected_size().unwrap_or_else(|| win.size());
+        let outer = tile.tile_expected_or_current_size();
+        let (current_window, current_tile, available_size) = match axis {
+            ShrinkAxis::Horizontal => (expected.w, outer.w, self.working_area.size.w),
+            ShrinkAxis::Vertical => (expected.h, outer.h, self.working_area.size.h),
+        };
+        let from_tile = |extent| match axis {
+            ShrinkAxis::Horizontal => tile.window_width_for_tile_width(extent),
+            ShrinkAxis::Vertical => tile.window_height_for_tile_height(extent),
+        };
+        const MAX_F: f64 = 10000.;
+        match change {
+            SizeChange::SetFixed(value) => f64::from(value),
+            SizeChange::SetProportion(prop) => {
+                from_tile(available_size * (prop / 100.).clamp(0., MAX_F))
+            }
+            SizeChange::AdjustFixed(delta) => f64::from(current_window.saturating_add(delta)),
+            SizeChange::AdjustProportion(delta) => from_tile(
+                available_size * (current_tile / available_size + delta / 100.).clamp(0., MAX_F),
+            ),
+        }
+    }
+
+    pub(super) fn keyboard_resize_intent(
+        &self,
+        id: &W::Id,
+        axis: super::shrink_expand::ShrinkAxis,
+        change: SizeChange,
+    ) -> Option<super::shrink_expand::KeyboardResizeIntent> {
+        use super::shrink_expand::{KeyboardResizeIntent, ShrinkAxis};
+        let idx = self.idx_of(id)?;
+        let tile = &self.tiles[idx];
+        if tile.is_spine() || !tile.window().pending_sizing_mode().is_normal() {
+            return None;
+        }
+        let current = tile.tile_expected_or_current_size();
+        let min = tile.window().min_size();
+        let max = tile.window().max_size();
+        let requested = self.dimension_change(idx, axis, change);
+        let (extent, minimum, client, target) = match axis {
+            ShrinkAxis::Horizontal => (
+                current.w,
+                tile.tile_width_for_window_width(f64::from(ensure_min_max_size(1, min.w, max.w))),
+                tile.window_width_for_tile_width(current.w),
+                tile.tile_width_for_window_width(requested),
+            ),
+            ShrinkAxis::Vertical => (
+                current.h,
+                tile.tile_height_for_window_height(f64::from(ensure_min_max_size(1, min.h, max.h))),
+                tile.window_height_for_tile_height(current.h),
+                tile.tile_height_for_window_height(requested),
+            ),
+        };
+        Some(KeyboardResizeIntent::new(
+            axis, extent, minimum, client, target, change,
+        ))
+    }
+
     pub fn set_window_width(&mut self, id: Option<&W::Id>, change: SizeChange, animate: bool) {
         let Some(id) = id.or(self.active_window_id.as_ref()) else {
             return;
@@ -876,32 +943,11 @@ impl<W: LayoutElement> FloatingSpace<W> {
             return;
         }
 
+        let win_width =
+            self.dimension_change(idx, super::shrink_expand::ShrinkAxis::Horizontal, change);
         let tile = &mut self.tiles[idx];
         tile.floating_preset_width_idx = None;
-
-        let available_size = self.working_area.size.w;
-        let win = tile.window();
-        let current_window = win.expected_size().unwrap_or_else(|| win.size()).w;
-        let current_tile = tile.tile_expected_or_current_size().w;
-
         const MAX_PX: f64 = 100000.;
-        const MAX_F: f64 = 10000.;
-
-        let win_width = match change {
-            SizeChange::SetFixed(win_width) => f64::from(win_width),
-            SizeChange::SetProportion(prop) => {
-                let prop = (prop / 100.).clamp(0., MAX_F);
-                let tile_width = available_size * prop;
-                tile.window_width_for_tile_width(tile_width)
-            }
-            SizeChange::AdjustFixed(delta) => f64::from(current_window.saturating_add(delta)),
-            SizeChange::AdjustProportion(delta) => {
-                let current_prop = current_tile / available_size;
-                let prop = (current_prop + delta / 100.).clamp(0., MAX_F);
-                let tile_width = available_size * prop;
-                tile.window_width_for_tile_width(tile_width)
-            }
-        };
         let win_width = win_width.round().clamp(1., MAX_PX) as i32;
 
         let win = tile.window_mut();
@@ -931,32 +977,11 @@ impl<W: LayoutElement> FloatingSpace<W> {
             return;
         }
 
+        let win_height =
+            self.dimension_change(idx, super::shrink_expand::ShrinkAxis::Vertical, change);
         let tile = &mut self.tiles[idx];
         tile.floating_preset_height_idx = None;
-
-        let available_size = self.working_area.size.h;
-        let win = tile.window();
-        let current_window = win.expected_size().unwrap_or_else(|| win.size()).h;
-        let current_tile = tile.tile_expected_or_current_size().h;
-
         const MAX_PX: f64 = 100000.;
-        const MAX_F: f64 = 10000.;
-
-        let win_height = match change {
-            SizeChange::SetFixed(win_height) => f64::from(win_height),
-            SizeChange::SetProportion(prop) => {
-                let prop = (prop / 100.).clamp(0., MAX_F);
-                let tile_height = available_size * prop;
-                tile.window_height_for_tile_height(tile_height)
-            }
-            SizeChange::AdjustFixed(delta) => f64::from(current_window.saturating_add(delta)),
-            SizeChange::AdjustProportion(delta) => {
-                let current_prop = current_tile / available_size;
-                let prop = (current_prop + delta / 100.).clamp(0., MAX_F);
-                let tile_height = available_size * prop;
-                tile.window_height_for_tile_height(tile_height)
-            }
-        };
         let win_height = win_height.round().clamp(1., MAX_PX) as i32;
 
         let win = tile.window_mut();

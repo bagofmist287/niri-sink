@@ -716,6 +716,10 @@ impl State {
             return;
         }
 
+        if self.handle_keyboard_shrink_boundary(&action) {
+            return;
+        }
+
         if matches!(action, Action::SinkWindow | Action::PullWindow)
             && (!self.niri.config.borrow().sink.enabled || !self.can_recall_sink(false))
         {

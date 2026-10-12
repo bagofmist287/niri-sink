@@ -168,3 +168,20 @@ without animation-frame countdown events. Window inventory includes `shrink_stat
 (Normal/Spine) and `shrink_axis` only for a spine. Previews keep Normal; actual form
 changes use existing window-change events and keep the same window ID. Client
 `window_size` and native `tile_size` retain their distinct meanings.
+
+Keyboard `set-column-width`, `set-window-width` and `set-window-height` commands
+also enter timed Shrink when the actual focused normal window is already at the
+native allocation's minimum and a further decrease is requested on that axis.
+The first ordinary resize reaching the minimum remains an ordinary resize.
+Shared columns, hidden-tab constraints and effective borders participate in this
+read-only boundary query. A targeted size command only triggers Shrink when its ID
+is the actual focused window.
+
+During a timed preview, another decrease on the selected axis refreshes the same
+operation/timer and keeps that axis. A grow request on that axis cancels the preview
+and executes the native size command. Zero adjustments do not refresh the timer.
+Changes on the other axis continue as native resize and update the ghost's shape
+without restarting the buffer deadline. These paths retain the original client
+identity/focus context; they do not expand an already committed spine. Existing
+size-command IPC replies remain `Handled`; operation state/events expose any
+boundary-triggered preview. Mouse spatial buffering is still pending.

@@ -4,6 +4,110 @@ use crate::layout::scrolling::ScrollingSpace;
 use crate::layout::shrink_expand::{ShrinkAxis, SpineGeometry, WindowForm};
 use crate::layout::workspace::{Workspace, WorkspaceAddWindowTarget};
 
+#[test]
+fn keyboard_boundary_query_uses_shared_column_tab_constraints_without_mutation() {
+    use std::cmp::Ordering;
+    for scale in [1., 1.25] {
+        for display in [ColumnDisplay::Normal, ColumnDisplay::Tabbed] {
+            let mut options = Options::default();
+            options.layout.default_column_display = display;
+            options.layout.border.off = false;
+            options.layout.border.width = 1.3;
+            let options = Rc::new(options);
+            let mut space = scrolling(scale, options.clone());
+            let mut clients = Vec::new();
+            for id in 1..=2 {
+                let mut params = TestWindowParams::new(id);
+                params.bbox = Rectangle::from_size((700, 500).into());
+                params.min_max_size = (
+                    (
+                        if id == 1 { 100 } else { 240 },
+                        if id == 1 { 100 } else { 180 },
+                    )
+                        .into(),
+                    (0, 0).into(),
+                );
+                let client = TestWindow::new(params);
+                let tile = Tile::new(
+                    client.clone(),
+                    space.view_size(),
+                    scale,
+                    space.clock().clone(),
+                    options.clone(),
+                );
+                if id == 1 {
+                    space.add_tile(None, tile, true, ColumnWidth::Fixed(700.), false, None);
+                } else {
+                    space.add_tile_to_column(0, None, tile, false);
+                }
+                clients.push(client);
+            }
+            settle(&mut space);
+            assert!(
+                !space
+                    .keyboard_resize_intent(
+                        &1,
+                        ShrinkAxis::Horizontal,
+                        SizeChange::AdjustFixed(-10)
+                    )
+                    .unwrap()
+                    .at_minimum
+            );
+            space.set_window_width(Some(&1), SizeChange::SetFixed(0));
+            space.set_window_height(Some(&1), SizeChange::SetFixed(0));
+            settle(&mut space);
+            let requests = clients
+                .iter()
+                .map(TestWindow::requested_size)
+                .collect::<Vec<_>>();
+            let sizes = space
+                .tiles()
+                .map(|tile| tile.tile_size())
+                .collect::<Vec<_>>();
+            for axis in [ShrinkAxis::Horizontal, ShrinkAxis::Vertical] {
+                let intent = space
+                    .keyboard_resize_intent(&1, axis, SizeChange::AdjustProportion(-0.1))
+                    .unwrap();
+                assert!(intent.at_minimum, "{scale} {display:?} {axis:?}");
+                assert_eq!(intent.direction, Ordering::Less);
+                assert_eq!(
+                    space
+                        .keyboard_resize_intent(&1, axis, SizeChange::AdjustFixed(0))
+                        .unwrap()
+                        .direction,
+                    Ordering::Equal
+                );
+                assert_eq!(
+                    space
+                        .keyboard_resize_intent(&1, axis, SizeChange::SetFixed(700))
+                        .unwrap()
+                        .direction,
+                    Ordering::Greater
+                );
+            }
+            assert_eq!(
+                requests,
+                clients
+                    .iter()
+                    .map(TestWindow::requested_size)
+                    .collect::<Vec<_>>()
+            );
+            assert_eq!(
+                sizes,
+                space
+                    .tiles()
+                    .map(|tile| tile.tile_size())
+                    .collect::<Vec<_>>()
+            );
+            assert!(clients[0].size().w >= 240);
+            if display == ColumnDisplay::Tabbed {
+                assert!(clients[0].size().h >= 180);
+            }
+            space.verify_invariants();
+        }
+    }
+}
+
 fn tile(id: usize, scale: f64, options: Rc<Options>) -> Tile<TestWindow> {
     let mut params = TestWindowParams::new(id);
     params.bbox = Rectangle::from_size((900, 700).into());

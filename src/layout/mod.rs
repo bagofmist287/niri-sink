@@ -1767,14 +1767,11 @@ impl<W: LayoutElement> Layout<W> {
         id: &W::Id,
         target: Size<f64, Logical>,
         animate: bool,
-    ) {
-        if let Some(tile) = self
-            .workspaces_mut()
+    ) -> bool {
+        self.workspaces_mut()
             .flat_map(|ws| ws.tiles_mut())
             .find(|tile| tile.window().id() == id)
-        {
-            tile.set_shrink_preview(target, animate);
-        }
+            .is_some_and(|tile| tile.set_shrink_preview(target, animate))
     }
 
     pub(crate) fn clear_shrink_previews(&mut self) {
@@ -3288,6 +3285,21 @@ impl<W: LayoutElement> Layout<W> {
             return;
         };
         workspace.set_column_width(change);
+    }
+
+    pub(crate) fn keyboard_resize_intent(
+        &self,
+        id: &W::Id,
+        axis: shrink_expand::ShrinkAxis,
+        change: SizeChange,
+    ) -> Option<shrink_expand::KeyboardResizeIntent> {
+        if self.interactive_move.is_some() || self.dnd.is_some() {
+            return None;
+        }
+        self.workspaces()
+            .find(|(_, _, ws)| ws.has_window(id))?
+            .2
+            .keyboard_resize_intent(id, axis, change)
     }
 
     pub fn set_window_width(&mut self, window: Option<&W::Id>, change: SizeChange) {

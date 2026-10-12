@@ -1955,6 +1955,19 @@ impl<W: LayoutElement> Workspace<W> {
         }
     }
 
+    pub(super) fn keyboard_resize_intent(
+        &self,
+        id: &W::Id,
+        axis: super::shrink_expand::ShrinkAxis,
+        change: SizeChange,
+    ) -> Option<super::shrink_expand::KeyboardResizeIntent> {
+        if self.floating.has_window(id) {
+            self.floating.keyboard_resize_intent(id, axis, change)
+        } else {
+            self.scrolling.keyboard_resize_intent(id, axis, change)
+        }
+    }
+
     pub fn set_window_width(&mut self, window: Option<&W::Id>, change: SizeChange) {
         if window.is_some_and(|id| self.sink.depth(id).is_some()) {
             return;

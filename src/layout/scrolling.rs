@@ -12,7 +12,9 @@ use smithay::utils::{Logical, Point, Rectangle, Scale, Serial, Size};
 
 use super::closing_window::{ClosingWindow, ClosingWindowRenderElement};
 use super::monitor::InsertPosition;
-use super::shrink_expand::{NormalSizePlan, ShrinkAxis, SpineGeometry, SpinePlans};
+use super::shrink_expand::{
+    KeyboardResizeIntent, NormalSizePlan, ShrinkAxis, SpineGeometry, SpinePlans,
+};
 use super::tab_indicator::{TabIndicator, TabIndicatorRenderElement, TabInfo};
 use super::tile::{Tile, TileRenderElement, TileRenderSnapshot};
 use super::workspace::{InteractiveResize, ResolvedSize};
@@ -2995,6 +2997,51 @@ impl<W: LayoutElement> ScrollingSpace<W> {
         self.data[col_idx].update(col);
     }
 
+    pub(super) fn keyboard_resize_intent(
+        &self,
+        id: &W::Id,
+        axis: ShrinkAxis,
+        change: SizeChange,
+    ) -> Option<KeyboardResizeIntent> {
+        let col = self.columns.iter().find(|col| col.contains(id))?;
+        let idx = col.tiles.iter().position(|tile| tile.window().id() == id)?;
+        let tile = &col.tiles[idx];
+        if tile.is_spine() || !col.pending_sizing_mode().is_normal() {
+            return None;
+        }
+        let rows = col
+            .tiles
+            .iter()
+            .zip(&col.data)
+            .map(|(tile, data)| TileSizing::new(tile, data.height))
+            .collect::<Vec<_>>();
+        let current = col.compute_tile_sizes(&rows)[idx];
+        let (extent, minimum, client, requested) = match axis {
+            ShrinkAxis::Horizontal => (
+                current.w,
+                col.compute_tile_sizes_at_width(&rows, ColumnWidth::Fixed(0.))[idx].w,
+                tile.window_width_for_tile_width(current.w),
+                col.resolve_column_width(col.column_width_change(change, Some(idx))),
+            ),
+            ShrinkAxis::Vertical => {
+                let mut min_rows = rows;
+                for row in &mut min_rows {
+                    row.height = WindowHeight::auto_1();
+                }
+                min_rows[idx].height = WindowHeight::Fixed(0.);
+                (
+                    current.h,
+                    col.compute_tile_sizes(&min_rows)[idx].h,
+                    tile.window_height_for_tile_height(current.h),
+                    tile.tile_height_for_window_height(col.window_height_change(change, idx)),
+                )
+            }
+        };
+        Some(KeyboardResizeIntent::new(
+            axis, extent, minimum, client, requested, change,
+        ))
+    }
+
     /// Uses the same native maximized area for stored windows and normal columns.
     pub(super) fn maximized_size(&self) -> Size<f64, Logical> {
         self.parent_area.size
@@ -5262,7 +5309,7 @@ impl<W: LayoutElement> Column<W> {
         self.update_tile_sizes(true);
     }
 
-    fn set_column_width(&mut self, change: SizeChange, tile_idx: Option<usize>, animate: bool) {
+    fn column_width_change(&self, change: SizeChange, tile_idx: Option<usize>) -> ColumnWidth {
         let current = if self.is_full_width || self.is_pending_maximized {
             ColumnWidth::Proportion(1.)
         } else {
@@ -5275,7 +5322,7 @@ impl<W: LayoutElement> Column<W> {
         const MAX_PX: f64 = 100000.;
         const MAX_F: f64 = 10000.;
 
-        let width = match (current, change) {
+        match (current, change) {
             (_, SizeChange::SetFixed(fixed)) => {
                 // As a special case, setting a fixed column width will compute it in such a way
                 // that the specified (usually active) window gets that width. This is the
@@ -5308,9 +5355,11 @@ impl<W: LayoutElement> Column<W> {
                 let proportion = (current + delta / 100.).clamp(0., MAX_F);
                 ColumnWidth::Proportion(proportion)
             }
-        };
+        }
+    }
 
-        self.width = width;
+    fn set_column_width(&mut self, change: SizeChange, tile_idx: Option<usize>, animate: bool) {
+        self.width = self.column_width_change(change, tile_idx);
         self.preset_width_idx = None;
         self.is_full_width = false;
         self.is_pending_maximized = false;
@@ -5329,6 +5378,11 @@ impl<W: LayoutElement> Column<W> {
             self.convert_heights_to_auto();
         }
 
+        let window_height = self.window_height_change(change, tile_idx);
+        self.apply_window_height(window_height, tile_idx, animate);
+    }
+
+    fn window_height_change(&self, change: SizeChange, tile_idx: usize) -> f64 {
         let current = self.data[tile_idx].height;
         let tile = &self.tiles[tile_idx];
         let current_window_px = match current {
@@ -5353,7 +5407,7 @@ impl<W: LayoutElement> Column<W> {
             (current_tile_px + gaps) / full
         };
 
-        let window_height = match change {
+        match change {
             SizeChange::SetFixed(fixed) => f64::from(fixed),
             SizeChange::SetProportion(proportion) => {
                 let tile_height = (working_size - gaps) * (proportion / 100.) - gaps - extra_size;
@@ -5365,9 +5419,7 @@ impl<W: LayoutElement> Column<W> {
                 let tile_height = (working_size - gaps) * proportion - gaps - extra_size;
                 tile.window_height_for_tile_height(tile_height)
             }
-        };
-
-        self.apply_window_height(window_height, tile_idx, animate);
+        }
     }
 
     fn apply_window_height(&mut self, mut window_height: f64, tile_idx: usize, animate: bool) {

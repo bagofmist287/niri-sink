@@ -32,6 +32,64 @@ pub enum Rejected {
 }
 
 impl State {
+    /// Intercepts only eligible boundary/repeated Shrink intent before common grab side effects.
+    pub(crate) fn handle_keyboard_shrink_boundary(&mut self, action: &niri_config::Action) -> bool {
+        use niri_config::Action;
+        use std::cmp::Ordering;
+        if !self.niri.config.borrow().shrink_expand.enabled || self.niri.screenshot_ui.is_open() {
+            return false;
+        }
+        let (axis, change, explicit_id) = match action {
+            Action::SetColumnWidth(change) | Action::SetWindowWidth(change) => {
+                (ShrinkAxis::Horizontal, *change, None)
+            }
+            Action::SetWindowHeight(change) => (ShrinkAxis::Vertical, *change, None),
+            Action::SetWindowWidthById { id, change } => {
+                (ShrinkAxis::Horizontal, *change, Some(*id))
+            }
+            Action::SetWindowHeightById { id, change } => {
+                (ShrinkAxis::Vertical, *change, Some(*id))
+            }
+            _ => return false,
+        };
+        if self.niri.shrink_expand.preview().is_some() && !self.shrink_preview_valid() {
+            self.cancel_shrink_expand_preview();
+        }
+        let Some(target) = self.niri.layout.focus() else {
+            return false;
+        };
+        if explicit_id.is_some_and(|id| id != target.id().get()) {
+            return false;
+        }
+        let window = target.window.clone();
+        let Some(intent) = self
+            .niri
+            .layout
+            .keyboard_resize_intent(&window, axis, change)
+        else {
+            return false;
+        };
+        let selected_axis = self.niri.shrink_expand.preview().and_then(|preview| {
+            if let Kind::ShrinkTimed(axis) = preview.record.kind {
+                Some(axis)
+            } else {
+                None
+            }
+        });
+        if selected_axis == Some(axis) && intent.direction == Ordering::Greater {
+            self.cancel_shrink_expand_preview();
+            return false;
+        }
+        if intent.direction != Ordering::Less || (!intent.at_minimum && selected_axis != Some(axis))
+        {
+            return false;
+        }
+        match self.begin_shrink_preview(Some(intent.axis)) {
+            Ok(_) | Err(Rejected::Blocked) => true,
+            Err(_) => false,
+        }
+    }
+
     /// Used before common action side effects by both IPC and native bindings.
     pub(crate) fn dispatch_shrink_expand_action(
         &mut self,
@@ -483,6 +541,25 @@ impl State {
     pub(crate) fn refresh_shrink_expand_operations(&mut self) {
         if self.niri.shrink_expand.preview().is_some() && !self.shrink_preview_valid() {
             self.cancel_shrink_expand_preview();
+        }
+        if let Some(preview) = self.niri.shrink_expand.preview() {
+            if let Kind::ShrinkTimed(axis) = preview.record.kind {
+                let window = self.niri.layout.focus().unwrap().window.clone();
+                let behavior = self.niri.config.borrow().shrink_expand;
+                let plan = self
+                    .niri
+                    .layout
+                    .shrink_plans(&window, behavior.thickness)
+                    .unwrap()
+                    .get(axis);
+                if self.niri.layout.set_shrink_preview(
+                    &window,
+                    plan.geometry.outer_size(),
+                    behavior.animate,
+                ) {
+                    self.niri.queue_redraw_all();
+                }
+            }
         }
         self.refresh_expand_focus_lease();
         let layout = &self.niri.layout;

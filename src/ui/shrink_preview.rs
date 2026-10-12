@@ -46,13 +46,14 @@ impl ShrinkPreview {
         to: Size<f64, Logical>,
         config: niri_config::Animation,
         animate: bool,
-    ) {
+    ) -> bool {
         if self.to == to {
-            return;
+            return false;
         }
         self.from = self.pose();
         self.to = to;
         self.animation = animate.then(|| Animation::new(self.clock.clone(), 0., 1., 0., config));
+        true
     }
 
     pub fn pose(&self) -> Size<f64, Logical> {

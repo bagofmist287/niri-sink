@@ -10,6 +10,184 @@ use crate::layout::SizingMode;
 struct ShrinkIpcClient(std::io::BufReader<std::os::unix::net::UnixStream>);
 
 #[test]
+fn keyboard_minimum_boundary_repeats_keep_axis_and_grow_restores_native_resize() {
+    use crate::shrink_expand::{Kind, Phase};
+    use niri_config::Action;
+    use niri_ipc::SizeChange;
+    for floating in [false, true] {
+        for axis in [ShrinkAxis::Horizontal, ShrinkAxis::Vertical] {
+            let (mut fixture, client, surfaces) = timed_shrink_fixture(2, floating, 60000);
+            fixture
+                .client(client)
+                .window(surfaces.last().unwrap())
+                .xdg_toplevel
+                .set_min_size(150, 120);
+            fixture
+                .client(client)
+                .window(surfaces.last().unwrap())
+                .commit();
+            fixture.double_roundtrip(client);
+            let window = fixture.niri().layout.focus().unwrap().window.clone();
+            let focus = fixture.niri().keyboard_focus.surface().cloned();
+            let action = |change| match axis {
+                ShrinkAxis::Horizontal => Action::SetColumnWidth(change),
+                ShrinkAxis::Vertical => Action::SetWindowHeight(change),
+            };
+            fixture
+                .niri_state()
+                .do_action(action(SizeChange::AdjustFixed(-10000)), false);
+            fixture.double_roundtrip(client);
+            assert!(fixture.niri().shrink_expand.preview().is_none());
+            assert!(!fixture.niri().layout.is_spine(&window));
+            fixture
+                .niri_state()
+                .do_action(action(SizeChange::AdjustFixed(-10)), false);
+            fixture.double_roundtrip(client);
+            let first = fixture
+                .niri()
+                .shrink_expand
+                .preview()
+                .unwrap()
+                .record
+                .clone();
+            assert_eq!(first.kind, Kind::ShrinkTimed(axis));
+            assert_eq!(fixture.niri().keyboard_focus.surface().cloned(), focus);
+            fixture
+                .niri_state()
+                .do_action(action(SizeChange::AdjustFixed(0)), false);
+            fixture.double_roundtrip(client);
+            assert_eq!(
+                fixture
+                    .niri()
+                    .shrink_expand
+                    .preview()
+                    .unwrap()
+                    .record
+                    .revision,
+                first.revision
+            );
+            fixture
+                .niri_state()
+                .do_action(action(SizeChange::AdjustProportion(-1.)), false);
+            fixture.double_roundtrip(client);
+            let repeated = fixture
+                .niri()
+                .shrink_expand
+                .preview()
+                .unwrap()
+                .record
+                .clone();
+            assert_eq!(repeated.id, first.id);
+            assert!(repeated.revision > first.revision);
+            assert_eq!(repeated.kind, first.kind);
+            fixture
+                .niri_state()
+                .do_action(action(SizeChange::SetFixed(220)), false);
+            fixture.double_roundtrip(client);
+            assert!(fixture.niri().shrink_expand.preview().is_none());
+            assert!(fixture.niri().shrink_preview_timer.is_none());
+            assert!(!fixture.niri().layout.is_spine(&window));
+            let mapped = fixture.niri().layout.focus().unwrap();
+            let requested = mapped.requested_size().unwrap();
+            assert_eq!(
+                match axis {
+                    ShrinkAxis::Horizontal => requested.w,
+                    ShrinkAxis::Vertical => requested.h,
+                },
+                220
+            );
+            assert!(fixture
+                .niri()
+                .shrink_expand
+                .records()
+                .any(|r| r.id == first.id && r.phase == Phase::Cancelled));
+            assert!(fixture
+                .niri_state()
+                .confirm_shrink_preview(repeated.ticket())
+                .is_none());
+        }
+    }
+}
+
+#[test]
+fn keyboard_boundary_by_id_requires_actual_focus_and_free_axis_keeps_deadline() {
+    use niri_config::Action;
+    use niri_ipc::SizeChange;
+    let (mut fixture, client, _) = timed_shrink_fixture(2, true, 60000);
+    let target = fixture.niri().layout.focus().unwrap().id().get();
+    let other = fixture
+        .niri()
+        .layout
+        .windows()
+        .find(|(_, w)| w.id().get() != target)
+        .unwrap()
+        .1
+        .id()
+        .get();
+    fixture.niri_state().do_action(
+        Action::SetWindowWidthById {
+            id: other,
+            change: SizeChange::SetFixed(1),
+        },
+        false,
+    );
+    fixture.niri_state().do_action(
+        Action::SetWindowWidthById {
+            id: other,
+            change: SizeChange::AdjustFixed(-1),
+        },
+        false,
+    );
+    fixture.double_roundtrip(client);
+    assert!(fixture.niri().shrink_expand.preview().is_none());
+    fixture.niri_state().do_action(Action::ShrinkWindow, false);
+    fixture.double_roundtrip(client);
+    let before = fixture.niri().shrink_expand.preview().unwrap().clone();
+    assert_eq!(
+        before.record.kind,
+        crate::shrink_expand::Kind::ShrinkTimed(ShrinkAxis::Horizontal)
+    );
+    let pose = fixture
+        .niri()
+        .layout
+        .active_workspace()
+        .unwrap()
+        .tiles()
+        .find(|tile| tile.window().id().get() == target)
+        .unwrap()
+        .shrink_preview_pose()
+        .unwrap();
+    fixture
+        .niri_state()
+        .do_action(Action::SetWindowHeight(SizeChange::AdjustFixed(50)), false);
+    fixture.double_roundtrip(client);
+    let after = fixture.niri().shrink_expand.preview().unwrap();
+    assert_eq!(after.record, before.record);
+    assert_eq!(after.deadline, before.deadline);
+    let changed_pose = fixture
+        .niri()
+        .layout
+        .active_workspace()
+        .unwrap()
+        .tiles()
+        .find(|tile| tile.window().id().get() == target)
+        .unwrap()
+        .shrink_preview_pose()
+        .unwrap();
+    assert!(changed_pose.h > pose.h);
+    assert_eq!(changed_pose.w, pose.w);
+    fixture.niri_state().do_action(
+        Action::SetWindowWidthById {
+            id: target,
+            change: SizeChange::AdjustFixed(10),
+        },
+        false,
+    );
+    fixture.double_roundtrip(client);
+    assert!(fixture.niri().shrink_expand.preview().is_none());
+}
+
+#[test]
 fn shrink_ipc_disabled_and_pointer_grab_rejections_preserve_native_ownership() {
     use crate::input::click_grab::ClickGrab;
     use niri_ipc::{Action, Request, Response, ShrinkExpandOutcome};
