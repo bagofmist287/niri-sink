@@ -86,6 +86,10 @@ pub enum Msg {
     Action {
         #[command(subcommand)]
         action: Action,
+        /// Wait for a Shrink/Expand terminal record; optional bound in milliseconds (max 60000).
+        #[arg(long, require_equals = true, num_args = 0..=1, default_missing_value = "5000",
+            value_parser = clap::value_parser!(u64).range(1..=60000))]
+        wait: Option<u64>,
     },
     /// Change output configuration temporarily.
     ///
@@ -110,6 +114,12 @@ pub enum Msg {
     RequestError,
     /// Print the overview state.
     OverviewState,
+    /// Print current and retained Shrink/Expand operations.
+    ShrinkExpandState {
+        /// Select an operation; absent IDs are expired or unknown.
+        #[arg(long)]
+        operation_id: Option<u64>,
+    },
     /// List screencasts.
     Casts,
     /// Send a raw JSON request to the compositor, reading from stdin.

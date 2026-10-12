@@ -1695,15 +1695,24 @@ impl<W: LayoutElement> Layout<W> {
 
     /// Form query that includes the temporary native owner during a move.
     pub fn is_spine(&self, id: &W::Id) -> bool {
+        self.spine_axis(id).is_some()
+    }
+
+    /// Persistent locked axis, including the temporary native owner during a move.
+    pub fn spine_axis(&self, id: &W::Id) -> Option<shrink_expand::ShrinkAxis> {
+        let axis = |tile: &Tile<W>| match tile.form() {
+            shrink_expand::WindowForm::Spine(axis) => Some(axis),
+            shrink_expand::WindowForm::Normal => None,
+        };
         if let Some(InteractiveMoveState::Moving(move_)) = &self.interactive_move {
             if move_.tile.window().id() == id {
-                return move_.tile.is_spine();
+                return axis(&move_.tile);
             }
         }
         self.workspaces()
             .flat_map(|(_, _, ws)| ws.tiles())
             .find(|tile| tile.window().id() == id)
-            .is_some_and(Tile::is_spine)
+            .and_then(axis)
     }
 
     /// Depth in the workspace-local Sink stack; zero is the current top.

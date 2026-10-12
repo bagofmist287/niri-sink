@@ -24,6 +24,8 @@ fn legacy_inventory_defaults_to_normal_owners() {
     let window: Window = serde_json::from_str(LEGACY_WINDOW).unwrap();
     assert!(!window.is_sunk);
     assert_eq!(window.sink_depth, None);
+    assert_eq!(window.shrink_state, ShrinkState::Normal);
+    assert_eq!(window.shrink_axis, None);
     assert!(window.is_floating);
     let workspace: Workspace = serde_json::from_str(LEGACY_WORKSPACE).unwrap();
     assert_eq!(workspace.sink_count, 0);

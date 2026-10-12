@@ -709,6 +709,9 @@ impl State {
     }
 
     pub fn do_action(&mut self, action: Action, allow_when_locked: bool) {
+        if self.dispatch_shrink_expand_action(&action).is_some() {
+            return;
+        }
         if self.niri.is_locked() && !(allow_when_locked || allowed_when_locked(&action)) {
             return;
         }
@@ -757,6 +760,11 @@ impl State {
         }
 
         match action {
+            Action::ShrinkWindow
+            | Action::ExpandWindow(_)
+            | Action::ExpandAllWindows
+            | Action::ConfirmShrinkExpand
+            | Action::CancelShrinkExpand => unreachable!("handled before common grab side effects"),
             Action::Quit(skip_confirmation) => {
                 if !skip_confirmation && self.niri.exit_confirm_dialog.show() {
                     self.niri.queue_redraw_all();

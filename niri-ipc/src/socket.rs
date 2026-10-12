@@ -60,6 +60,18 @@ impl Socket {
         Ok(reply)
     }
 
+    /// Bounds blocking reads. `None` restores the socket's default unbounded reads.
+    pub fn set_read_timeout(&self, timeout: Option<std::time::Duration>) -> io::Result<()> {
+        self.stream.get_ref().set_read_timeout(timeout)
+    }
+
+    /// Reads one event after requesting [`Request::EventStream`].
+    pub fn read_event(&mut self) -> io::Result<Event> {
+        let mut buf = String::new();
+        self.stream.read_line(&mut buf)?;
+        Ok(serde_json::from_str(&buf)?)
+    }
+
     /// Starts reading event stream [`Event`]s from the socket.
     ///
     /// The returned function will block until the next [`Event`] arrives, then return it.

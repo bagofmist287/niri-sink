@@ -1,9 +1,10 @@
 # Shrink / Expand development configuration
 
-The `shrink/development` branch currently parses the configuration below.
-Shrink / Expand commands and input buffering are still under development.
-Internal spines now have independent rendering and compositor-owned hit regions. Setting `enabled true` does not yet enable a usable
-feature. The installed Sink session has not been replaced by this branch.
+The `shrink/development` branch provides the five base commands below when
+`enabled true`, with independent spine rendering and compositor-owned hit regions.
+Mouse buffering, adjacent selection, complete expansion visuals and disable-time
+restoration remain under development. This is a partial development candidate;
+the installed Sink session has not been replaced by this branch.
 
 ```kdl
 shrink-expand {
@@ -89,15 +90,15 @@ PNG and SVG are decoded by the installed GdkPixbuf loaders; unsupported or missi
 icons use the window fallback. App icon colours and aspect ratio are preserved. Sensitive capture targets replace the inner
 fill and caption with black, including when an unblocked caption is cached.
 These checks use an explicit software EGL test, not the installed session or a
-physical input device. No user Shrink/Expand command is available yet.
+physical input device. The base commands below use this renderer.
 
 The layout now carries the parsed behavior settings through global configuration
 updates. Changing `thickness` reallocates existing internal spines in tiled,
 floating and native Moving ownership, without requesting that size from the
 hidden client. It also updates workspaces retained while no output is present.
-Paint-only updates preserve their current thickness. This does not yet enable
-user actions or implement `enabled false` restoration; operation coordination
-remains under development.
+Paint-only updates preserve their current thickness. `enabled false` restoration
+still requires integration; existing spines can be expanded with the base commands
+while the feature is enabled.
 
 Icon source images are cached separately from title shaping. A changed title or
 text colour does not reread the app icon. A new app ID/physical icon size or layout
@@ -115,8 +116,7 @@ changes that shape immediately without changing the buffer timer. Cancellation
 removes the preview; a successful form commit also clears it. Output, screencast
 and screenshot rendering use separate caches, and capture passes preserve the
 output's presentation-feedback mapping. CPU, Wayland fixture and software EGL
-checks cover these internal paths; public actions and mouse buffering remain
-under development.
+checks cover these paths; mouse buffering remains under development.
 
 Internal direct and workspace-wide expansion now use the current native slot's
 normal size plan. Direct expansion selects that window, but waits for the
@@ -125,5 +125,46 @@ Navigation during that wait cancels the deferred focus handoff. Workspace-wide
 expansion includes hidden tabs and floating spines in one transaction, preserving
 ordinary focus or the absence of focus. Submitted operation records distinguish
 Ready, Deadline and TargetsRemoved; a late commit does not rewrite a terminal
-result. These paths are tested with real Wayland fixtures. They do not yet expose
-public commands, complete expansion visuals or restore all workspaces on disable.
+result. These paths are tested with real Wayland fixtures and real IPC sockets.
+Complete expansion visuals and restoration of all workspaces on disable remain
+under development.
+
+## Base commands and operation observation
+
+| KDL action | CLI action | Behavior |
+| --- | --- | --- |
+| `shrink-window` | `shrink-window` | First-axis prediction; repeat changes axis and refreshes the same timer. |
+| `expand-window id=42` | `expand-window --id 42` | Direct expansion by ID, without a selection preview. |
+| `expand-all-windows` | `expand-all-windows` | One current-workspace batch including hidden tabs and floating spines. |
+| `confirm-shrink-expand` | `confirm-shrink-expand` | Revalidate and submit the current preview. |
+| `cancel-shrink-expand` | `cancel-shrink-expand` | Cancel the current preview. |
+
+`expand-nearby-window` is not available yet. Opposite Expand input during a Shrink
+preview only cancels that preview, including explicit-ID and batch commands.
+Escape also cancels. The action dispatcher checks seat ownership before the
+native common grab side effects, preserving pointer/touch/IME constraints.
+
+For example, on a binary built from this branch:
+
+```sh
+niri msg --json action shrink-window
+niri msg --json action --wait expand-window --id 42
+niri msg --json action --wait=2000 expand-all-windows
+niri msg --json shrink-expand-state --operation-id 7
+```
+
+The five actions return `ShrinkExpandAction` receipts with operation/workspace IDs,
+actual targets, Previewing/Submitted/Cancelled/NoChange and `waiting_for_clients`.
+Ordinary actions retain `Handled`. Submitted asserts native form/allocation, not a
+client response. `--wait` subscribes to the event stream and includes its terminal
+record, with a 5000 ms default bound or an explicit 1–60000 ms bound. A Deadline
+result is reported as Deadline. Unknown or expired IDs stop observation with an
+error. A no-op creates no operation to wait for.
+
+`ShrinkExpandState` queries and initial `ShrinkExpandChanged` events include the
+current preview, submitted batches and the most recent 64 terminal records, closing
+the receipt/subscription race. Snapshots update on operation revisions and outcomes,
+without animation-frame countdown events. Window inventory includes `shrink_state`
+(Normal/Spine) and `shrink_axis` only for a spine. Previews keep Normal; actual form
+changes use existing window-change events and keep the same window ID. Client
+`window_size` and native `tile_size` retain their distinct meanings.

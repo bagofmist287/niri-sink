@@ -32,6 +32,87 @@ pub enum Rejected {
 }
 
 impl State {
+    /// Used before common action side effects by both IPC and native bindings.
+    pub(crate) fn dispatch_shrink_expand_action(
+        &mut self,
+        action: &niri_config::Action,
+    ) -> Option<Result<niri_ipc::ShrinkExpandActionReceipt, String>> {
+        use super::Phase;
+        use niri_config::Action;
+        use niri_ipc::{ShrinkExpandActionReceipt as Receipt, ShrinkExpandOutcome as Outcome};
+        if !matches!(
+            action,
+            Action::ShrinkWindow
+                | Action::ExpandWindow(_)
+                | Action::ExpandAllWindows
+                | Action::ConfirmShrinkExpand
+                | Action::CancelShrinkExpand
+        ) {
+            return None;
+        }
+        if self.niri.is_locked() {
+            return Some(Err("Shrink/Expand is blocked while locked".into()));
+        }
+        if !self.niri.config.borrow().shrink_expand.enabled
+            && !matches!(action, Action::CancelShrinkExpand)
+        {
+            return Some(Err("Shrink/Expand is disabled".into()));
+        }
+        let result = match action {
+            Action::ShrinkWindow => self.begin_shrink_preview(None).map(Some),
+            Action::ExpandWindow(id) => self.expand_spine_window(*id),
+            Action::ExpandAllWindows => self.expand_all_spines(),
+            Action::ConfirmShrinkExpand => {
+                let ticket = self.niri.shrink_expand.preview().map(|p| p.record.ticket());
+                Ok(ticket.and_then(|ticket| self.confirm_shrink_preview(ticket)))
+            }
+            Action::CancelShrinkExpand => Ok(self.cancel_shrink_expand_preview()),
+            _ => unreachable!(),
+        };
+        Some(
+            result
+                .map(|record| {
+                    if let Some(record) = record {
+                        Receipt {
+                            operation_id: Some(record.id),
+                            workspace_id: Some(record.workspace),
+                            targets: record.targets,
+                            outcome: match record.phase {
+                                Phase::Previewing => Outcome::Previewing,
+                                Phase::Cancelled => Outcome::Cancelled,
+                                Phase::Submitted | Phase::Settled => Outcome::Submitted,
+                            },
+                            waiting_for_clients: self
+                                .niri
+                                .shrink_expand
+                                .records()
+                                .any(|r| r.id == record.id && r.phase == Phase::Submitted),
+                        }
+                    } else {
+                        Receipt {
+                            operation_id: None,
+                            workspace_id: self
+                                .niri
+                                .layout
+                                .active_workspace()
+                                .map(|ws| ws.id().get()),
+                            targets: Vec::new(),
+                            outcome: Outcome::NoChange,
+                            waiting_for_clients: false,
+                        }
+                    }
+                })
+                .map_err(|reason| match reason {
+                    Rejected::Disabled => "Shrink/Expand is disabled".into(),
+                    Rejected::Blocked => {
+                        "Shrink/Expand is blocked by current seat ownership".into()
+                    }
+                    Rejected::NoTarget => "Shrink/Expand target is unavailable".into(),
+                    Rejected::NoLegalAxis => "No legal Shrink axis is available".into(),
+                }),
+        )
+    }
+
     fn can_expand_spines(&self) -> bool {
         self.can_recall_sink(false)
             && !self.niri.screenshot_ui.is_open()
@@ -135,6 +216,7 @@ impl State {
             .niri
             .shrink_expand
             .submit_immediate(workspace, targets, kind, deadline);
+        self.ipc_refresh_shrink_expand();
         if let Some(window) = focus {
             self.cancel_expand_focus_lease();
             self.niri.layout.activate_window(&window);
@@ -274,6 +356,7 @@ impl State {
         );
         self.arm_shrink_preview_timer();
         self.niri.queue_redraw_all();
+        self.ipc_refresh_shrink_expand();
         Ok(record)
     }
 
@@ -330,6 +413,7 @@ impl State {
         if record.is_some() {
             self.niri.queue_redraw_all();
         }
+        self.ipc_refresh_shrink_expand();
         record
     }
 
@@ -359,6 +443,7 @@ impl State {
             .shrink_expand
             .submit(ticket, preview.record.targets, None)
             .unwrap();
+        self.ipc_refresh_shrink_expand();
         self.refresh_shrink_expand_operations();
         self.niri.queue_redraw_all();
         Some(record)
@@ -414,5 +499,6 @@ impl State {
                 TargetState::Ready
             }
         });
+        self.ipc_refresh_shrink_expand();
     }
 }

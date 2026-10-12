@@ -58,13 +58,17 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
+pub mod shrink_expand;
 pub mod socket;
+pub use shrink_expand::*;
 pub mod state;
 
 /// Request from client to niri.
 #[derive(Debug, Serialize, Deserialize, Clone)]
 #[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
 pub enum Request {
+    /// Current and retained experimental Shrink/Expand operation records.
+    ShrinkExpandState,
     /// Request the version string for the running niri instance.
     Version,
     /// Request information about connected outputs.
@@ -135,6 +139,10 @@ pub type Reply = Result<Response, String>;
 #[derive(Debug, Serialize, Deserialize, Clone)]
 #[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
 pub enum Response {
+    /// Actual Shrink/Expand seat-dispatch result, not unconditional Handled.
+    ShrinkExpandAction(ShrinkExpandActionReceipt),
+    /// Current and retained operation snapshot.
+    ShrinkExpandState(ShrinkExpandState),
     /// A request that does not need a response was handled successfully.
     Handled,
     /// The version string for the running niri instance.
@@ -192,6 +200,20 @@ pub struct PickedColor {
 #[cfg_attr(feature = "clap", command(subcommand_help_heading = "Actions"))]
 #[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
 pub enum Action {
+    /// Preview shrinking the focused normal window; repeated input changes axis.
+    ShrinkWindow {},
+    /// Directly expand a spine by its stable window identity.
+    ExpandWindow {
+        /// Required window ID.
+        #[cfg_attr(feature = "clap", arg(long))]
+        id: u64,
+    },
+    /// Expand all tiled/floating spines in the current workspace snapshot.
+    ExpandAllWindows {},
+    /// Confirm the current Shrink/Expand preview after revalidation.
+    ConfirmShrinkExpand {},
+    /// Cancel the current preview without executing another operation.
+    CancelShrinkExpand {},
     /// Sink the active normal window into its workspace background stack (experimental fork).
     SinkWindow {},
     /// Restore the top window from the active workspace background stack (experimental fork).
@@ -1364,6 +1386,12 @@ pub struct Window {
     /// Depth in that stack, with zero indicating the top; absent for normal windows.
     #[serde(default)]
     pub sink_depth: Option<usize>,
+    /// Persistent Shrink form; previews do not change this.
+    #[serde(default)]
+    pub shrink_state: ShrinkState,
+    /// Locked axis, present only for a spine.
+    #[serde(default)]
+    pub shrink_axis: Option<ShrinkAxis>,
     /// Whether this window requests your attention.
     pub is_urgent: bool,
     /// Position- and size-related properties of the window.
@@ -1621,6 +1649,11 @@ pub enum CastTarget {
 #[derive(Serialize, Deserialize, Debug, Clone)]
 #[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
 pub enum Event {
+    /// Complete replacement operation snapshot, also included in the initial event prefix.
+    ShrinkExpandChanged {
+        /// Current preview, submitted operations and bounded terminal records.
+        state: ShrinkExpandState,
+    },
     /// The workspace configuration has changed.
     WorkspacesChanged {
         /// The new workspace configuration.

@@ -336,6 +336,11 @@ pub enum Action {
     MoveWorkspaceToMonitorNext,
     SinkWindow,
     PullWindow,
+    ShrinkWindow,
+    ExpandWindow(#[knuffel(property(name = "id"))] u64),
+    ExpandAllWindows,
+    ConfirmShrinkExpand,
+    CancelShrinkExpand,
     ToggleWindowFloating,
     #[knuffel(skip)]
     ToggleWindowFloatingById(u64),
@@ -672,6 +677,11 @@ impl From<niri_ipc::Action> for Action {
             niri_ipc::Action::DebugToggleDamage {} => Self::DebugToggleDamage,
             niri_ipc::Action::SinkWindow {} => Self::SinkWindow,
             niri_ipc::Action::PullWindow {} => Self::PullWindow,
+            niri_ipc::Action::ShrinkWindow {} => Self::ShrinkWindow,
+            niri_ipc::Action::ExpandWindow { id } => Self::ExpandWindow(id),
+            niri_ipc::Action::ExpandAllWindows {} => Self::ExpandAllWindows,
+            niri_ipc::Action::ConfirmShrinkExpand {} => Self::ConfirmShrinkExpand,
+            niri_ipc::Action::CancelShrinkExpand {} => Self::CancelShrinkExpand,
             niri_ipc::Action::ToggleWindowFloating { id: None } => Self::ToggleWindowFloating,
             niri_ipc::Action::ToggleWindowFloating { id: Some(id) } => {
                 Self::ToggleWindowFloatingById(id)

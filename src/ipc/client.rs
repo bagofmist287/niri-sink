@@ -22,6 +22,7 @@ pub fn handle_msg(mut msg: Msg, json: bool, print_request: bool) -> anyhow::Resu
             Action::Screenshot { path, .. }
             | Action::ScreenshotScreen { path, .. }
             | Action::ScreenshotWindow { path, .. },
+        ..
     } = &mut msg
     {
         if let Some(path) = path {
@@ -36,7 +37,7 @@ pub fn handle_msg(mut msg: Msg, json: bool, print_request: bool) -> anyhow::Resu
         Msg::FocusedOutput => Request::FocusedOutput,
         Msg::PickWindow => Request::PickWindow,
         Msg::PickColor => Request::PickColor,
-        Msg::Action { action } => Request::Action(action.clone()),
+        Msg::Action { action, .. } => Request::Action(action.clone()),
         Msg::Output { output, action } => Request::Output {
             output: output.clone(),
             action: action.clone(),
@@ -48,6 +49,7 @@ pub fn handle_msg(mut msg: Msg, json: bool, print_request: bool) -> anyhow::Resu
         Msg::EventStream => Request::EventStream,
         Msg::RequestError => Request::ReturnError,
         Msg::OverviewState => Request::OverviewState,
+        Msg::ShrinkExpandState { .. } => Request::ShrinkExpandState,
         Msg::Casts => Request::Casts,
         Msg::RawRequest => {
             let mut buf = Vec::new();
@@ -333,10 +335,67 @@ pub fn handle_msg(mut msg: Msg, json: bool, print_request: bool) -> anyhow::Resu
                 println!("No color was picked.");
             }
         }
-        Msg::Action { .. } => {
-            let Response::Handled = response else {
-                bail!("unexpected response: expected Handled, got {response:?}");
+        Msg::Action { wait, .. } => match response {
+            Response::Handled if wait.is_some() => {
+                bail!("This action does not provide a Shrink/Expand operation to wait for")
+            }
+            Response::Handled => (),
+            Response::ShrinkExpandAction(receipt) => {
+                let terminal = match (wait, receipt.operation_id) {
+                    (Some(ms), Some(id)) => Some(wait_for_shrink_operation(
+                        &mut socket,
+                        id,
+                        std::time::Duration::from_millis(ms),
+                    )?),
+                    _ => None,
+                };
+                if json {
+                    if wait.is_some() {
+                        println!("{}", json!({"receipt": receipt, "operation": terminal}));
+                    } else {
+                        println!("{}", serde_json::to_string(&receipt)?);
+                    }
+                } else {
+                    println!(
+                        "{:?}; operation {:?}; targets {:?}; waiting for clients: {}",
+                        receipt.outcome,
+                        receipt.operation_id,
+                        receipt.targets,
+                        receipt.waiting_for_clients
+                    );
+                    if let Some(terminal) = terminal {
+                        println!(
+                            "Operation {}: {:?}, reason {:?}",
+                            terminal.operation_id, terminal.phase, terminal.reason
+                        );
+                    }
+                }
+            }
+            _ => bail!("unexpected action response: {response:?}"),
+        },
+        Msg::ShrinkExpandState { operation_id } => {
+            let Response::ShrinkExpandState(state) = response else {
+                bail!("unexpected response: expected ShrinkExpandState, got {response:?}");
             };
+            if let Some(id) = operation_id {
+                let record = state
+                    .operations
+                    .iter()
+                    .find(|record| record.operation_id == id)
+                    .ok_or_else(|| anyhow!("Shrink/Expand operation {id}: expired or unknown"))?;
+                if json {
+                    println!("{}", serde_json::to_string(record)?);
+                } else {
+                    println!(
+                        "Operation {id}: {:?}, reason {:?}",
+                        record.phase, record.reason
+                    );
+                }
+            } else if json {
+                println!("{}", serde_json::to_string(&state)?);
+            } else {
+                println!("{state:#?}");
+            }
         }
         Msg::Output { output, .. } => {
             let Response::OutputConfigChanged(response) = response else {
@@ -466,6 +525,9 @@ pub fn handle_msg(mut msg: Msg, json: bool, print_request: bool) -> anyhow::Resu
                     Event::WindowsChanged { windows } => {
                         println!("Windows changed: {windows:?}");
                     }
+                    Event::ShrinkExpandChanged { state } => {
+                        println!("Shrink/Expand operations: {state:?}");
+                    }
                     Event::WindowOpenedOrChanged { window } => {
                         println!("Window opened or changed: {window:?}");
                     }
@@ -582,6 +644,45 @@ pub fn handle_msg(mut msg: Msg, json: bool, print_request: bool) -> anyhow::Resu
     }
 
     Ok(())
+}
+
+fn wait_for_shrink_operation(
+    socket: &mut Socket,
+    id: u64,
+    timeout: std::time::Duration,
+) -> anyhow::Result<niri_ipc::ShrinkExpandOperation> {
+    use niri_ipc::ShrinkExpandPhase;
+    let deadline = std::time::Instant::now() + timeout;
+    socket.set_read_timeout(Some(timeout))?;
+    let reply = socket
+        .send(Request::EventStream)
+        .context("starting Shrink/Expand operation observation")?;
+    if !matches!(reply, Ok(Response::Handled)) {
+        bail!("unexpected event-stream reply: {reply:?}");
+    }
+    loop {
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            bail!("timed out waiting for Shrink/Expand operation {id}");
+        }
+        socket.set_read_timeout(Some(remaining))?;
+        let event = socket
+            .read_event()
+            .with_context(|| format!("waiting for Shrink/Expand operation {id}"))?;
+        if let Event::ShrinkExpandChanged { state } = event {
+            let record = state
+                .operations
+                .into_iter()
+                .find(|record| record.operation_id == id)
+                .ok_or_else(|| anyhow!("Shrink/Expand operation {id}: expired or unknown"))?;
+            if matches!(
+                record.phase,
+                ShrinkExpandPhase::Cancelled | ShrinkExpandPhase::Settled
+            ) {
+                return Ok(record);
+            }
+        }
+    }
 }
 
 fn print_output(output: Output) -> anyhow::Result<()> {
@@ -836,6 +937,147 @@ mod tests {
     use insta::assert_snapshot;
 
     use super::*;
+
+    #[test]
+    fn shrink_cli_wait_handles_prefix_race_expired_ids_and_bounded_silent_server() {
+        use niri_ipc::{
+            ShrinkExpandFinishReason as Reason, ShrinkExpandKind, ShrinkExpandOperation,
+            ShrinkExpandPhase as Phase, ShrinkExpandState,
+        };
+        use std::io::{BufRead as _, Write as _};
+        use std::os::unix::net::UnixListener;
+        use std::sync::atomic::{AtomicU64, Ordering};
+        use std::time::{Duration, Instant};
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        struct Cleanup(std::path::PathBuf);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_file(&self.0);
+            }
+        }
+        for scenario in ["finished", "expired", "silent"] {
+            let path = std::env::temp_dir().join(format!(
+                "niri-shrink-wait-{}-{}.sock",
+                std::process::id(),
+                NEXT.fetch_add(1, Ordering::Relaxed)
+            ));
+            let cleanup = Cleanup(path.clone());
+            let listener = UnixListener::bind(&path).unwrap();
+            let server = std::thread::spawn(move || {
+                let (stream, _) = listener.accept().unwrap();
+                let mut reader = std::io::BufReader::new(stream);
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                assert!(matches!(
+                    serde_json::from_str::<Request>(&line).unwrap(),
+                    Request::EventStream
+                ));
+                writeln!(
+                    reader.get_mut(),
+                    "{}",
+                    serde_json::to_string(&niri_ipc::Reply::Ok(Response::Handled)).unwrap()
+                )
+                .unwrap();
+                let operations = if scenario == "expired" {
+                    vec![]
+                } else {
+                    vec![ShrinkExpandOperation {
+                        operation_id: 7,
+                        revision: 2,
+                        workspace_id: 1,
+                        targets: vec![8],
+                        kind: ShrinkExpandKind::ExpandDirect,
+                        phase: if scenario == "finished" {
+                            Phase::Settled
+                        } else {
+                            Phase::Submitted
+                        },
+                        reason: (scenario == "finished").then_some(Reason::Deadline),
+                    }]
+                };
+                writeln!(
+                    reader.get_mut(),
+                    "{}",
+                    serde_json::to_string(&Event::ShrinkExpandChanged {
+                        state: ShrinkExpandState { operations }
+                    })
+                    .unwrap()
+                )
+                .unwrap();
+                if scenario == "silent" {
+                    std::thread::sleep(Duration::from_millis(100));
+                }
+            });
+            let mut socket = Socket::connect_to(&path).unwrap();
+            let began = Instant::now();
+            let result = wait_for_shrink_operation(
+                &mut socket,
+                7,
+                if scenario == "silent" {
+                    Duration::from_millis(25)
+                } else {
+                    Duration::from_secs(2)
+                },
+            );
+            match scenario {
+                "finished" => assert_eq!(result.unwrap().reason, Some(Reason::Deadline)),
+                "expired" => assert!(result
+                    .unwrap_err()
+                    .to_string()
+                    .contains("expired or unknown")),
+                _ => {
+                    assert!(result.is_err());
+                    assert!(began.elapsed() < Duration::from_secs(1));
+                }
+            }
+            server.join().unwrap();
+            drop(cleanup);
+        }
+    }
+
+    #[test]
+    fn shrink_cli_actions_require_id_and_bounded_wait_option() {
+        use clap::Parser as _;
+        let cli = crate::cli::Cli::try_parse_from([
+            "niri",
+            "msg",
+            "action",
+            "--wait=40",
+            "expand-window",
+            "--id",
+            "7",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.subcommand,
+            Some(crate::cli::Sub::Msg {
+                msg: Msg::Action {
+                    action: Action::ExpandWindow { id: 7 },
+                    wait: Some(40)
+                },
+                ..
+            })
+        ));
+        let cli =
+            crate::cli::Cli::try_parse_from(["niri", "msg", "action", "--wait", "shrink-window"])
+                .unwrap();
+        assert!(matches!(
+            cli.subcommand,
+            Some(crate::cli::Sub::Msg {
+                msg: Msg::Action {
+                    wait: Some(5000),
+                    ..
+                },
+                ..
+            })
+        ));
+        for args in [
+            vec!["niri", "msg", "action", "expand-window"],
+            vec!["niri", "msg", "action", "--wait=60001", "shrink-window"],
+        ] {
+            assert!(crate::cli::Cli::try_parse_from(args).is_err());
+        }
+    }
 
     #[test]
     fn test_fmt_rounded() {

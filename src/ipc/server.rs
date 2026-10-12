@@ -185,6 +185,11 @@ fn on_new_ipc_client(state: &mut State, stream: UnixStream) {
     }
 }
 
+#[cfg(test)]
+pub(crate) fn attach_test_client(state: &mut State, stream: UnixStream) {
+    on_new_ipc_client(state, stream);
+}
+
 async fn handle_client(ctx: ClientCtx, stream: Async<'static, UnixStream>) -> anyhow::Result<()> {
     let (read, mut write) = stream.split();
     let mut read = BufReader::new(read);
@@ -389,15 +394,33 @@ async fn process(ctx: &ClientCtx, request: Request) -> Reply {
                 // Make sure some logic like workspace clean-up has a chance to run before doing
                 // actions.
                 state.niri.advance_animations();
-                state.do_action(action, false);
-                let _ = tx.send_blocking(());
+                let result = if let Some(result) = state.dispatch_shrink_expand_action(&action) {
+                    result.map(Response::ShrinkExpandAction)
+                } else {
+                    state.do_action(action, false);
+                    Ok(Response::Handled)
+                };
+                state.ipc_refresh_shrink_expand();
+                let _ = tx.send_blocking(result);
             });
 
             // Wait until the action has been processed before returning. This is important for a
             // few actions, for instance for DoScreenTransition this wait ensures that the screen
             // contents were sampled into the texture.
-            let _ = rx.recv().await;
-            Response::Handled
+            rx.recv()
+                .await
+                .map_err(|_| "error dispatching action".to_owned())??
+        }
+        Request::ShrinkExpandState => {
+            let (tx, rx) = async_channel::bounded(1);
+            ctx.event_loop.insert_idle(move |state| {
+                let _ = tx.send_blocking(state.niri.shrink_expand.ipc_state());
+            });
+            Response::ShrinkExpandState(
+                rx.recv()
+                    .await
+                    .map_err(|_| "error getting Shrink/Expand state".to_owned())?,
+            )
         }
         Request::Output { output, action } => {
             action.validate()?;
@@ -518,6 +541,7 @@ fn make_ipc_window(
     workspace_id: Option<WorkspaceId>,
     layout: WindowLayout,
     sink_depth: Option<usize>,
+    shrink_axis: Option<niri_ipc::ShrinkAxis>,
 ) -> niri_ipc::Window {
     with_toplevel_role(mapped.toplevel(), |role| niri_ipc::Window {
         id: mapped.id().get(),
@@ -529,6 +553,12 @@ fn make_ipc_window(
         is_floating: mapped.is_floating(),
         is_sunk: sink_depth.is_some(),
         sink_depth,
+        shrink_state: if shrink_axis.is_some() {
+            niri_ipc::ShrinkState::Spine
+        } else {
+            niri_ipc::ShrinkState::Normal
+        },
+        shrink_axis,
         is_urgent: mapped.is_urgent(),
         layout,
         focus_timestamp: mapped.get_focus_timestamp().map(Timestamp::from),
@@ -588,6 +618,21 @@ impl State {
         self.ipc_refresh_workspaces();
         self.ipc_refresh_windows();
         self.ipc_refresh_overview();
+        self.ipc_refresh_shrink_expand();
+    }
+
+    pub(crate) fn ipc_refresh_shrink_expand(&mut self) {
+        let Some(server) = &self.niri.ipc_server else {
+            return;
+        };
+        let snapshot = self.niri.shrink_expand.ipc_state();
+        let mut state = server.event_stream_state.borrow_mut();
+        if state.shrink_expand.state == snapshot {
+            return;
+        }
+        let event = Event::ShrinkExpandChanged { state: snapshot };
+        state.shrink_expand.apply(event.clone());
+        server.send_event(event);
     }
 
     fn ipc_refresh_workspaces(&mut self) {
@@ -718,8 +763,9 @@ impl State {
             }
 
             let sink_depth = layout.sink_depth(&mapped.window);
+            let shrink_axis = layout.spine_axis(&mapped.window).map(Into::into);
             let Some(ipc_win) = state.windows.get(&id) else {
-                let window = make_ipc_window(mapped, ws_id, window_layout, sink_depth);
+                let window = make_ipc_window(mapped, ws_id, window_layout, sink_depth, shrink_axis);
                 events.push(Event::WindowOpenedOrChanged { window });
                 return;
             };
@@ -728,14 +774,15 @@ impl State {
             let mut changed = ipc_win.workspace_id != workspace_id
                 || ipc_win.is_floating != mapped.is_floating()
                 || ipc_win.is_sunk != sink_depth.is_some()
-                || ipc_win.sink_depth != sink_depth;
+                || ipc_win.sink_depth != sink_depth
+                || ipc_win.shrink_axis != shrink_axis;
 
             changed |= with_toplevel_role(mapped.toplevel(), |role| {
                 ipc_win.title != role.title || ipc_win.app_id != role.app_id
             });
 
             if changed {
-                let window = make_ipc_window(mapped, ws_id, window_layout, sink_depth);
+                let window = make_ipc_window(mapped, ws_id, window_layout, sink_depth, shrink_axis);
                 events.push(Event::WindowOpenedOrChanged { window });
                 return;
             }

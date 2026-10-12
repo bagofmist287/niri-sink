@@ -59,6 +59,48 @@ impl Record {
     }
 }
 
+impl From<ShrinkAxis> for niri_ipc::ShrinkAxis {
+    fn from(axis: ShrinkAxis) -> Self {
+        match axis {
+            ShrinkAxis::Horizontal => Self::Horizontal,
+            ShrinkAxis::Vertical => Self::Vertical,
+        }
+    }
+}
+
+impl From<&Record> for niri_ipc::ShrinkExpandOperation {
+    fn from(record: &Record) -> Self {
+        use niri_ipc::{
+            ShrinkExpandFinishReason as Reason, ShrinkExpandKind as IpcKind,
+            ShrinkExpandPhase as IpcPhase,
+        };
+        Self {
+            operation_id: record.id,
+            revision: record.revision,
+            workspace_id: record.workspace,
+            targets: record.targets.clone(),
+            kind: match record.kind {
+                Kind::ShrinkTimed(axis) => IpcKind::ShrinkTimed(axis.into()),
+                Kind::ShrinkSpatial(axis) => IpcKind::ShrinkSpatial(axis.into()),
+                Kind::ExpandSelection => IpcKind::ExpandSelection,
+                Kind::ExpandDirect => IpcKind::ExpandDirect,
+                Kind::ExpandAll => IpcKind::ExpandAll,
+            },
+            phase: match record.phase {
+                Phase::Previewing => IpcPhase::Previewing,
+                Phase::Submitted => IpcPhase::Submitted,
+                Phase::Cancelled => IpcPhase::Cancelled,
+                Phase::Settled => IpcPhase::Settled,
+            },
+            reason: record.reason.map(|r| match r {
+                FinishReason::Ready => Reason::Ready,
+                FinishReason::Deadline => Reason::Deadline,
+                FinishReason::TargetsRemoved => Reason::TargetsRemoved,
+            }),
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Preview {
     pub record: Record,
@@ -88,6 +130,11 @@ pub struct Coordinator {
 }
 
 impl Coordinator {
+    pub fn ipc_state(&self) -> niri_ipc::ShrinkExpandState {
+        niri_ipc::ShrinkExpandState {
+            operations: self.records().map(Into::into).collect(),
+        }
+    }
     pub fn preview(&self) -> Option<&Preview> {
         self.preview.as_ref()
     }

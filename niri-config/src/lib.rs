@@ -41,6 +41,8 @@ pub mod misc;
 pub mod output;
 pub mod recent_windows;
 pub mod shrink_expand;
+#[cfg(test)]
+mod shrink_expand_actions_tests;
 pub mod sink;
 pub mod utils;
 pub mod window_rule;

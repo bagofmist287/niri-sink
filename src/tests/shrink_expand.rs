@@ -7,6 +7,320 @@ use crate::layout::shrink_expand::{ShrinkAxis, WindowForm};
 use crate::layout::LayoutElement as _;
 use crate::layout::SizingMode;
 
+struct ShrinkIpcClient(std::io::BufReader<std::os::unix::net::UnixStream>);
+
+#[test]
+fn shrink_ipc_disabled_and_pointer_grab_rejections_preserve_native_ownership() {
+    use crate::input::click_grab::ClickGrab;
+    use niri_ipc::{Action, Request, Response, ShrinkExpandOutcome};
+    use smithay::input::pointer::{Focus, GrabStartData};
+    use smithay::utils::Serial;
+    let (mut fixture, _, _) = timed_shrink_fixture(1, false, 60000);
+    let target = fixture.niri().layout.focus().unwrap().window.clone();
+    let mut ipc = ShrinkIpcClient::new(&mut fixture);
+    fixture.niri().config.borrow_mut().shrink_expand.enabled = false;
+    assert!(ipc
+        .request(&mut fixture, Request::Action(Action::ShrinkWindow {}))
+        .unwrap_err()
+        .contains("disabled"));
+    assert!(!fixture.niri().layout.is_spine(&target));
+    fixture.niri().config.borrow_mut().shrink_expand.enabled = true;
+    let pointer = fixture.niri().seat.get_pointer().unwrap();
+    pointer.set_grab(
+        fixture.niri_state(),
+        ClickGrab::new(GrabStartData {
+            focus: None,
+            button: 0x110,
+            location: (10., 10.).into(),
+        }),
+        Serial::from(501),
+        Focus::Keep,
+    );
+    for action in [
+        Action::ShrinkWindow {},
+        Action::ExpandWindow { id: u64::MAX },
+        Action::ExpandAllWindows {},
+    ] {
+        assert!(ipc
+            .request(&mut fixture, Request::Action(action))
+            .unwrap_err()
+            .contains("blocked"));
+        assert!(pointer.is_grabbed());
+        assert_eq!(fixture.niri().layout.focus().unwrap().window, target);
+        assert!(fixture.niri().shrink_expand.preview().is_none());
+    }
+    pointer.unset_grab(
+        fixture.niri_state(),
+        Serial::from(502),
+        smithay::backend::input::InputTime::now(),
+    );
+    ipc.request(&mut fixture, Request::Action(Action::ShrinkWindow {}))
+        .unwrap();
+    let Response::ShrinkExpandAction(cancelled) = ipc
+        .request(
+            &mut fixture,
+            Request::Action(Action::ExpandWindow { id: u64::MAX }),
+        )
+        .unwrap()
+    else {
+        panic!()
+    };
+    assert_eq!(cancelled.outcome, ShrinkExpandOutcome::Cancelled);
+    assert!(!fixture.niri().layout.is_spine(&target));
+}
+
+impl ShrinkIpcClient {
+    fn new(fixture: &mut Fixture) -> Self {
+        let (client, server) = std::os::unix::net::UnixStream::pair().unwrap();
+        client.set_nonblocking(true).unwrap();
+        crate::ipc::server::attach_test_client(fixture.niri_state(), server);
+        Self(std::io::BufReader::new(client))
+    }
+
+    fn write(&mut self, request: &niri_ipc::Request) {
+        use std::io::Write as _;
+        writeln!(
+            self.0.get_mut(),
+            "{}",
+            serde_json::to_string(request).unwrap()
+        )
+        .unwrap();
+    }
+
+    fn read<T: serde::de::DeserializeOwned>(&mut self, fixture: &mut Fixture) -> T {
+        use std::io::BufRead as _;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        let mut line = String::new();
+        loop {
+            fixture.dispatch();
+            match self.0.read_line(&mut line) {
+                Ok(0) => panic!("IPC closed before response"),
+                Ok(_) if line.ends_with('\n') => return serde_json::from_str(&line).unwrap(),
+                Ok(_) => (),
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => (),
+                Err(e) => panic!("IPC read: {e}"),
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "IPC response timeout: {line}"
+            );
+            std::thread::yield_now();
+        }
+    }
+
+    fn request(&mut self, fixture: &mut Fixture, request: niri_ipc::Request) -> niri_ipc::Reply {
+        self.write(&request);
+        self.read(fixture)
+    }
+}
+
+#[test]
+fn shrink_ipc_dispatch_receipts_snapshot_and_inventory_follow_real_submission() {
+    use niri_ipc::{
+        Action, Request, Response, ShrinkExpandOutcome as Outcome, ShrinkExpandPhase as Phase,
+    };
+    let (mut fixture, client, _) = timed_shrink_fixture(2, false, 60000);
+    let target = fixture.niri().layout.focus().unwrap().id().get();
+    let mut ipc = ShrinkIpcClient::new(&mut fixture);
+    assert!(matches!(
+        ipc.request(&mut fixture, Request::Action(Action::FocusColumnLeft {}))
+            .unwrap(),
+        Response::Handled
+    ));
+    // Restore the original ordinary focus through the public action path.
+    assert!(matches!(
+        ipc.request(
+            &mut fixture,
+            Request::Action(Action::FocusWindow { id: target })
+        )
+        .unwrap(),
+        Response::Handled
+    ));
+    let Response::ShrinkExpandAction(first) = ipc
+        .request(&mut fixture, Request::Action(Action::ShrinkWindow {}))
+        .unwrap()
+    else {
+        panic!()
+    };
+    assert_eq!(first.outcome, Outcome::Previewing);
+    assert_eq!(first.targets, vec![target]);
+    assert!(!first.waiting_for_clients);
+    let Response::Windows(windows) = ipc.request(&mut fixture, Request::Windows).unwrap() else {
+        panic!()
+    };
+    assert_eq!(
+        windows
+            .iter()
+            .find(|w| w.id == target)
+            .unwrap()
+            .shrink_state,
+        niri_ipc::ShrinkState::Normal
+    );
+    let Response::ShrinkExpandAction(repeated) = ipc
+        .request(&mut fixture, Request::Action(Action::ShrinkWindow {}))
+        .unwrap()
+    else {
+        panic!()
+    };
+    assert_eq!(repeated.operation_id, first.operation_id);
+    let Response::ShrinkExpandAction(submitted) = ipc
+        .request(
+            &mut fixture,
+            Request::Action(Action::ConfirmShrinkExpand {}),
+        )
+        .unwrap()
+    else {
+        panic!()
+    };
+    assert_eq!(submitted.outcome, Outcome::Submitted);
+    assert!(!submitted.waiting_for_clients);
+    let Response::ShrinkExpandState(state) = ipc
+        .request(&mut fixture, Request::ShrinkExpandState)
+        .unwrap()
+    else {
+        panic!()
+    };
+    assert!(state
+        .operations
+        .iter()
+        .any(|op| Some(op.operation_id) == first.operation_id && op.phase == Phase::Settled));
+    let Response::Windows(windows) = ipc.request(&mut fixture, Request::Windows).unwrap() else {
+        panic!()
+    };
+    let book = windows.iter().find(|w| w.id == target).unwrap();
+    assert_eq!(book.shrink_state, niri_ipc::ShrinkState::Spine);
+    assert_eq!(book.shrink_axis, Some(niri_ipc::ShrinkAxis::Vertical));
+    assert_eq!(windows.len(), 2);
+    fixture.niri_state().reload_config(Ok(expand_test_config()));
+    fixture.double_roundtrip(client);
+    let Response::ShrinkExpandAction(expand) = ipc
+        .request(
+            &mut fixture,
+            Request::Action(Action::ExpandWindow { id: target }),
+        )
+        .unwrap()
+    else {
+        panic!()
+    };
+    assert_eq!(expand.outcome, Outcome::Submitted);
+    assert!(expand.waiting_for_clients);
+    assert_ne!(expand.operation_id, first.operation_id);
+    let Response::ShrinkExpandState(state) = ipc
+        .request(&mut fixture, Request::ShrinkExpandState)
+        .unwrap()
+    else {
+        panic!()
+    };
+    assert!(state
+        .operations
+        .iter()
+        .any(|op| Some(op.operation_id) == expand.operation_id && op.phase == Phase::Submitted));
+    let Response::Windows(windows) = ipc.request(&mut fixture, Request::Windows).unwrap() else {
+        panic!()
+    };
+    let normal = windows.iter().find(|w| w.id == target).unwrap();
+    assert_eq!(normal.shrink_state, niri_ipc::ShrinkState::Normal);
+    assert_eq!(normal.shrink_axis, None);
+    assert!(ipc
+        .request(
+            &mut fixture,
+            Request::Action(Action::ExpandWindow { id: u64::MAX })
+        )
+        .is_err());
+}
+
+#[test]
+fn shrink_ipc_event_prefix_covers_finished_operation_and_only_revision_changes_emit() {
+    use niri_ipc::{Action, Event, Request, Response, ShrinkExpandPhase as Phase};
+    let (mut fixture, client, _) = timed_shrink_fixture(1, false, 60000);
+    let mut control = ShrinkIpcClient::new(&mut fixture);
+    let Response::ShrinkExpandAction(first) = control
+        .request(&mut fixture, Request::Action(Action::ShrinkWindow {}))
+        .unwrap()
+    else {
+        panic!()
+    };
+    let Response::ShrinkExpandAction(cancelled) = control
+        .request(&mut fixture, Request::Action(Action::CancelShrinkExpand {}))
+        .unwrap()
+    else {
+        panic!()
+    };
+    assert_eq!(cancelled.operation_id, first.operation_id);
+    let mut events = ShrinkIpcClient::new(&mut fixture);
+    assert!(matches!(
+        events.request(&mut fixture, Request::EventStream).unwrap(),
+        Response::Handled
+    ));
+    loop {
+        if let Event::ShrinkExpandChanged { state } = events.read(&mut fixture) {
+            assert!(state
+                .operations
+                .iter()
+                .any(|op| Some(op.operation_id) == first.operation_id
+                    && op.phase == Phase::Cancelled));
+            break;
+        }
+    }
+    fixture.double_roundtrip(client);
+    // Static refreshes must not produce operation events or per-frame countdown updates.
+    for _ in 0..16 {
+        fixture.double_roundtrip(client);
+    }
+    {
+        use std::io::BufRead as _;
+        loop {
+            let mut line = String::new();
+            match events.0.read_line(&mut line) {
+                Ok(0) => panic!("event stream disconnected"),
+                Ok(_) => assert!(!matches!(
+                    serde_json::from_str::<Event>(&line).unwrap(),
+                    Event::ShrinkExpandChanged { .. }
+                )),
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    assert!(line.is_empty());
+                    break;
+                }
+                Err(e) => panic!("event stream: {e}"),
+            }
+        }
+    }
+    let second = control
+        .request(&mut fixture, Request::Action(Action::ShrinkWindow {}))
+        .unwrap();
+    let Response::ShrinkExpandAction(second) = second else {
+        panic!()
+    };
+    loop {
+        if let Event::ShrinkExpandChanged { state } = events.read(&mut fixture) {
+            assert!(state
+                .operations
+                .iter()
+                .any(|op| Some(op.operation_id) == second.operation_id
+                    && op.phase == Phase::Previewing));
+            break;
+        }
+    }
+    control
+        .request(
+            &mut fixture,
+            Request::Action(Action::ConfirmShrinkExpand {}),
+        )
+        .unwrap();
+    let mut phases = Vec::new();
+    while phases.last() != Some(&Phase::Settled) {
+        if let Event::ShrinkExpandChanged { state } = events.read(&mut fixture) {
+            let op = state
+                .operations
+                .iter()
+                .find(|op| Some(op.operation_id) == second.operation_id)
+                .unwrap();
+            phases.push(op.phase);
+        }
+    }
+    assert_eq!(phases, [Phase::Submitted, Phase::Settled]);
+}
+
 fn timed_shrink_fixture(
     count: usize,
     floating: bool,

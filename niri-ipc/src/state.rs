@@ -49,6 +49,32 @@ pub struct EventStreamState {
 
     /// State of screencasts.
     pub casts: CastsState,
+    /// State of experimental Shrink/Expand operations.
+    pub shrink_expand: ShrinkExpandState,
+}
+
+/// Complete replacement operation snapshot from the event stream.
+#[derive(Debug, Default)]
+pub struct ShrinkExpandState {
+    /// Current/submitted/recent terminal operation records.
+    pub state: crate::ShrinkExpandState,
+}
+
+impl EventStreamStatePart for ShrinkExpandState {
+    fn replicate(&self) -> Vec<Event> {
+        vec![Event::ShrinkExpandChanged {
+            state: self.state.clone(),
+        }]
+    }
+
+    fn apply(&mut self, event: Event) -> Option<Event> {
+        if let Event::ShrinkExpandChanged { state } = event {
+            self.state = state;
+            None
+        } else {
+            Some(event)
+        }
+    }
 }
 
 /// The workspaces state communicated over the event stream.
@@ -102,6 +128,7 @@ impl EventStreamStatePart for EventStreamState {
         events.extend(self.overview.replicate());
         events.extend(self.config.replicate());
         events.extend(self.casts.replicate());
+        events.extend(self.shrink_expand.replicate());
         events
     }
 
@@ -112,6 +139,7 @@ impl EventStreamStatePart for EventStreamState {
         let event = self.overview.apply(event)?;
         let event = self.config.apply(event)?;
         let event = self.casts.apply(event)?;
+        let event = self.shrink_expand.apply(event)?;
         Some(event)
     }
 }
