@@ -7,6 +7,247 @@ use crate::layout::shrink_expand::{ShrinkAxis, WindowForm};
 use crate::layout::LayoutElement as _;
 use crate::layout::SizingMode;
 
+fn timed_shrink_fixture(
+    count: usize,
+    floating: bool,
+    delay: u32,
+) -> (
+    Fixture,
+    super::client::ClientId,
+    Vec<wayland_client::protocol::wl_surface::WlSurface>,
+) {
+    let mut config = niri_config::Config::default();
+    config.animations.off = true;
+    config.shrink_expand.enabled = true;
+    config.shrink_expand.shrink_buffer_ms = delay;
+    let mut fixture = Fixture::with_config(config);
+    fixture.add_output(1, (1280, 720));
+    let client = fixture.add_client();
+    let mut surfaces = Vec::new();
+    for _ in 0..count {
+        let surface = fixture.client(client).create_window().surface.clone();
+        fixture.client(client).window(&surface).commit();
+        fixture.roundtrip(client);
+        let window = fixture.client(client).window(&surface);
+        window.attach_new_buffer();
+        window.set_size(300, 200);
+        window.ack_last_and_commit();
+        fixture.double_roundtrip(client);
+        if floating {
+            let id = fixture.niri().layout.focus().unwrap().window.clone();
+            fixture.niri().layout.toggle_window_floating(Some(&id));
+            fixture.double_roundtrip(client);
+            fixture
+                .client(client)
+                .window(&surface)
+                .ack_last_and_commit();
+            fixture.double_roundtrip(client);
+        }
+        surfaces.push(surface);
+    }
+    fixture.niri_complete_animations();
+    (fixture, client, surfaces)
+}
+
+#[test]
+fn timed_shrink_repeat_rejects_old_ticket_and_commits_native_focus_handoff() {
+    use crate::shrink_expand::{FinishReason, Kind, Phase};
+    for floating in [false, true] {
+        for count in [1, 2] {
+            let (mut fixture, client, surfaces) = timed_shrink_fixture(count, floating, 60000);
+            let window = fixture.niri().layout.focus().unwrap().window.clone();
+            let old_surface = fixture.niri().keyboard_focus.surface().unwrap().clone();
+            let before_size = fixture.niri().layout.focus().unwrap().size();
+            let first = fixture
+                .niri_state()
+                .begin_shrink_preview(Some(ShrinkAxis::Horizontal))
+                .unwrap();
+            fixture.double_roundtrip(client);
+            assert!(!fixture.niri().layout.is_spine(&window));
+            assert_eq!(fixture.niri().keyboard_focus.surface(), Some(&old_surface));
+            assert_eq!(fixture.niri().layout.focus().unwrap().size(), before_size);
+            let second = fixture.niri_state().begin_shrink_preview(None).unwrap();
+            assert_eq!(second.id, first.id);
+            assert!(second.revision > first.revision);
+            assert_eq!(second.kind, Kind::ShrinkTimed(ShrinkAxis::Vertical));
+            assert!(fixture
+                .niri_state()
+                .confirm_shrink_preview(first.ticket())
+                .is_none());
+            assert!(!fixture.niri().layout.is_spine(&window));
+            let submitted = fixture
+                .niri_state()
+                .confirm_shrink_preview(second.ticket())
+                .unwrap();
+            assert_eq!(submitted.phase, Phase::Submitted);
+            fixture.double_roundtrip(client);
+            assert!(fixture.niri().layout.is_spine(&window));
+            assert!(fixture.niri().shrink_expand.preview().is_none());
+            assert!(fixture
+                .niri()
+                .shrink_expand
+                .records()
+                .any(|r| r.id == first.id
+                    && r.phase == Phase::Settled
+                    && r.reason == Some(FinishReason::Ready)));
+            assert!(fixture.niri().shrink_preview_timer.is_none());
+            if count == 1 {
+                assert!(fixture.niri().keyboard_focus.surface().is_none());
+            } else {
+                assert!(fixture.niri().keyboard_focus.surface().is_some());
+                assert_ne!(fixture.niri().keyboard_focus.surface(), Some(&old_surface));
+                let receiver = fixture.niri().layout.focus().unwrap().window.clone();
+                assert!(!fixture.niri().layout.is_spine(&receiver));
+            }
+            assert_eq!(fixture.niri().layout.windows().count(), count);
+            assert!(!fixture
+                .client(client)
+                .window(surfaces.last().unwrap())
+                .configures_received
+                .last()
+                .unwrap()
+                .1
+                .states
+                .contains(&xdg_toplevel::State::Activated));
+        }
+    }
+}
+
+#[test]
+fn timed_shrink_actual_zero_timer_submits_and_scope_change_or_disable_cancels() {
+    use crate::shrink_expand::{Phase, Rejected};
+    let (mut fixture, client, _) = timed_shrink_fixture(1, false, 0);
+    let window = fixture.niri().layout.focus().unwrap().window.clone();
+    let record = fixture.niri_state().begin_shrink_preview(None).unwrap();
+    assert_eq!(record.phase, Phase::Previewing);
+    fixture.double_roundtrip(client);
+    assert!(fixture.niri().layout.is_spine(&window));
+    assert!(fixture
+        .niri()
+        .shrink_expand
+        .records()
+        .any(|r| r.id == record.id && r.phase == Phase::Settled));
+    for change in ["focus", "disable", "close", "workspace"] {
+        let (mut fixture, client, surfaces) = timed_shrink_fixture(2, false, 60000);
+        let target = fixture.niri().layout.focus().unwrap().window.clone();
+        let record = fixture.niri_state().begin_shrink_preview(None).unwrap();
+        match change {
+            "focus" => {
+                fixture.niri().layout.focus_left();
+            }
+            "disable" => fixture.niri().config.borrow_mut().shrink_expand.enabled = false,
+            "close" => {
+                let window = fixture.client(client).window(surfaces.last().unwrap());
+                window.xdg_toplevel.destroy();
+                window.xdg_surface.destroy();
+                window.surface.destroy();
+            }
+            "workspace" => fixture.niri().layout.switch_workspace_down(),
+            _ => unreachable!(),
+        }
+        fixture.double_roundtrip(client);
+        assert!(fixture.niri().shrink_expand.preview().is_none(), "{change}");
+        assert!(fixture.niri().shrink_preview_timer.is_none());
+        assert!(!fixture.niri().layout.is_spine(&target));
+        assert!(fixture
+            .niri_state()
+            .confirm_shrink_preview(record.ticket())
+            .is_none());
+        assert!(fixture
+            .niri()
+            .shrink_expand
+            .records()
+            .any(|r| r.id == record.id && r.phase == Phase::Cancelled));
+        if change == "disable" {
+            assert_eq!(
+                fixture.niri_state().begin_shrink_preview(None),
+                Err(Rejected::Disabled)
+            );
+        }
+    }
+}
+
+#[test]
+fn timed_shrink_keyboard_suppression_balances_old_and_new_presses_across_escape() {
+    use super::client::KeyboardEvent;
+    use super::test_input_backend::{TestInputBackend, TestKeyboardKeyEvent};
+    use smithay::backend::input::{InputEvent, InputTime, KeyState};
+    let (mut fixture, client, surfaces) = timed_shrink_fixture(1, false, 60000);
+    let surface = &surfaces[0];
+    let _ = fixture
+        .client(client)
+        .state
+        .recent_keyboard_events(surface)
+        .count();
+    let send = |fixture: &mut Fixture, name: &str, state: KeyState| {
+        let keyboard = fixture.niri().seat.get_keyboard().unwrap();
+        let code = keyboard.with_xkb_state(fixture.niri_state(), |xkb| {
+            let xkb = xkb.xkb().lock().unwrap();
+            unsafe { xkb.keymap() }.key_by_name(name).unwrap()
+        });
+        fixture
+            .niri_state()
+            .process_input_event(InputEvent::<TestInputBackend>::Keyboard {
+                event: TestKeyboardKeyEvent {
+                    time: InputTime::from_micros(0),
+                    code,
+                    state,
+                    count: 1,
+                },
+            });
+        fixture.double_roundtrip(client);
+    };
+    send(&mut fixture, "AC01", KeyState::Pressed);
+    assert_eq!(
+        fixture
+            .client(client)
+            .state
+            .recent_keyboard_events(surface)
+            .filter(|e| matches!(e, KeyboardEvent::Key { .. }))
+            .count(),
+        1
+    );
+    fixture.niri_state().begin_shrink_preview(None).unwrap();
+    // Release for a press forwarded before the preview must still reach its client.
+    send(&mut fixture, "AC01", KeyState::Released);
+    assert_eq!(
+        fixture
+            .client(client)
+            .state
+            .recent_keyboard_events(surface)
+            .filter(|e| matches!(e, KeyboardEvent::Key { .. }))
+            .count(),
+        1
+    );
+    send(&mut fixture, "AB05", KeyState::Pressed);
+    send(&mut fixture, "ESC", KeyState::Pressed);
+    assert!(fixture.niri().shrink_expand.preview().is_none());
+    send(&mut fixture, "AB05", KeyState::Released);
+    send(&mut fixture, "ESC", KeyState::Released);
+    assert_eq!(
+        fixture
+            .client(client)
+            .state
+            .recent_keyboard_events(surface)
+            .filter(|e| matches!(e, KeyboardEvent::Key { .. }))
+            .count(),
+        0
+    );
+    assert!(fixture.niri().suppressed_keys.is_empty());
+    assert!(fixture.niri().layout.focus().is_some());
+    send(&mut fixture, "AB05", KeyState::Pressed);
+    send(&mut fixture, "AB05", KeyState::Released);
+    assert_eq!(
+        fixture
+            .client(client)
+            .state
+            .recent_keyboard_events(surface)
+            .filter(|e| matches!(e, KeyboardEvent::Key { .. }))
+            .count(),
+        2
+    );
+}
+
 #[test]
 fn real_spine_hit_never_forwards_to_hidden_client_and_static_refresh_stays_idle() {
     use crate::layout::HitType;

@@ -1731,6 +1731,24 @@ impl<W: LayoutElement> Layout<W> {
         self.interactive_move.is_none() && self.dnd.is_none()
     }
 
+    /// Validate and commit an initial Shrink at its current owner, without client resizing.
+    pub(crate) fn commit_shrink(
+        &mut self,
+        id: &W::Id,
+        axis: shrink_expand::ShrinkAxis,
+        thickness: f64,
+    ) -> bool {
+        if self
+            .shrink_plans(id, thickness)
+            .is_none_or(|plans| !plans.get(axis).fits)
+        {
+            return false;
+        }
+        self.workspaces_mut()
+            .find(|ws| ws.has_window(id))
+            .is_some_and(|ws| ws.commit_shrink(id, axis, thickness))
+    }
+
     /// Moves the active normal tile to its workspace's Sink owner.
     /// The action layer is responsible for feature, seat, lock and popup-grab permission.
     pub fn sink_window(&mut self) -> bool {

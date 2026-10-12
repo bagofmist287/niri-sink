@@ -554,6 +554,15 @@ impl State {
                     this.niri.screenshot_ui.set_space_down(pressed);
                 }
 
+                if pressed
+                    && raw == Some(Keysym::Escape)
+                    && this.niri.shrink_expand.preview().is_some()
+                {
+                    this.niri.suppressed_keys.insert(key_code);
+                    this.cancel_shrink_expand_preview();
+                    return FilterResult::Intercept(None);
+                }
+
                 let res = {
                     let config = this.niri.config.borrow();
                     let bindings =
@@ -582,6 +591,12 @@ impl State {
                             this.niri.suppressed_keys.insert(key_code);
                             return FilterResult::Intercept(Some(bind));
                         }
+                    }
+
+                    if pressed && this.niri.shrink_expand.preview().is_some() {
+                        // Use the native suppression set so release stays consumed after cancellation.
+                        this.niri.suppressed_keys.insert(key_code);
+                        return FilterResult::Intercept(None);
                     }
 
                     // Interaction with the active window, immediately update the active window's

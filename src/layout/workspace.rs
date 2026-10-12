@@ -888,6 +888,40 @@ impl<W: LayoutElement> Workspace<W> {
         }
     }
 
+    /// Native-slot form commit; eligibility/seat ownership is checked by the coordinator.
+    pub(super) fn commit_shrink(
+        &mut self,
+        id: &W::Id,
+        axis: super::shrink_expand::ShrinkAxis,
+        thickness: f64,
+    ) -> bool {
+        if self
+            .spine_plans(id, thickness)
+            .is_none_or(|plans| !plans.get(axis).fits)
+        {
+            return false;
+        }
+        let hand_off = self.active_window().is_some_and(|window| window.id() == id);
+        let Some(tile) = self.tiles_mut().find(|tile| tile.window().id() == id) else {
+            return false;
+        };
+        if tile.is_spine() || !tile.set_spine(axis, thickness) {
+            return false;
+        }
+        self.update_window(id, None);
+        if hand_off {
+            if self.floating_is_active.get() {
+                if !self.floating.focus_normal_window() && self.scrolling.focus_normal_window() {
+                    self.floating_is_active = FloatingActive::No;
+                }
+            } else if !self.scrolling.focus_normal_window() && self.floating.focus_normal_window() {
+                self.floating_is_active = FloatingActive::Yes;
+            }
+            self.accept_selected_sink_focus();
+        }
+        true
+    }
+
     pub fn active_window_mut(&mut self) -> Option<&mut W> {
         self.active_window()?;
         if self.floating_is_active.get() {

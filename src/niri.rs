@@ -366,6 +366,9 @@ pub struct Niri {
     pub bind_repeat_timer: Option<RegistrationToken>,
     sink_focus_plan: Option<SinkFocusPlan>,
     sink_input_timer: Option<(RegistrationToken, Instant)>,
+    pub(crate) shrink_expand: crate::shrink_expand::Coordinator,
+    pub(crate) shrink_preview_timer: Option<(RegistrationToken, crate::shrink_expand::Ticket)>,
+    pub(crate) shrink_preview_lease: Option<crate::shrink_expand::PreviewLease>,
     pub keyboard_focus: KeyboardFocus,
     pub layer_shell_on_demand_focus: Option<LayerSurface>,
     pub idle_inhibiting_surfaces: HashSet<WlSurface>,
@@ -845,6 +848,7 @@ impl State {
         // These should be called periodically, before flushing the clients.
         self.niri.popups.cleanup();
         self.refresh_popup_grab();
+        self.refresh_shrink_expand_operations();
         self.refresh_sink_transient_parents();
         self.update_keyboard_focus();
 
@@ -3044,6 +3048,9 @@ impl Niri {
             seat,
             sink_focus_plan: None,
             sink_input_timer: None,
+            shrink_expand: Default::default(),
+            shrink_preview_timer: None,
+            shrink_preview_lease: None,
             keyboard_focus: KeyboardFocus::Layout { surface: None },
             layer_shell_on_demand_focus: None,
             idle_inhibiting_surfaces: HashSet::new(),
