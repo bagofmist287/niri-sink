@@ -2,8 +2,9 @@ use std::time::{Duration, Instant};
 
 use calloop::timer::{TimeoutAction, Timer};
 use smithay::desktop::Window;
+use smithay::input::tablet::TabletSeatTrait as _;
 use smithay::output::Output;
-use smithay::utils::{IsAlive, Logical, Point};
+use smithay::utils::{IsAlive, Logical, Point, Serial};
 use smithay::wayland::input_method::InputMethodKeyboardGrab;
 
 use super::{Kind, Record, TargetState, Ticket};
@@ -55,6 +56,8 @@ pub(crate) struct ExpandFocusLease {
     workspace: u64,
     output: Option<Output>,
     resize_input: Option<SpatialInput>,
+    activation_press: Option<(SpatialInput, Serial)>,
+    warp_output_on_ready: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -529,6 +532,55 @@ impl State {
             .then_some((window, edges))
     }
 
+    /// Native tab indicators select on press; a book tab is an explicit activation, unlike
+    /// passive hover or structural selection. Return true even when its seat permission rejects.
+    pub(crate) fn try_activate_spine_tab(
+        &mut self,
+        pos: Point<f64, Logical>,
+        input: SpatialInput,
+        serial: Serial,
+    ) -> bool {
+        let Some((
+            window,
+            crate::layout::HitType::Activate {
+                is_tab_indicator: true,
+            },
+        )) = self.niri.contents_under(pos).window
+        else {
+            return false;
+        };
+        if !self.niri.layout.is_spine(&window) {
+            return false;
+        }
+        if !self.niri.config.borrow().shrink_expand.enabled || !self.can_activate_spine(false) {
+            return true;
+        }
+        if self.niri.layout.is_overview_open() {
+            let target = self.niri.layout.workspaces().find_map(|(mon, idx, ws)| {
+                ws.has_window(&window)
+                    .then(|| mon.map(|mon| (mon.output().clone(), idx)))
+                    .flatten()
+            });
+            if let Some((output, idx)) = target {
+                self.niri.layout.focus_output(&output);
+                self.niri.layout.toggle_overview_to_workspace(idx);
+            }
+        }
+        if self.prepare_window_activation(&window) {
+            self.niri.layout.activate_window(&window);
+            self.niri.queue_redraw_all();
+        }
+        if let Some(lease) = self
+            .niri
+            .shrink_expand_focus
+            .as_mut()
+            .filter(|lease| lease.window == window)
+        {
+            lease.activation_press = Some((input, serial));
+        }
+        true
+    }
+
     pub(crate) fn spine_click_context(
         &self,
         window: &Window,
@@ -615,9 +667,67 @@ impl State {
     }
 
     fn can_expand_spines(&self) -> bool {
-        self.can_recall_sink(false)
+        self.can_activate_spine(false)
+    }
+
+    pub(crate) fn can_activate_spine(&self, confirming_mru: bool) -> bool {
+        self.can_recall_sink(confirming_mru)
             && !self.niri.screenshot_ui.is_open()
             && !self.niri.exit_confirm_dialog.is_open()
+            && !self
+                .niri
+                .seat
+                .tablet_seat()
+                .get_tools()
+                .into_values()
+                .any(|tool| tool.is_grabbed())
+    }
+
+    /// Called only after the source's activation policy has allowed focus. Explicit activation
+    /// cancels a selection preview and restores this identity, rather than cycling its candidates.
+    pub(crate) fn prepare_spine_activation(&mut self, window: &Window) -> bool {
+        if !self.niri.layout.is_spine(window) {
+            return true;
+        }
+        if !self.niri.config.borrow().shrink_expand.enabled || !self.can_activate_spine(false) {
+            return false;
+        }
+        let Some(workspace) = self
+            .niri
+            .layout
+            .workspaces()
+            .find_map(|(_, _, ws)| ws.has_window(window).then_some(ws.id().get()))
+        else {
+            return false;
+        };
+        self.cancel_shrink_expand_preview();
+        self.submit_spine_expansion(
+            workspace,
+            vec![window.clone()],
+            Kind::ExpandDirect,
+            Some(window.clone()),
+        )
+        .is_ok_and(|record| record.is_some())
+    }
+
+    /// A newly related child needs a normal parent, without selecting that parent for focus.
+    /// Recheck the live relationship on each refresh when a lock or interaction delays this.
+    pub(crate) fn prepare_spine_parent(&mut self, window: &Window) {
+        if !self.niri.config.borrow().shrink_expand.enabled || !self.can_activate_spine(false) {
+            return;
+        }
+        let workspace = self.niri.layout.workspaces().find_map(|(_, _, ws)| {
+            (ws.has_window(window) && self.niri.layout.is_spine(window)).then_some(ws.id().get())
+        });
+        if let Some(workspace) = workspace {
+            self.cancel_shrink_expand_preview();
+            let _ = self.submit_spine_expansion(
+                workspace,
+                vec![window.clone()],
+                Kind::ExpandDirect,
+                None,
+            );
+        }
     }
 
     /// Internal direct entry, sharing the current-slot allocator and protocol barrier.
@@ -754,6 +864,8 @@ impl State {
                 workspace,
                 output: self.niri.layout.active_output().cloned(),
                 resize_input: resize.map(|(_, input)| input),
+                activation_press: None,
+                warp_output_on_ready: false,
             });
         }
         self.refresh_shrink_expand_operations();
@@ -815,6 +927,17 @@ impl State {
         }
     }
 
+    pub(crate) fn plan_spine_activation_warp(&mut self, window: &Window, source: Option<&Output>) {
+        if let Some(lease) = self
+            .niri
+            .shrink_expand_focus
+            .as_mut()
+            .filter(|lease| &lease.window == window)
+        {
+            lease.warp_output_on_ready = lease.output.as_ref() != source;
+        }
+    }
+
     fn refresh_expand_focus_lease(&mut self) {
         let Some(lease) = self.niri.shrink_expand_focus.as_ref() else {
             return;
@@ -827,7 +950,28 @@ impl State {
                 .as_ref()
                 .is_some_and(|session| session.window == lease.window && session.input == *input)
         });
-        let seat_allowed = if let Some(input) = resizing {
+        let pressing = lease
+            .activation_press
+            .filter(|(input, serial)| match input {
+                SpatialInput::Pointer => self
+                    .niri
+                    .seat
+                    .get_pointer()
+                    .is_some_and(|pointer| pointer.has_grab(*serial)),
+                SpatialInput::Touch => self
+                    .niri
+                    .seat
+                    .get_touch()
+                    .is_some_and(|touch| touch.has_grab(*serial)),
+                SpatialInput::Tablet => self
+                    .niri
+                    .seat
+                    .tablet_seat()
+                    .get_tools()
+                    .into_values()
+                    .any(|tool| tool.has_grab(*serial)),
+            });
+        let seat_allowed = if let Some(input) = resizing.or(pressing.map(|(input, _)| input)) {
             self.can_shrink_spatial(input)
         } else {
             self.can_expand_spines()
@@ -850,15 +994,25 @@ impl State {
             .focus()
             .is_some_and(|w| w.window == lease.window)
         {
+            let output = lease.output.clone();
+            let warp_output = lease.warp_output_on_ready;
             self.niri.shrink_expand_focus = None;
             if resizing.is_none() {
-                self.maybe_warp_cursor_to_focus();
+                if warp_output {
+                    if let Some(output) = output {
+                        if !self.maybe_warp_cursor_to_focus_centered() {
+                            self.move_cursor_to_output(&output);
+                        }
+                    }
+                } else {
+                    self.maybe_warp_cursor_to_focus();
+                }
             }
         }
     }
 
     fn can_start_shrink_preview(&self) -> bool {
-        self.can_recall_sink(false)
+        self.can_activate_spine(false)
             && matches!(self.niri.keyboard_focus, KeyboardFocus::Layout { .. })
             && !self.niri.screenshot_ui.is_open()
             && !self.niri.exit_confirm_dialog.is_open()

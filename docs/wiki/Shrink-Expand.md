@@ -1,5 +1,41 @@
 # Shrink / Expand development configuration
 
+Explicit `focus-window` by ID, MRU confirmation, foreign-toplevel activation, and
+policy-approved XDG activation, and clicking its native tab indicator expand a spine
+at its current native position. MRU
+browsing and cancellation, ordinary navigation, focus follows mouse, and internal
+layout selection keep the spine form. XDG token expiry and `on-xdg-activate`
+ignore/urgency policy are checked before expansion; input owners and session locks
+also retain their existing protection. A permitted activation cancels any pending
+selection preview and restores the explicitly requested identity. Focus waits for
+the normal restore barrier or its original deadline; navigation or lock invalidates
+the pending focus handoff.
+
+A tab indicator selects on press, including hidden spine tabs. Its original pointer,
+touch or tablet press serial may retain the focus handoff while that same press owns
+the grab; a different interaction still invalidates it. In Overview, tab activation
+exits to the target workspace. Ordinary tab hover remains passive.
+
+A newly mapped or reparented transient causes its spine parent to expand without
+selecting the parent for focus. While a lock or another interaction prevents this,
+the live relationship is checked again on refresh. Child input stays blocked until
+the ancestor chain is normal and its restore barriers have settled. Reparenting,
+closing either identity, and revoking an existing child grab use the same lifecycle
+as the existing Sink transient handling.
+
+Explicit fullscreen, maximize, and windowed fullscreen requests for a spine in an
+active native move retain a final mode intent on that identity. The spine and grab
+remain intact until native release, when expansion and the final intent apply at
+the actual drop position. Repeated toggles use the pending intent; maximize can
+remain latent under fullscreen, and windowed fullscreen excludes real fullscreen.
+Closing the moving identity discards its intent. Ordinary-window move policy stays
+with the native implementation.
+
+Spine content and unconfirmed content previews do not qualify for Wayland idle
+inhibition or on-demand VRR. Their normal surface presentation feedback stays intact;
+normal restored content follows the native visibility rules. The desktop-wide D-Bus
+idle inhibitor keeps its original semantics.
+
 The `shrink/development` branch provides the six commands below when
 `enabled true`, with independent spine rendering and compositor-owned hit regions.
 Adjacent selection includes a content preview. This is a partial development candidate;

@@ -15,7 +15,7 @@ use crate::niri::KeyboardFocus;
 // Fixtures do not render. Publish a renderer's visibility decision without changing role or
 // exercising hardware scanout, so policy tests can distinguish a visible projection from a
 // foreground window.
-fn publish_surface_visibility(
+pub(super) fn publish_surface_visibility(
     surface: &WlSurface,
     output: &smithay::output::Output,
     visible: bool,

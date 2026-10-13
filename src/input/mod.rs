@@ -730,7 +730,7 @@ impl State {
             return;
         }
 
-        // Reject an explicit Sink recall before the common touch cancellation can end a grab.
+        // Reject special-form activation before common touch cancellation can end a grab.
         let recall = match &action {
             Action::FocusWindow(id) => self
                 .niri
@@ -759,6 +759,11 @@ impl State {
         };
         if recall.is_some_and(|window| self.niri.layout.sink_depth(window).is_some())
             && !self.can_recall_sink(matches!(action, Action::MruConfirm))
+        {
+            return;
+        }
+        if recall.is_some_and(|window| self.niri.layout.is_spine(window))
+            && !self.can_activate_spine(matches!(action, Action::MruConfirm))
         {
             return;
         }
@@ -3047,7 +3052,16 @@ impl State {
                 }
             }
 
-            if self.try_start_spine_pointer_interaction(&pointer, button_code, serial) {
+            if button == Some(MouseButton::Left)
+                && !pointer.is_grabbed()
+                && self.try_activate_spine_tab(
+                    pointer.current_location(),
+                    crate::shrink_expand::SpatialInput::Pointer,
+                    serial,
+                )
+            {
+                // Tab indicators explicitly activate their identity without starting a body drag.
+            } else if self.try_start_spine_pointer_interaction(&pointer, button_code, serial) {
                 // The spine owns this press; it has no client surface to activate or forward to.
             } else if let Some(mapped) = self.niri.window_under_cursor() {
                 let window = mapped.window.clone();
@@ -3858,7 +3872,13 @@ impl State {
                             }
                         }
                     } else if !tool.is_grabbed() {
-                        if let Some((window, edges)) = self.spine_interaction_hit(pos) {
+                        if self.try_activate_spine_tab(
+                            pos,
+                            crate::shrink_expand::SpatialInput::Tablet,
+                            serial,
+                        ) {
+                            // Native tab activation has no client surface to receive this tip.
+                        } else if let Some((window, edges)) = self.spine_interaction_hit(pos) {
                             let start = AnyStartData::TabletTool(TabletToolGrabStartData {
                                 focus: None,
                                 trigger: tablet::tool::GrabTrigger::Tip,
@@ -4512,7 +4532,9 @@ impl State {
                 }
             }
         } else if !handle.is_grabbed() {
-            if let Some((window, edges)) = self.spine_interaction_hit(pos) {
+            if self.try_activate_spine_tab(pos, crate::shrink_expand::SpatialInput::Touch, serial) {
+                // Native tab activation has no client surface to receive this contact.
+            } else if let Some((window, edges)) = self.spine_interaction_hit(pos) {
                 let start = AnyStartData::Touch(TouchGrabStartData {
                     focus: None,
                     slot,

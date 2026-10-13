@@ -7,7 +7,952 @@ use crate::layout::shrink_expand::{ShrinkAxis, WindowForm};
 use crate::layout::LayoutElement as _;
 use crate::layout::SizingMode;
 
+#[test]
+fn shrink_explicit_activation_policy_precedes_form_and_preview_changes() {
+    use smithay::wayland::xdg_activation::{XdgActivationHandler, XdgActivationTokenData};
+    use std::time::{Duration, Instant};
+
+    for policy in ["ignore", "set-urgent", "focus", "urgent-only", "expired"] {
+        let SelectionFixture {
+            mut fixture,
+            client,
+            surfaces,
+            windows,
+        } = selection_fixture(false, false);
+        if matches!(policy, "ignore" | "set-urgent" | "focus") {
+            let mut config = expand_test_config();
+            config.window_rules = niri_config::Config::parse_mem(&format!(
+                "window-rule {{ on-xdg-activate \"{policy}\"; default-column-width {{ fixed 720; }}; default-window-height {{ fixed 400; }}; }}"
+            ))
+            .unwrap()
+            .window_rules;
+            fixture.niri_state().reload_config(Ok(config));
+        }
+        let preview = fixture.niri_state().begin_expand_selection().unwrap();
+        let target = &windows[2].1;
+        let mut data = XdgActivationTokenData::default();
+        if policy == "expired" {
+            data.timestamp = Instant::now() - Duration::from_secs(60);
+        }
+        let token = fixture
+            .niri()
+            .activation_state
+            .create_external_token(Some(data.clone()))
+            .0
+            .clone();
+        if policy == "urgent-only" {
+            assert!(XdgActivationHandler::token_created(
+                fixture.niri_state(),
+                token.clone(),
+                data.clone()
+            ));
+        }
+        XdgActivationHandler::request_activation(
+            fixture.niri_state(),
+            token.clone(),
+            data,
+            target.toplevel().unwrap().wl_surface().clone(),
+        );
+        fixture.double_roundtrip(client);
+        assert!(fixture
+            .niri()
+            .activation_state
+            .data_for_token(&token)
+            .is_none());
+        assert_eq!(fixture.niri().layout.is_spine(target), policy != "focus");
+        if policy == "focus" {
+            assert!(fixture.niri().shrink_expand.preview().is_none());
+            assert!(fixture.niri().shrink_preview_timer.is_none());
+            assert!(fixture.niri().layout.is_spine(&windows[1].1));
+            assert!(fixture.niri().keyboard_focus.surface().is_none());
+            let w = fixture.client(client).window(&surfaces[2]);
+            let size = w.configures_received.last().unwrap().1.size;
+            w.ack_last();
+            fixture.double_roundtrip(client);
+            assert!(fixture.niri().keyboard_focus.surface().is_none());
+            let w = fixture.client(client).window(&surfaces[2]);
+            w.set_size(size.0 as u16, size.1 as u16);
+            w.commit();
+            fixture.double_roundtrip(client);
+            assert_eq!(fixture.niri().layout.focus().unwrap().window, *target);
+            assert_eq!(
+                fixture
+                    .niri()
+                    .keyboard_focus
+                    .surface()
+                    .unwrap()
+                    .id()
+                    .protocol_id(),
+                surfaces[2].id().protocol_id()
+            );
+        } else {
+            assert_eq!(
+                fixture.niri().shrink_expand.preview().unwrap().record.id,
+                preview.id
+            );
+            assert_eq!(fixture.niri().layout.focus().unwrap().window, windows[0].1);
+            let mapped = fixture
+                .niri()
+                .layout
+                .windows()
+                .find(|(_, w)| &w.window == target)
+                .unwrap()
+                .1;
+            assert_eq!(
+                mapped.is_urgent(),
+                matches!(policy, "set-urgent" | "urgent-only")
+            );
+        }
+        assert_eq!(fixture.niri().layout.windows().count(), 4);
+    }
+}
+
+#[test]
+fn shrink_client_issued_activation_token_expands_only_after_valid_serial_policy() {
+    use smithay::reexports::wayland_protocols::xdg::activation::v1::client::xdg_activation_v1::XdgActivationV1;
+    for has_serial in [false, true] {
+        let SelectionFixture {
+            mut fixture,
+            client,
+            surfaces,
+            windows,
+        } = selection_fixture(false, false);
+        let activation: XdgActivationV1 = fixture.client(client).bind();
+        let qh = fixture.client(client).qh.clone();
+        let token = activation.get_activation_token(&qh, ());
+        if has_serial {
+            let state = &fixture.client(client).state;
+            let (seat, data) = state.seats.iter().next().unwrap();
+            token.set_serial(data.keyboard.as_ref().unwrap().last_enter.unwrap(), seat);
+        }
+        token.commit();
+        fixture.double_roundtrip(client);
+        let issued = fixture
+            .client(client)
+            .state
+            .activation_tokens
+            .pop()
+            .unwrap();
+        activation.activate(issued, &surfaces[2]);
+        fixture.double_roundtrip(client);
+        assert_eq!(fixture.niri().layout.is_spine(&windows[2].1), !has_serial);
+        assert!(fixture.niri().layout.is_spine(&windows[1].1));
+        if !has_serial {
+            assert_eq!(fixture.niri().layout.focus().unwrap().window, windows[0].1);
+        }
+    }
+}
+
+#[test]
+fn shrink_mru_browsing_cancel_and_confirmation_keep_identity_and_restore_only_on_confirm() {
+    use niri_config::Action;
+    for floating in [false, true] {
+        for confirm in [false, true] {
+            let SelectionFixture {
+                mut fixture,
+                client,
+                surfaces,
+                windows,
+            } = selection_fixture(true, floating);
+            fixture.niri_state().reload_config(Ok(expand_test_config()));
+            let timestamps = fixture
+                .niri()
+                .layout
+                .windows()
+                .map(|(_, w)| (w.id(), w.get_focus_timestamp()))
+                .collect::<Vec<_>>();
+            fixture.niri_state().do_action(
+                Action::MruAdvance {
+                    direction: niri_config::MruDirection::Forward,
+                    scope: None,
+                    filter: None,
+                },
+                false,
+            );
+            fixture.double_roundtrip(client);
+            assert!(fixture.niri().window_mru_ui.is_open());
+            assert!(windows
+                .iter()
+                .all(|(_, w)| fixture.niri().layout.is_spine(w)));
+            let id = fixture
+                .niri()
+                .window_mru_ui
+                .current_window_id()
+                .unwrap()
+                .get();
+            let index = windows
+                .iter()
+                .position(|(window_id, _)| *window_id == id)
+                .unwrap();
+            if !confirm {
+                fixture.niri_state().do_action(Action::MruCancel, false);
+                fixture.double_roundtrip(client);
+                assert!(windows
+                    .iter()
+                    .all(|(_, w)| fixture.niri().layout.is_spine(w)));
+                assert!(fixture.niri().shrink_expand_focus.is_none());
+                continue;
+            }
+            fixture.niri_state().do_action(Action::MruConfirm, false);
+            fixture.double_roundtrip(client);
+            assert!(!fixture.niri().window_mru_ui.is_open());
+            assert!(!fixture.niri().layout.is_spine(&windows[index].1));
+            assert!(windows
+                .iter()
+                .enumerate()
+                .all(|(i, (_, w))| i == index || fixture.niri().layout.is_spine(w)));
+            assert!(fixture.niri().keyboard_focus.surface().is_none());
+            assert!(fixture.niri().shrink_expand_focus.is_some());
+            let w = fixture.client(client).window(&surfaces[index]);
+            let size = w.configures_received.last().unwrap().1.size;
+            w.ack_last();
+            fixture.double_roundtrip(client);
+            assert!(fixture.niri().keyboard_focus.surface().is_none());
+            let w = fixture.client(client).window(&surfaces[index]);
+            w.set_size(size.0 as u16, size.1 as u16);
+            w.commit();
+            fixture.double_roundtrip(client);
+            assert_eq!(
+                fixture.niri().layout.focus().unwrap().window,
+                windows[index].1
+            );
+            assert_eq!(
+                fixture
+                    .niri()
+                    .keyboard_focus
+                    .surface()
+                    .unwrap()
+                    .id()
+                    .protocol_id(),
+                surfaces[index].id().protocol_id()
+            );
+            fixture.niri().mru_apply_keyboard_commit();
+            for (_, w) in fixture.niri().layout.windows() {
+                if w.id().get() != id {
+                    assert_eq!(
+                        w.get_focus_timestamp(),
+                        timestamps
+                            .iter()
+                            .find(|(old_id, _)| *old_id == w.id())
+                            .unwrap()
+                            .1
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn shrink_explicit_focus_and_foreign_activation_respect_input_owner_and_late_focus() {
+    use crate::niri::KeyboardFocus;
+    use crate::protocols::foreign_toplevel::ForeignToplevelHandler;
+    use niri_config::Action;
+    for foreign in [false, true] {
+        for navigate in [false, true] {
+            let SelectionFixture {
+                mut fixture,
+                client,
+                surfaces,
+                windows,
+            } = selection_fixture(false, false);
+            fixture.niri_state().reload_config(Ok(expand_test_config()));
+            let target = &windows[2].1;
+            for blocked in ["focus", "dnd", "touch"] {
+                match blocked {
+                    "focus" => fixture.niri().keyboard_focus = KeyboardFocus::ScreenshotUi,
+                    "dnd" => {
+                        let output = fixture.niri().layout.active_output().unwrap().clone();
+                        fixture
+                            .niri()
+                            .layout
+                            .dnd_update(output, (100., 100.).into());
+                    }
+                    "touch" => {
+                        let touch = fixture.niri().seat.add_touch();
+                        touch.down(
+                            fixture.niri_state(),
+                            None,
+                            &smithay::input::touch::DownEvent {
+                                slot: Some(0).into(),
+                                location: (0., 0.).into(),
+                                serial: smithay::utils::Serial::from(910),
+                                time: smithay::backend::input::InputTime::now(),
+                            },
+                        );
+                    }
+                    _ => unreachable!(),
+                }
+                if foreign {
+                    ForeignToplevelHandler::activate(
+                        fixture.niri_state(),
+                        target.toplevel().unwrap().wl_surface().clone(),
+                    );
+                } else {
+                    fixture
+                        .niri_state()
+                        .do_action(Action::FocusWindow(windows[2].0), false);
+                }
+                assert!(fixture.niri().layout.is_spine(target));
+                match blocked {
+                    "focus" => {
+                        fixture.niri().keyboard_focus = KeyboardFocus::Layout { surface: None }
+                    }
+                    "dnd" => fixture.niri().layout.dnd_end(),
+                    "touch" => {
+                        let touch = fixture.niri().seat.get_touch().unwrap();
+                        assert!(
+                            touch.is_grabbed(),
+                            "permission precedes common touch cancellation"
+                        );
+                        touch.unset_grab(fixture.niri_state());
+                    }
+                    _ => unreachable!(),
+                }
+            }
+            if foreign {
+                ForeignToplevelHandler::activate(
+                    fixture.niri_state(),
+                    target.toplevel().unwrap().wl_surface().clone(),
+                );
+            } else {
+                fixture
+                    .niri_state()
+                    .do_action(Action::FocusWindow(windows[2].0), false);
+            }
+            fixture.double_roundtrip(client);
+            assert!(!fixture.niri().layout.is_spine(target));
+            assert!(fixture.niri().keyboard_focus.surface().is_none());
+            let deadline = fixture
+                .niri()
+                .layout
+                .windows()
+                .find(|(_, w)| &w.window == target)
+                .unwrap()
+                .1
+                .normal_restore_deadline();
+            if navigate {
+                fixture
+                    .niri_state()
+                    .do_action(Action::FocusWindow(windows[0].0), false);
+                fixture.double_roundtrip(client);
+                assert!(fixture.niri().shrink_expand_focus.is_none());
+            }
+            let w = fixture.client(client).window(&surfaces[2]);
+            let size = w.configures_received.last().unwrap().1.size;
+            w.set_size(size.0 as u16, size.1 as u16);
+            w.ack_last_and_commit();
+            fixture.double_roundtrip(client);
+            assert_eq!(
+                fixture.niri().layout.focus().unwrap().window,
+                windows[if navigate { 0 } else { 2 }].1
+            );
+            assert!(deadline.is_some());
+        }
+    }
+}
+
 struct ShrinkIpcClient(std::io::BufReader<std::os::unix::net::UnixStream>);
+
+#[test]
+fn shrink_explicit_cross_output_focus_defers_native_cursor_migration_until_client_ready() {
+    for navigate in [false, true] {
+        let SelectionFixture {
+            mut fixture,
+            client,
+            surfaces,
+            windows,
+        } = selection_fixture(false, false);
+        fixture.add_output(2, (1280, 720));
+        let source = fixture.niri_output(1);
+        let output = fixture.niri_output(2);
+        fixture.niri().layout.move_to_output(
+            Some(&windows[2].1),
+            &output,
+            None,
+            crate::layout::ActivateWindow::No,
+        );
+        fixture.niri().layout.focus_output(&source);
+        fixture.niri_state().move_cursor_to_output(&source);
+        fixture.niri_state().reload_config(Ok(expand_test_config()));
+        fixture.double_roundtrip(client);
+        let pointer = fixture.niri().seat.get_pointer().unwrap();
+        let original = pointer.current_location();
+        fixture
+            .niri_state()
+            .do_action(niri_config::Action::FocusWindow(windows[2].0), false);
+        fixture.double_roundtrip(client);
+        assert_eq!(fixture.niri().layout.active_output(), Some(&output));
+        assert!(fixture.niri().shrink_expand_focus.is_some());
+        assert_eq!(
+            pointer.current_location(),
+            original,
+            "no cursor migration while waiting"
+        );
+        if navigate {
+            fixture
+                .niri_state()
+                .do_action(niri_config::Action::FocusWindow(windows[0].0), false);
+            fixture.double_roundtrip(client);
+            assert!(fixture.niri().shrink_expand_focus.is_none());
+        }
+        let w = fixture.client(client).window(&surfaces[2]);
+        let size = w.configures_received.last().unwrap().1.size;
+        w.set_size(size.0.max(1) as u16, size.1.max(1) as u16);
+        w.ack_last_and_commit();
+        fixture.double_roundtrip(client);
+        if navigate {
+            assert_eq!(pointer.current_location(), original);
+            assert_eq!(fixture.niri().layout.active_output(), Some(&source));
+        } else {
+            let rect = fixture
+                .niri()
+                .global_space
+                .output_geometry(&output)
+                .unwrap()
+                .to_f64();
+            assert!(rect.contains(pointer.current_location()));
+            assert_eq!(fixture.niri().layout.focus().unwrap().window, windows[2].1);
+        }
+    }
+}
+
+#[test]
+fn shrink_real_tab_indicator_click_expands_hidden_identity_and_keeps_own_press_focus_lease() {
+    use crate::layout::HitType;
+    for overview in [false, true] {
+        for hold in [false, true] {
+            let (mut fixture, client, surfaces, windows) = explicit_mode_fixture();
+            fixture.niri_state().reload_config(Ok(expand_test_config()));
+            // Change the native shared column while the book is hidden. Its preserved client
+            // size must differ from the new normal allocation, forcing a real restore barrier.
+            fixture
+                .niri()
+                .layout
+                .set_column_width(niri_ipc::SizeChange::SetFixed(900));
+            fixture.double_roundtrip(client);
+            if overview {
+                fixture.niri().layout.open_overview();
+            }
+            fixture.niri_complete_animations();
+            fixture.double_roundtrip(client);
+            let target = &windows[1];
+            let point = (0..720)
+                .step_by(2)
+                .find_map(|y| {
+                    (0..1280).step_by(2).find_map(|x| {
+                        let point = smithay::utils::Point::from((f64::from(x), f64::from(y)));
+                        fixture
+                            .niri()
+                            .contents_under(point)
+                            .window
+                            .filter(|(window, hit)| {
+                                window == target
+                                    && matches!(
+                                        hit,
+                                        HitType::Activate {
+                                            is_tab_indicator: true
+                                        }
+                                    )
+                            })
+                            .map(|_| (x as u32, y as u32))
+                    })
+                })
+                .expect("a real hidden-spine native tab indicator");
+            let c = fixture.client(client);
+            let pointer = c
+                .state
+                .virtual_pointer_manager
+                .as_ref()
+                .unwrap()
+                .create_virtual_pointer(None, &c.qh, ());
+            pointer.motion_absolute(1, point.0, point.1, 1280, 720);
+            pointer.frame();
+            fixture.double_roundtrip(client);
+            assert!(fixture.niri().layout.is_spine(target), "hover is passive");
+            pointer.button(
+                2,
+                0x110,
+                wayland_client::protocol::wl_pointer::ButtonState::Pressed,
+            );
+            pointer.frame();
+            fixture.double_roundtrip(client);
+            assert!(!fixture.niri().layout.is_spine(target));
+            assert!(fixture.niri().layout.is_spine(&windows[2]));
+            assert!(!fixture.niri().layout.is_overview_open());
+            let niri = fixture.niri();
+            assert!(
+                niri.shrink_expand_focus.is_some(),
+                "overview={overview} hold={hold}, focus={:?}, records={:?}, pointer={:?}",
+                niri.keyboard_focus,
+                niri.shrink_expand.records().collect::<Vec<_>>(),
+                niri.seat.get_pointer().unwrap().grab_start_data()
+            );
+            assert!(fixture.niri().keyboard_focus.surface().is_none());
+            if !hold {
+                pointer.button(
+                    3,
+                    0x110,
+                    wayland_client::protocol::wl_pointer::ButtonState::Released,
+                );
+                pointer.frame();
+                fixture.double_roundtrip(client);
+                assert!(fixture.niri().shrink_expand_focus.is_some());
+            }
+            let w = fixture.client(client).window(&surfaces[1]);
+            let size = w.configures_received.last().unwrap().1.size;
+            w.ack_last();
+            fixture.double_roundtrip(client);
+            assert!(fixture.niri().keyboard_focus.surface().is_none());
+            let w = fixture.client(client).window(&surfaces[1]);
+            w.set_size(size.0.max(1) as u16, size.1.max(1) as u16);
+            w.commit();
+            fixture.double_roundtrip(client);
+            assert_eq!(fixture.niri().layout.focus().unwrap().window, *target);
+            assert_eq!(
+                fixture.niri().keyboard_focus.surface(),
+                Some(target.toplevel().unwrap().wl_surface())
+            );
+            if hold {
+                pointer.button(
+                    3,
+                    0x110,
+                    wayland_client::protocol::wl_pointer::ButtonState::Released,
+                );
+                pointer.frame();
+                fixture.double_roundtrip(client);
+            }
+            assert!(fixture.niri().shrink_expand_focus.is_none());
+        }
+    }
+}
+
+#[test]
+fn shrink_system_idle_and_vrr_ignore_book_content_preview_without_erasing_output_feedback() {
+    use smithay::desktop::utils::surface_primary_scanout_output;
+    use smithay::wayland::compositor::with_states;
+    use smithay::wayland::idle_inhibit::IdleInhibitHandler;
+    use std::sync::atomic::Ordering;
+    for preview in [false, true] {
+        let SelectionFixture {
+            mut fixture,
+            client,
+            surfaces,
+            windows,
+        } = selection_fixture(false, false);
+        let mut config = expand_test_config();
+        config.window_rules = niri_config::Config::parse_mem(
+            "window-rule { variable-refresh-rate true; default-column-width { fixed 720; }; }",
+        )
+        .unwrap()
+        .window_rules;
+        fixture.niri_state().reload_config(Ok(config));
+        fixture.double_roundtrip(client);
+        let target = &windows[1].1;
+        let server = target.toplevel().unwrap().wl_surface().clone();
+        let output = fixture.niri_output(1);
+        if preview {
+            fixture.niri_state().begin_expand_selection().unwrap();
+        }
+        super::sink::publish_surface_visibility(&server, &output, true);
+        IdleInhibitHandler::inhibit(fixture.niri_state(), server.clone());
+        fixture.niri().refresh_idle_inhibit();
+        assert!(!fixture.niri().idle_notifier_state.is_inhibited());
+        assert!(!fixture.niri().has_visible_vrr_window(&output));
+        assert_eq!(
+            with_states(&server, |states| surface_primary_scanout_output(
+                &server, states
+            )),
+            Some(output.clone())
+        );
+        fixture
+            .niri()
+            .is_fdo_idle_inhibited
+            .store(true, Ordering::SeqCst);
+        fixture.niri().refresh_idle_inhibit();
+        assert!(fixture.niri().idle_notifier_state.is_inhibited());
+        fixture
+            .niri()
+            .is_fdo_idle_inhibited
+            .store(false, Ordering::SeqCst);
+        fixture.niri_state().focus_window(target);
+        fixture.double_roundtrip(client);
+        let w = fixture.client(client).window(&surfaces[1]);
+        let size = w.configures_received.last().unwrap().1.size;
+        w.set_size(size.0.max(1) as u16, size.1.max(1) as u16);
+        w.ack_last_and_commit();
+        fixture.double_roundtrip(client);
+        super::sink::publish_surface_visibility(&server, &output, true);
+        fixture.niri().refresh_idle_inhibit();
+        assert!(fixture.niri().idle_notifier_state.is_inhibited());
+        assert!(fixture.niri().has_visible_vrr_window(&output));
+        fixture.add_output(2, (1280, 720));
+        let second_output = fixture.niri_output(2);
+        assert!(!fixture.niri().has_visible_vrr_window(&second_output));
+        super::sink::publish_surface_visibility(&server, &output, false);
+        fixture.niri().refresh_idle_inhibit();
+        assert!(!fixture.niri().idle_notifier_state.is_inhibited());
+        assert!(!fixture.niri().has_visible_vrr_window(&output));
+    }
+}
+
+#[test]
+fn shrink_moving_xdg_mode_requests_keep_grab_and_form_until_final_native_owner() {
+    for floating in [false, true] {
+        for mode in ["fullscreen", "maximized", "windowed"] {
+            let (mut fixture, client, surfaces) = timed_shrink_fixture(2, floating, 60000);
+            let target = fixture.niri().layout.focus().unwrap().window.clone();
+            let id = fixture.niri().layout.focus().unwrap().id().get();
+            let ticket = fixture
+                .niri_state()
+                .begin_shrink_preview(Some(ShrinkAxis::Horizontal))
+                .unwrap()
+                .ticket();
+            fixture.niri_state().confirm_shrink_preview(ticket).unwrap();
+            fixture.double_roundtrip(client);
+            let pos = spine_test_point(&mut fixture, &target, (0.5, 0.5));
+            let pointer = spine_test_press(&mut fixture, pos);
+            spine_test_pointer_motion(
+                &mut fixture,
+                &pointer,
+                pos + smithay::utils::Point::from((350., 0.)),
+                true,
+            );
+            fixture.double_roundtrip(client);
+            let request = fixture
+                .niri()
+                .layout
+                .windows()
+                .find(|(_, w)| w.window == target)
+                .unwrap()
+                .1
+                .expected_size();
+            if mode == "windowed" {
+                fixture
+                    .niri_state()
+                    .do_action(niri_config::Action::ToggleWindowedFullscreenById(id), false);
+            } else {
+                let w = fixture.client(client).window(surfaces.last().unwrap());
+                if mode == "fullscreen" {
+                    w.xdg_toplevel.set_fullscreen(None);
+                } else {
+                    w.xdg_toplevel.set_maximized();
+                }
+            }
+            fixture.double_roundtrip(client);
+            assert!(pointer.is_grabbed());
+            assert!(fixture.niri().layout.is_spine(&target));
+            assert!(!fixture.niri().layout.can_transfer_sink());
+            let mapped = fixture
+                .niri()
+                .layout
+                .windows()
+                .find(|(_, w)| w.window == target)
+                .unwrap()
+                .1;
+            assert_eq!(mapped.expected_size(), request);
+            assert!(mapped.pending_sizing_mode().is_normal());
+            assert!(!mapped.is_pending_windowed_fullscreen());
+            spine_test_release(&mut fixture, &pointer);
+            fixture.double_roundtrip(client);
+            assert!(!pointer.is_grabbed());
+            assert!(fixture.niri().layout.can_transfer_sink());
+            assert!(!fixture.niri().layout.is_spine(&target));
+            assert!(fixture
+                .niri()
+                .keyboard_focus
+                .surface()
+                .is_none_or(|s| s != target.toplevel().unwrap().wl_surface()));
+            let w = fixture.client(client).window(surfaces.last().unwrap());
+            let config = &w.configures_received.last().unwrap().1;
+            assert!(config.states.contains(&if mode == "maximized" {
+                xdg_toplevel::State::Maximized
+            } else {
+                xdg_toplevel::State::Fullscreen
+            }));
+            let size = config.size;
+            w.ack_last();
+            fixture.double_roundtrip(client);
+            assert!(fixture
+                .niri()
+                .keyboard_focus
+                .surface()
+                .is_none_or(|s| s != target.toplevel().unwrap().wl_surface()));
+            let w = fixture.client(client).window(surfaces.last().unwrap());
+            w.set_size(
+                if size.0 == 0 { 300 } else { size.0 as u16 },
+                if size.1 == 0 { 200 } else { size.1 as u16 },
+            );
+            w.commit();
+            fixture.double_roundtrip(client);
+            let mapped = fixture
+                .niri()
+                .layout
+                .windows()
+                .find(|(_, w)| w.window == target)
+                .unwrap()
+                .1;
+            assert_eq!(mapped.id().get(), id);
+            assert!(mapped.normal_restore_ready());
+            assert_eq!(fixture.niri().layout.windows().count(), 2);
+        }
+    }
+}
+
+#[test]
+fn shrink_transient_parent_restores_without_parent_focus_and_child_waits_for_processed_commit() {
+    for floating in [false, true] {
+        for mapped_child in [false, true] {
+            let SelectionFixture {
+                mut fixture,
+                client,
+                surfaces,
+                windows,
+            } = selection_fixture(false, floating);
+            fixture.niri_state().reload_config(Ok(expand_test_config()));
+            let parent = &windows[2].1;
+            let parent_top = fixture
+                .client(client)
+                .window(&surfaces[2])
+                .xdg_toplevel
+                .clone();
+            let child = if mapped_child {
+                surfaces[0].clone()
+            } else {
+                fixture.client(client).create_window().surface.clone()
+            };
+            fixture
+                .client(client)
+                .window(&child)
+                .xdg_toplevel
+                .set_parent(Some(&parent_top));
+            if !mapped_child {
+                fixture.client(client).window(&child).commit();
+                fixture.roundtrip(client);
+                let w = fixture.client(client).window(&child);
+                w.attach_new_buffer();
+                w.set_size(200, 100);
+                w.ack_last_and_commit();
+            }
+            fixture.double_roundtrip(client);
+            assert!(!fixture.niri().layout.is_spine(parent));
+            assert!(fixture.niri().layout.is_spine(&windows[1].1));
+            assert!(fixture
+                .niri()
+                .layout
+                .find_window_and_output(parent.toplevel().unwrap().wl_surface())
+                .unwrap()
+                .0
+                .normal_restore_deadline()
+                .is_some());
+            let child_server = fixture
+                .niri()
+                .layout
+                .windows()
+                .find(|(_, w)| {
+                    w.toplevel().wl_surface().id().protocol_id() == child.id().protocol_id()
+                })
+                .unwrap()
+                .1
+                .window
+                .clone();
+            assert!(
+                fixture
+                    .niri()
+                    .layout
+                    .find_window_and_output(child_server.toplevel().unwrap().wl_surface())
+                    .unwrap()
+                    .0
+                    .sink_parent_input_blocked
+            );
+            assert_ne!(
+                fixture.niri().keyboard_focus.surface(),
+                Some(child_server.toplevel().unwrap().wl_surface())
+            );
+            assert_ne!(
+                fixture.niri().keyboard_focus.surface(),
+                Some(parent.toplevel().unwrap().wl_surface())
+            );
+            assert!(fixture.niri().shrink_expand_focus.is_none());
+            let w = fixture.client(client).window(&surfaces[2]);
+            let size = w.configures_received.last().unwrap().1.size;
+            w.ack_last();
+            fixture.double_roundtrip(client);
+            assert_ne!(
+                fixture.niri().keyboard_focus.surface(),
+                Some(child_server.toplevel().unwrap().wl_surface())
+            );
+            let w = fixture.client(client).window(&surfaces[2]);
+            w.set_size(size.0 as u16, size.1 as u16);
+            w.commit();
+            fixture.double_roundtrip(client);
+            assert!(
+                !fixture
+                    .niri()
+                    .layout
+                    .find_window_and_output(child_server.toplevel().unwrap().wl_surface())
+                    .unwrap()
+                    .0
+                    .sink_parent_input_blocked
+            );
+            assert_ne!(fixture.niri().layout.focus().unwrap().window, *parent);
+        }
+    }
+}
+
+#[test]
+fn shrink_transient_lock_defers_and_reparent_close_or_unlock_rechecks_live_identity() {
+    for finish in ["unlock", "reparent", "parent-close", "child-close"] {
+        let SelectionFixture {
+            mut fixture,
+            client,
+            surfaces,
+            windows,
+        } = selection_fixture(false, false);
+        fixture.niri_state().reload_config(Ok(expand_test_config()));
+        let lock = super::sink::lock_fixture(&mut fixture, client);
+        let parent_top = fixture
+            .client(client)
+            .window(&surfaces[2])
+            .xdg_toplevel
+            .clone();
+        fixture
+            .client(client)
+            .window(&surfaces[0])
+            .xdg_toplevel
+            .set_parent(Some(&parent_top));
+        fixture.double_roundtrip(client);
+        assert!(fixture.niri().layout.is_spine(&windows[2].1));
+        assert!(
+            fixture
+                .niri()
+                .layout
+                .find_window_and_output(windows[0].1.toplevel().unwrap().wl_surface())
+                .unwrap()
+                .0
+                .sink_parent_input_blocked
+        );
+        match finish {
+            "reparent" => fixture
+                .client(client)
+                .window(&surfaces[0])
+                .xdg_toplevel
+                .set_parent(None),
+            "parent-close" | "child-close" => {
+                let index = if finish == "parent-close" { 2 } else { 0 };
+                let w = fixture.client(client).window(&surfaces[index]);
+                w.attach_null();
+                w.commit();
+            }
+            _ => (),
+        }
+        fixture.double_roundtrip(client);
+        lock.unlock_and_destroy();
+        fixture.double_roundtrip(client);
+        if finish == "unlock" {
+            assert!(!fixture.niri().layout.is_spine(&windows[2].1));
+            let mapped = fixture
+                .niri()
+                .layout
+                .find_window_and_output(windows[2].1.toplevel().unwrap().wl_surface())
+                .unwrap()
+                .0;
+            let deadline = mapped.normal_restore_deadline().unwrap();
+            std::thread::sleep(
+                deadline.saturating_duration_since(std::time::Instant::now())
+                    + std::time::Duration::from_millis(5),
+            );
+            fixture.double_roundtrip(client);
+            assert!(
+                !fixture
+                    .niri()
+                    .layout
+                    .find_window_and_output(windows[0].1.toplevel().unwrap().wl_surface())
+                    .unwrap()
+                    .0
+                    .sink_parent_input_blocked
+            );
+        } else if finish != "parent-close" {
+            assert!(fixture.niri().layout.is_spine(&windows[2].1));
+        }
+        assert!(fixture.niri().shrink_expand_focus.is_none());
+    }
+}
+
+#[test]
+fn shrink_late_parent_revokes_child_grabs_and_defers_only_while_native_owner_is_active() {
+    use crate::input::click_grab::ClickGrab;
+    use smithay::input::pointer::{Focus, GrabStartData};
+    for device in ["pointer", "touch"] {
+        let SelectionFixture {
+            mut fixture,
+            client,
+            surfaces,
+            windows,
+        } = selection_fixture(false, false);
+        fixture.niri_state().reload_config(Ok(expand_test_config()));
+        let child_surface = windows[0].1.toplevel().unwrap().wl_surface().clone();
+        let pointer = fixture.niri().seat.get_pointer().unwrap();
+        let touch = fixture.niri().seat.add_touch();
+        if device == "pointer" {
+            pointer.set_grab(
+                fixture.niri_state(),
+                ClickGrab::new(GrabStartData {
+                    focus: Some((child_surface.clone(), (0., 0.).into())),
+                    button: 0x110,
+                    location: (10., 10.).into(),
+                }),
+                smithay::utils::Serial::from(920),
+                Focus::Keep,
+            );
+        } else {
+            touch.down(
+                fixture.niri_state(),
+                Some((child_surface.clone(), (0., 0.).into())),
+                &smithay::input::touch::DownEvent {
+                    slot: Some(0).into(),
+                    location: (10., 10.).into(),
+                    serial: smithay::utils::Serial::from(920),
+                    time: smithay::backend::input::InputTime::now(),
+                },
+            );
+        }
+        let parent_top = fixture
+            .client(client)
+            .window(&surfaces[2])
+            .xdg_toplevel
+            .clone();
+        fixture
+            .client(client)
+            .window(&surfaces[0])
+            .xdg_toplevel
+            .set_parent(Some(&parent_top));
+        fixture.double_roundtrip(client);
+        if device == "pointer" {
+            assert!(pointer.grab_start_data().unwrap().focus.is_none());
+            assert!(fixture.niri().layout.is_spine(&windows[2].1));
+            pointer.unset_grab(
+                fixture.niri_state(),
+                smithay::utils::Serial::from(921),
+                smithay::backend::input::InputTime::now(),
+            );
+        } else {
+            assert!(!touch.is_grabbed());
+        }
+        fixture.double_roundtrip(client);
+        assert!(!fixture.niri().layout.is_spine(&windows[2].1));
+        assert!(
+            fixture
+                .niri()
+                .layout
+                .find_window_and_output(&child_surface)
+                .unwrap()
+                .0
+                .sink_parent_input_blocked
+        );
+        assert!(fixture.niri().shrink_expand_focus.is_none());
+    }
+}
 
 fn spatial_test_pointer(
     fixture: &mut Fixture,

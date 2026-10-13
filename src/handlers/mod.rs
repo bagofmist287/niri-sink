@@ -539,7 +539,7 @@ impl ForeignToplevelHandler for State {
     fn activate(&mut self, wl_surface: WlSurface) {
         if let Some((mapped, _)) = self.niri.layout.find_window_and_output(&wl_surface) {
             let window = mapped.window.clone();
-            if !self.prepare_sink_recall(&window) {
+            if !self.prepare_window_activation(&window) {
                 return;
             }
             self.niri.layout.activate_window(&window);
@@ -836,7 +836,7 @@ impl XdgActivationHandler for State {
                         }
                     }
                 };
-                if focus && self.prepare_sink_recall(&window) {
+                if focus && self.prepare_window_activation(&window) {
                     self.niri.layout.activate_window(&window);
                     self.niri.layer_shell_on_demand_focus = None;
                     self.niri.queue_redraw_all();

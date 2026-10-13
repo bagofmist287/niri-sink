@@ -1115,14 +1115,15 @@ impl State {
     /// Focus a specific window, taking care of a potential active output change and cursor
     /// warp.
     pub fn focus_window(&mut self, window: &Window) {
-        if !self.prepare_sink_recall(window) {
+        let active_output = self.niri.layout.active_output().cloned();
+        if !self.prepare_window_activation(window) {
             return;
         }
-        let active_output = self.niri.layout.active_output().cloned();
+        self.plan_spine_activation_warp(window, active_output.as_ref());
 
         self.niri.layout.activate_window(window);
         self.plan_sink_focus(window);
-        if self.niri.sink_focus_plan.is_some() {
+        if self.niri.sink_focus_plan.is_some() || self.niri.layout.focus().is_none() {
             self.niri.queue_redraw_all();
             return;
         }
@@ -1195,6 +1196,12 @@ impl State {
             self.plan_sink_focus(window);
         }
         restored
+    }
+
+    /// Policy-approved activation restores special forms at their existing native owner.
+    /// Passive selection and ordinary Layout activation do not use this entry point.
+    pub(crate) fn prepare_window_activation(&mut self, window: &Window) -> bool {
+        self.prepare_spine_activation(window) && self.prepare_sink_recall(window)
     }
 
     pub fn plan_sink_focus(&mut self, window: &Window) {
@@ -1292,8 +1299,14 @@ impl State {
             .layout
             .with_windows_mut(|mapped, _| mapped.sink_parent_input_blocked = false);
         if !self.niri.layout.workspaces().any(|(_, _, ws)| {
-            ws.sink_count() > 0 || ws.tiles().any(|tile| tile.is_sink_restoring())
-        }) {
+            ws.sink_count() > 0
+                || ws.tiles().any(|tile| {
+                    tile.is_sink_restoring()
+                        || tile.is_spine()
+                        || !tile.window().normal_restore_ready()
+                })
+        }) && !self.niri.layout.has_spines()
+        {
             return;
         }
         if self.can_recall_sink(false) {
@@ -1316,10 +1329,14 @@ impl State {
                 .filter_map(|window| window.toplevel()?.parent())
                 .filter_map(|surface| self.niri.layout.find_window_and_output(&surface))
                 .map(|(mapped, _)| mapped.window.clone())
-                .filter(|window| self.niri.layout.sink_depth(window).is_some())
+                .filter(|window| {
+                    self.niri.layout.sink_depth(window).is_some()
+                        || self.niri.layout.is_spine(window)
+                })
                 .collect();
             for parent in parents {
                 self.prepare_sink_recall(&parent);
+                self.prepare_spine_parent(&parent);
             }
         }
         let blocked: Vec<_> = self
@@ -1432,8 +1449,9 @@ impl State {
 
     pub fn confirm_mru(&mut self) {
         if let Some(window) = self.niri.close_mru(MruCloseRequest::Confirm) {
-            if self.niri.layout.sink_depth(&window).is_some() {
-                if !self.prepare_sink_recall(&window) {
+            if self.niri.layout.sink_depth(&window).is_some() || self.niri.layout.is_spine(&window)
+            {
+                if !self.prepare_window_activation(&window) {
                     return;
                 }
                 // Select the restored target before handing the closed MRU's keyboard focus back.
@@ -3798,6 +3816,8 @@ impl Niri {
                 return false;
             };
             if self.layout.sink_depth(&mapped.window).is_some()
+                || self.layout.is_spine(&mapped.window)
+                || !mapped.normal_restore_ready()
                 || self.layout.workspaces().any(|(_, _, ws)| {
                     ws.tiles().any(|tile| {
                         tile.window().window == mapped.window
@@ -4562,7 +4582,7 @@ impl Niri {
 
         let is_inhibited = self.is_fdo_idle_inhibited.load(Ordering::SeqCst)
             || self.idle_inhibiting_surfaces.iter().any(|surface| {
-                !self.is_sunk_surface(surface)
+                !self.is_background_policy_surface(surface)
                     && with_states(surface, |states| {
                         surface_primary_scanout_output(surface, states).is_some()
                     })
@@ -4570,9 +4590,11 @@ impl Niri {
         self.idle_notifier_state.set_is_inhibited(is_inhibited);
     }
 
-    fn is_sunk_surface(&self, surface: &WlSurface) -> bool {
+    fn is_background_policy_surface(&self, surface: &WlSurface) -> bool {
         self.layout.windows().any(|(_, mapped)| {
-            if self.layout.sink_depth(&mapped.window).is_none() {
+            if self.layout.sink_depth(&mapped.window).is_none()
+                && !self.layout.is_spine(&mapped.window)
+            {
                 return false;
             }
             let mut owned = false;
@@ -5309,6 +5331,7 @@ impl Niri {
     pub(crate) fn has_visible_vrr_window(&self, output: &Output) -> bool {
         self.layout.windows_for_output(output).any(|mapped| {
             self.layout.sink_depth(&mapped.window).is_none()
+                && !self.layout.is_spine(&mapped.window)
                 && mapped.rules().variable_refresh_rate == Some(true)
                 && {
                     let mut visible = false;

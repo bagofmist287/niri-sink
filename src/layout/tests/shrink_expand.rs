@@ -5,6 +5,142 @@ use crate::layout::shrink_expand::{ShrinkAxis, SpineGeometry, WindowForm};
 use crate::layout::workspace::{Workspace, WorkspaceAddWindowTarget};
 
 #[test]
+fn moving_spine_mode_intent_waits_for_native_drop_and_toggles_virtual_flags() {
+    for scale in [1., 1.25] {
+        for floating in [false, true] {
+            for starting in [false, true] {
+                for case in [
+                    "full",
+                    "max",
+                    "latent",
+                    "windowed",
+                    "cancel-full",
+                    "cancel-windowed",
+                ] {
+                    let mut options = Options::default();
+                    options.animations.off = true;
+                    let mut layout =
+                        Layout::with_options(Clock::with_time(Duration::ZERO), options);
+                    layout.clock.set_complete_instantly(true);
+                    Op::AddScaledOutput {
+                        id: 1,
+                        scale,
+                        layout_config: None,
+                    }
+                    .apply(&mut layout);
+                    Op::AddWindow {
+                        params: TestWindowParams::new(1),
+                    }
+                    .apply(&mut layout);
+                    Op::Communicate(1).apply(&mut layout);
+                    if floating {
+                        layout.set_window_floating(Some(&1), true);
+                    }
+                    Op::Communicate(1).apply(&mut layout);
+                    assert!(layout.commit_shrink(&1, ShrinkAxis::Horizontal, 32.));
+                    let client = layout.windows().next().unwrap().1.clone();
+                    let request = client.requested_size();
+                    layout.advance_animations();
+                    let output = layout.outputs().next().unwrap().clone();
+                    assert!(layout.interactive_move_begin(1, &output, (10., 100.).into()));
+                    // The first request can arrive before native detachment.
+                    layout.request_toggle_fullscreen(&1);
+                    if !starting {
+                        layout.interactive_move_update(
+                            &1,
+                            (350., 0.).into(),
+                            output,
+                            (500., 300.).into(),
+                        );
+                        assert!(matches!(
+                            layout.interactive_move,
+                            Some(InteractiveMoveState::Moving(_))
+                        ));
+                    }
+                    match case {
+                        "full" => (),
+                        "max" => {
+                            layout.request_fullscreen(&1, false);
+                            layout.request_maximized(&1, true);
+                        }
+                        "latent" => layout.request_maximized(&1, true),
+                        "windowed" => {
+                            layout.request_maximized(&1, true);
+                            layout.request_toggle_windowed_fullscreen(&1);
+                        }
+                        "cancel-full" => layout.request_toggle_fullscreen(&1),
+                        "cancel-windowed" => {
+                            layout.request_toggle_windowed_fullscreen(&1);
+                            layout.request_fullscreen(&1, false);
+                        }
+                        _ => unreachable!(),
+                    }
+                    assert!(layout.is_spine(&1));
+                    assert_eq!(client.requested_size(), request);
+                    assert!(client.pending_sizing_mode().is_normal());
+                    assert!(!client.is_pending_windowed_fullscreen());
+                    layout.verify_invariants();
+                    layout.interactive_move_end(&1);
+                    assert!(layout.moving_spine_mode.is_none());
+                    assert!(!layout.is_spine(&1));
+                    let expected = match case {
+                        "full" | "latent" => SizingMode::Fullscreen,
+                        "max" | "windowed" => SizingMode::Maximized,
+                        _ => SizingMode::Normal,
+                    };
+                    assert_eq!(client.pending_sizing_mode(), expected, "{case}");
+                    assert_eq!(client.is_pending_windowed_fullscreen(), case == "windowed");
+                    if case == "latent" {
+                        layout.request_fullscreen(&1, false);
+                        assert_eq!(client.pending_sizing_mode(), SizingMode::Maximized);
+                    }
+                    assert!(Rc::ptr_eq(
+                        &layout.windows().next().unwrap().1 .0,
+                        &client.0
+                    ));
+                    layout.verify_invariants();
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn moving_spine_mode_close_removes_intent_and_normal_move_keeps_native_policy() {
+    for spine in [false, true] {
+        let mut layout = Layout::with_options(Clock::with_time(Duration::ZERO), Options::default());
+        Op::AddOutput(1).apply(&mut layout);
+        Op::AddWindow {
+            params: TestWindowParams::new(1),
+        }
+        .apply(&mut layout);
+        Op::Communicate(1).apply(&mut layout);
+        if spine {
+            assert!(layout.commit_shrink(&1, ShrinkAxis::Vertical, 32.));
+        }
+        let output = layout.outputs().next().unwrap().clone();
+        layout.interactive_move_begin(1, &output, (100., 10.).into());
+        layout.interactive_move_update(&1, (300., 0.).into(), output, (500., 300.).into());
+        let request = layout.windows().next().unwrap().1.requested_size();
+        layout.request_fullscreen(&1, true);
+        assert_eq!(layout.moving_spine_mode.is_some(), spine);
+        assert!(layout
+            .windows()
+            .next()
+            .unwrap()
+            .1
+            .pending_sizing_mode()
+            .is_normal());
+        assert_eq!(layout.windows().next().unwrap().1.requested_size(), request);
+        layout.remove_window(&1, Transaction::new());
+        assert!(layout.moving_spine_mode.is_none());
+        assert!(layout.interactive_move.is_none());
+        assert_eq!(layout.windows().count(), 0);
+        layout.verify_invariants();
+    }
+}
+
+#[test]
 fn spine_search_uses_native_slots_and_keeps_scope_separate_from_floating_and_sink() {
     use crate::layout::spine_search::SpineSearchMode;
     for scale in [1., 1.25] {
@@ -2204,9 +2340,12 @@ fn moving_book_mode_requests_do_not_partially_restore_or_change_client_intent() 
         assert!(!window.is_pending_windowed_fullscreen());
         assert_eq!(layout.windows().count(), 1);
         layout.verify_invariants();
-        // Deferred mode intent after drop remains an E4 task; rejection is not the final feature.
+        // The final virtual intent is windowed fullscreen with latent maximize.
         layout.interactive_move_end(&1);
-        assert!(layout.is_spine(&1));
+        assert!(!layout.is_spine(&1));
+        assert_eq!(window.pending_sizing_mode(), SizingMode::Maximized);
+        assert!(window.is_pending_windowed_fullscreen());
+        layout.verify_invariants();
     }
 }
 

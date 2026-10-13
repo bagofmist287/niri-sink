@@ -602,6 +602,12 @@ enum Op {
     CloseWindow(#[proptest(strategy = "1..=5usize")] usize),
     SinkWindow,
     PullWindow,
+    ShrinkWindow {
+        #[proptest(strategy = "1..=5usize")]
+        window: usize,
+        horizontal: bool,
+    },
+    ExpandWindow(#[proptest(strategy = "1..=5usize")] usize),
     UnwindSink(#[proptest(strategy = "1..=5usize")] usize),
     FullscreenWindow(#[proptest(strategy = "1..=5usize")] usize),
     SetFullscreenWindow {
@@ -610,6 +616,13 @@ enum Op {
         is_fullscreen: bool,
     },
     ToggleWindowedFullscreen(#[proptest(strategy = "1..=5usize")] usize),
+    RequestWindowMode {
+        #[proptest(strategy = "1..=5usize")]
+        window: usize,
+        #[proptest(strategy = "0..=4u8")]
+        kind: u8,
+        value: bool,
+    },
     FocusColumnLeft,
     FocusColumnRight,
     FocusColumnFirst,
@@ -1221,6 +1234,21 @@ impl Op {
                     layout.activate_window(&id);
                 }
             }
+            Op::ShrinkWindow { window, horizontal } => {
+                let axis = if horizontal {
+                    crate::layout::shrink_expand::ShrinkAxis::Horizontal
+                } else {
+                    crate::layout::shrink_expand::ShrinkAxis::Vertical
+                };
+                layout.commit_shrink(&window, axis, 32.);
+            }
+            Op::ExpandWindow(id) => {
+                if layout.can_transfer_sink() {
+                    if let Some(ws) = layout.workspaces_mut().find(|ws| ws.has_window(&id)) {
+                        ws.restore_normal_spines(&[id]);
+                    }
+                }
+            }
             Op::CloseWindow(id) => {
                 layout.remove_window(&id, Transaction::new());
             }
@@ -1244,6 +1272,23 @@ impl Op {
                     return;
                 }
                 layout.toggle_windowed_fullscreen(&id);
+            }
+            Op::RequestWindowMode {
+                window,
+                kind,
+                value,
+            } => {
+                if !layout.has_window(&window) {
+                    return;
+                }
+                match kind {
+                    0 => layout.request_fullscreen(&window, value),
+                    1 => layout.request_maximized(&window, value),
+                    2 => layout.request_toggle_fullscreen(&window),
+                    3 => layout.request_toggle_maximized(&window),
+                    4 => layout.request_toggle_windowed_fullscreen(&window),
+                    _ => unreachable!(),
+                }
             }
             Op::FocusColumnLeft => layout.focus_left(),
             Op::FocusColumnRight => layout.focus_right(),
@@ -1946,6 +1991,25 @@ fn operations_dont_panic() {
     }
 
     let every_op = [
+        Op::ShrinkWindow {
+            window: 1,
+            horizontal: true,
+        },
+        Op::ShrinkWindow {
+            window: 1,
+            horizontal: false,
+        },
+        Op::ExpandWindow(1),
+        Op::RequestWindowMode {
+            window: 1,
+            kind: 0,
+            value: true,
+        },
+        Op::RequestWindowMode {
+            window: 1,
+            kind: 4,
+            value: true,
+        },
         Op::AddOutput(0),
         Op::AddOutput(1),
         Op::AddOutput(2),
@@ -2103,6 +2167,25 @@ fn operations_from_starting_state_dont_panic() {
     ];
 
     let every_op = [
+        Op::ShrinkWindow {
+            window: 1,
+            horizontal: true,
+        },
+        Op::ShrinkWindow {
+            window: 1,
+            horizontal: false,
+        },
+        Op::ExpandWindow(1),
+        Op::RequestWindowMode {
+            window: 1,
+            kind: 0,
+            value: true,
+        },
+        Op::RequestWindowMode {
+            window: 1,
+            kind: 4,
+            value: true,
+        },
         Op::AddOutput(0),
         Op::AddOutput(1),
         Op::AddOutput(2),

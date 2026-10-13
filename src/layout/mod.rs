@@ -408,6 +408,8 @@ pub struct Layout<W: LayoutElement> {
     last_active_workspace_id: HashMap<String, WorkspaceId>,
     /// Ongoing interactive move.
     interactive_move: Option<InteractiveMoveState<W>>,
+    /// Final explicit mode intent for the one moving spine, without changing its live geometry.
+    moving_spine_mode: Option<(W::Id, MovingSpineMode)>,
     /// Ongoing drag-and-drop operation.
     dnd: Option<DndData<W>>,
     /// Clock for driving animations.
@@ -442,6 +444,13 @@ enum MonitorSet<W: LayoutElement> {
         /// The workspaces.
         workspaces: Vec<Workspace<W>>,
     },
+}
+
+#[derive(Debug, Clone, Copy)]
+struct MovingSpineMode {
+    fullscreen: bool,
+    maximized: bool,
+    windowed: bool,
 }
 
 #[derive(Debug, Default, Clone, PartialEq)]
@@ -781,6 +790,7 @@ impl<W: LayoutElement> Layout<W> {
             is_active: true,
             last_active_workspace_id: HashMap::new(),
             interactive_move: None,
+            moving_spine_mode: None,
             dnd: None,
             clock,
             update_render_elements_time: Duration::ZERO,
@@ -807,6 +817,7 @@ impl<W: LayoutElement> Layout<W> {
             is_active: true,
             last_active_workspace_id: HashMap::new(),
             interactive_move: None,
+            moving_spine_mode: None,
             dnd: None,
             clock,
             update_render_elements_time: Duration::ZERO,
@@ -1217,6 +1228,14 @@ impl<W: LayoutElement> Layout<W> {
         window: &W::Id,
         transaction: Transaction,
     ) -> Option<RemovedTile<W>> {
+        if self.interactive_move.is_some()
+            && self
+                .moving_spine_mode
+                .as_ref()
+                .is_some_and(|(id, _)| id == window)
+        {
+            self.moving_spine_mode = None;
+        }
         if let Some(state) = &self.interactive_move {
             match state {
                 InteractiveMoveState::Starting { window_id, .. } => {
@@ -1701,6 +1720,13 @@ impl<W: LayoutElement> Layout<W> {
     /// Form query that includes the temporary native owner during a move.
     pub fn is_spine(&self, id: &W::Id) -> bool {
         self.spine_axis(id).is_some()
+    }
+
+    pub(crate) fn has_spines(&self) -> bool {
+        matches!(&self.interactive_move, Some(InteractiveMoveState::Moving(move_)) if move_.tile.is_spine())
+            || self
+                .workspaces()
+                .any(|(_, _, ws)| ws.tiles().any(Tile::is_spine))
     }
 
     /// Persistent locked axis, including the temporary native owner during a move.
@@ -2751,6 +2777,16 @@ impl<W: LayoutElement> Layout<W> {
         use std::collections::HashSet;
 
         use approx::assert_abs_diff_eq;
+
+        if let Some((id, mode)) = &self.moving_spine_mode {
+            assert!(!(mode.fullscreen && mode.windowed));
+            assert!(self.is_spine(id));
+            assert!(match &self.interactive_move {
+                Some(InteractiveMoveState::Starting { window_id, .. }) => window_id == id,
+                Some(InteractiveMoveState::Moving(move_)) => move_.tile.window().id() == id,
+                None => false,
+            });
+        }
 
         let zoom = self.overview_zoom();
 
@@ -3938,6 +3974,62 @@ impl<W: LayoutElement> Layout<W> {
             .unwrap_or_default()
     }
 
+    fn moving_spine_mode_mut(&mut self, id: &W::Id) -> Option<&mut MovingSpineMode> {
+        let moving = match &self.interactive_move {
+            Some(InteractiveMoveState::Starting { window_id, .. }) => window_id == id,
+            Some(InteractiveMoveState::Moving(move_)) => move_.tile.window().id() == id,
+            None => false,
+        };
+        if !moving || !self.is_spine(id) {
+            return None;
+        }
+        if self.moving_spine_mode.is_none() {
+            let (fullscreen, maximized) = self.column_pending_modes(id);
+            let windowed = self
+                .windows()
+                .find(|(_, win)| win.id() == id)
+                .unwrap()
+                .1
+                .is_pending_windowed_fullscreen();
+            self.moving_spine_mode = Some((
+                id.clone(),
+                MovingSpineMode {
+                    fullscreen,
+                    maximized,
+                    windowed,
+                },
+            ));
+        }
+        Some(&mut self.moving_spine_mode.as_mut().unwrap().1)
+    }
+
+    fn finish_moving_spine_mode(&mut self, id: &W::Id) {
+        let Some((target, mode)) = self.moving_spine_mode.take() else {
+            return;
+        };
+        debug_assert_eq!(&target, id);
+        let (fullscreen, maximized) = self.column_pending_modes(id);
+        let column_mode = fullscreen || maximized || mode.fullscreen || mode.maximized;
+        let Some(restored) = self.prepare_spines_for_mode_request(id, column_mode) else {
+            return;
+        };
+        // Apply one final intent at the native drop owner. Maximize remains latent under real
+        // fullscreen; windowed fullscreen excludes real fullscreen but retains that latent flag.
+        let pending_windowed = self
+            .windows()
+            .find(|(_, win)| win.id() == id)
+            .is_some_and(|(_, win)| win.is_pending_windowed_fullscreen());
+        if pending_windowed && !mode.windowed {
+            self.set_windowed_fullscreen(id, false);
+        }
+        self.set_maximized(id, mode.maximized);
+        self.set_fullscreen(id, mode.fullscreen);
+        if mode.windowed {
+            self.set_windowed_fullscreen(id, true);
+        }
+        self.finish_spine_mode_request(&restored);
+    }
+
     fn prepare_spines_for_mode_request(
         &mut self,
         id: &W::Id,
@@ -3979,6 +4071,17 @@ impl<W: LayoutElement> Layout<W> {
     }
 
     pub fn request_fullscreen(&mut self, id: &W::Id, value: bool) {
+        if let Some(mode) = self.moving_spine_mode_mut(id) {
+            if !value && mode.windowed {
+                mode.windowed = false;
+            } else {
+                mode.fullscreen = value;
+                if value {
+                    mode.windowed = false;
+                }
+            }
+            return;
+        }
         // Unfullscreen can be client-only (windowed fullscreen); duplicate unsets of a
         // normal column also leave other tabs untouched. Resolve scope before restoring form.
         let pending_windowed = self
@@ -3997,11 +4100,20 @@ impl<W: LayoutElement> Layout<W> {
         if self.sink_depth(id).is_some() {
             return;
         }
+        if let Some(mode) = self.moving_spine_mode_mut(id) {
+            mode.fullscreen = !mode.fullscreen;
+            mode.windowed = false;
+            return;
+        }
         let value = !self.column_pending_modes(id).0;
         self.request_fullscreen(id, value);
     }
 
     pub fn request_maximized(&mut self, id: &W::Id, value: bool) {
+        if let Some(mode) = self.moving_spine_mode_mut(id) {
+            mode.maximized = value;
+            return;
+        }
         let column_mode = value || self.column_pending_modes(id).1;
         let Some(restored) = self.prepare_spines_for_mode_request(id, column_mode) else {
             return;
@@ -4014,12 +4126,21 @@ impl<W: LayoutElement> Layout<W> {
         if self.sink_depth(id).is_some() {
             return;
         }
+        if let Some(mode) = self.moving_spine_mode_mut(id) {
+            mode.maximized = !mode.maximized;
+            return;
+        }
         let value = !self.column_pending_modes(id).1;
         self.request_maximized(id, value);
     }
 
     pub fn request_toggle_windowed_fullscreen(&mut self, id: &W::Id) {
         if self.sink_depth(id).is_some() {
+            return;
+        }
+        if let Some(mode) = self.moving_spine_mode_mut(id) {
+            mode.windowed = !mode.windowed;
+            mode.fullscreen = false;
             return;
         }
         let Some((_, window)) = self.windows().find(|(_, win)| win.id() == id) else {
@@ -4673,6 +4794,7 @@ impl<W: LayoutElement> Layout<W> {
                     }
                 }
 
+                self.finish_moving_spine_mode(window);
                 return;
             }
             InteractiveMoveState::Moving(move_) => move_,
@@ -4915,6 +5037,7 @@ impl<W: LayoutElement> Layout<W> {
                 );
             }
         }
+        self.finish_moving_spine_mode(window);
     }
 
     pub fn interactive_move_is_moving_above_output(&self, output: &Output) -> bool {
