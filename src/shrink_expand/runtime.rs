@@ -110,6 +110,14 @@ impl State {
                     .seat
                     .get_touch()
                     .is_some_and(|touch| touch.is_grabbed()))
+            && (input == SpatialInput::Tablet
+                || !self
+                    .niri
+                    .seat
+                    .tablet_seat()
+                    .get_tools()
+                    .into_values()
+                    .any(|tool| tool.is_grabbed()))
     }
 
     /// Called only by the compositor's existing ResizeGrab, while its own grab may be borrowed.

@@ -528,6 +528,176 @@ fn shrink_real_tab_indicator_click_expands_hidden_identity_and_keeps_own_press_f
 }
 
 #[test]
+fn shrink_tab_touch_and_tablet_activation_preserve_native_press_and_restore_barrier() {
+    use crate::layout::HitType;
+    use crate::shrink_expand::SpatialInput;
+    use smithay::backend::input::{
+        InputTime, TabletToolCapabilities, TabletToolDescriptor, TabletToolType,
+    };
+    use smithay::input::tablet::tool::{
+        DownEvent as TabletDown, ProximityInEvent, UpEvent as TabletUp,
+    };
+    use smithay::input::tablet::{TabletDescriptor, TabletSeatTrait};
+    use smithay::input::touch::{DownEvent as TouchDown, UpEvent as TouchUp};
+    use smithay::utils::{Point, Serial};
+
+    for input in [SpatialInput::Touch, SpatialInput::Tablet] {
+        for overview in [false, true] {
+            for hold in [false, true] {
+                let (mut fixture, client, surfaces, windows) = explicit_mode_fixture();
+                fixture.niri_state().reload_config(Ok(expand_test_config()));
+                fixture
+                    .niri()
+                    .layout
+                    .set_column_width(niri_ipc::SizeChange::SetFixed(900));
+                fixture.double_roundtrip(client);
+                if overview {
+                    fixture.niri().layout.open_overview();
+                }
+                fixture.niri_complete_animations();
+                fixture.double_roundtrip(client);
+                let target = &windows[1];
+                let pos = (0..720)
+                    .step_by(2)
+                    .find_map(|y| {
+                        (0..1280).step_by(2).find_map(|x| {
+                            let pos = Point::from((f64::from(x), f64::from(y)));
+                            fixture
+                                .niri()
+                                .contents_under(pos)
+                                .window
+                                .filter(|(window, hit)| {
+                                    window == target
+                                        && matches!(
+                                            hit,
+                                            HitType::Activate {
+                                                is_tab_indicator: true
+                                            }
+                                        )
+                                })
+                                .map(|_| pos)
+                        })
+                    })
+                    .expect("native hidden book tab");
+                let touch = fixture.niri().seat.add_touch();
+                let tool = if input == SpatialInput::Tablet {
+                    let seat = fixture.niri().seat.tablet_seat();
+                    let tablet = seat.add_tablet(&TabletDescriptor {
+                        name: "tab-test".into(),
+                        usb_id: None,
+                        syspath: None,
+                    });
+                    let tool = seat.add_tool(&TabletToolDescriptor {
+                        tool_type: TabletToolType::Pen,
+                        hardware_serial: 72,
+                        hardware_id_wacom: 72,
+                        capabilities: TabletToolCapabilities::empty(),
+                    });
+                    tool.proximity_in(
+                        fixture.niri_state(),
+                        None,
+                        tablet,
+                        &ProximityInEvent {
+                            location: pos,
+                            axis: Default::default(),
+                            serial: Serial::from(720),
+                            time: InputTime::now(),
+                        },
+                    );
+                    Some(tool)
+                } else {
+                    None
+                };
+                let serial = Serial::from(721);
+                assert!(fixture
+                    .niri_state()
+                    .try_activate_spine_tab(pos, input, serial));
+                // Match the native handler's order: tab activation before forwarding the
+                // same press to the original device handle with no client target.
+                let slot = Some(0).into();
+                if let Some(tool) = &tool {
+                    tool.down(
+                        fixture.niri_state(),
+                        &TabletDown {
+                            serial,
+                            time: InputTime::now(),
+                        },
+                    );
+                    assert!(tool.has_grab(serial));
+                } else {
+                    touch.down(
+                        fixture.niri_state(),
+                        None,
+                        &TouchDown {
+                            slot,
+                            location: pos,
+                            serial,
+                            time: InputTime::now(),
+                        },
+                    );
+                    assert!(touch.has_grab(serial));
+                }
+                fixture.double_roundtrip(client);
+                assert!(!fixture.niri().layout.is_spine(target));
+                assert!(fixture.niri().layout.is_spine(&windows[2]));
+                assert!(!fixture.niri().layout.is_overview_open());
+                assert!(
+                    fixture.niri().shrink_expand_focus.is_some(),
+                    "{input:?}, {overview}, {hold}"
+                );
+                assert!(fixture.niri().keyboard_focus.surface().is_none());
+                let release = |fixture: &mut Fixture| {
+                    if let Some(tool) = &tool {
+                        tool.up(
+                            fixture.niri_state(),
+                            &TabletUp {
+                                serial: Serial::from(722),
+                                time: InputTime::now(),
+                            },
+                        );
+                    } else {
+                        touch.up(
+                            fixture.niri_state(),
+                            &TouchUp {
+                                slot,
+                                serial: Serial::from(722),
+                                time: InputTime::now(),
+                            },
+                        );
+                    }
+                };
+                if !hold {
+                    release(&mut fixture);
+                    fixture.double_roundtrip(client);
+                }
+                let w = fixture.client(client).window(&surfaces[1]);
+                let size = w.configures_received.last().unwrap().1.size;
+                w.ack_last();
+                fixture.double_roundtrip(client);
+                assert!(
+                    fixture.niri().keyboard_focus.surface().is_none(),
+                    "ack-only"
+                );
+                let w = fixture.client(client).window(&surfaces[1]);
+                w.set_size(size.0.max(1) as u16, size.1.max(1) as u16);
+                w.commit();
+                fixture.double_roundtrip(client);
+                assert_eq!(fixture.niri().layout.focus().unwrap().window, *target);
+                assert_eq!(
+                    fixture.niri().keyboard_focus.surface(),
+                    Some(target.toplevel().unwrap().wl_surface())
+                );
+                if hold {
+                    release(&mut fixture);
+                    fixture.double_roundtrip(client);
+                }
+                assert!(fixture.niri().shrink_expand_focus.is_none());
+            }
+        }
+    }
+}
+
+#[test]
 fn shrink_system_idle_and_vrr_ignore_book_content_preview_without_erasing_output_feedback() {
     use smithay::desktop::utils::surface_primary_scanout_output;
     use smithay::wayland::compositor::with_states;
@@ -2438,6 +2608,109 @@ fn spatial_real_pointer_enters_exits_and_release_submits_without_timer() {
                 .is_some_and(|w| w.window != window));
         }
     }
+}
+
+#[test]
+fn spatial_shrink_foreign_tablet_grab_does_not_use_pointer_resize_exception() {
+    use crate::utils::ResizeEdge;
+    use smithay::backend::input::{
+        ButtonState, InputTime, TabletToolCapabilities, TabletToolDescriptor, TabletToolType,
+    };
+    use smithay::input::pointer::ButtonEvent;
+    use smithay::input::tablet::tool::{DownEvent, ProximityInEvent, UpEvent};
+    use smithay::input::tablet::{TabletDescriptor, TabletSeatTrait};
+    use smithay::utils::Serial;
+
+    let (mut fixture, client, surfaces) = timed_shrink_fixture(2, true, 60000);
+    let source = surfaces.last().unwrap();
+    fixture
+        .client(client)
+        .window(source)
+        .xdg_toplevel
+        .set_min_size(150, 120);
+    fixture.client(client).window(source).commit();
+    fixture.double_roundtrip(client);
+    let (window, pointer) = spatial_test_pointer(&mut fixture, ResizeEdge::RIGHT);
+    let foreign_surface = fixture
+        .niri()
+        .layout
+        .windows()
+        .find(|(_, w)| w.window != window)
+        .unwrap()
+        .1
+        .toplevel()
+        .wl_surface()
+        .clone();
+    let seat = fixture.niri().seat.tablet_seat();
+    let tablet = seat.add_tablet(&TabletDescriptor {
+        name: "foreign-tablet".into(),
+        usb_id: None,
+        syspath: None,
+    });
+    let tool = seat.add_tool(&TabletToolDescriptor {
+        tool_type: TabletToolType::Pen,
+        hardware_serial: 71,
+        hardware_id_wacom: 71,
+        capabilities: TabletToolCapabilities::empty(),
+    });
+    tool.proximity_in(
+        fixture.niri_state(),
+        Some((foreign_surface, (0., 0.).into())),
+        tablet,
+        &ProximityInEvent {
+            location: (100., 100.).into(),
+            axis: Default::default(),
+            serial: Serial::from(710),
+            time: InputTime::now(),
+        },
+    );
+    tool.down(
+        fixture.niri_state(),
+        &DownEvent {
+            serial: Serial::from(711),
+            time: InputTime::now(),
+        },
+    );
+    assert!(tool.is_grabbed());
+    spatial_test_motion(&mut fixture, &pointer, (-140., 0.));
+    fixture.double_roundtrip(client);
+    assert!(
+        pointer.is_grabbed(),
+        "the native pointer resize keeps its owner"
+    );
+    assert!(tool.is_grabbed(), "the other input owner is not revoked");
+    assert!(
+        fixture.niri().shrink_expand.preview().is_none(),
+        "another tablet owns input"
+    );
+    assert!(fixture.niri().shrink_spatial_session.is_none());
+    assert!(!fixture.niri().layout.is_spine(&window));
+
+    tool.up(
+        fixture.niri_state(),
+        &UpEvent {
+            serial: Serial::from(712),
+            time: InputTime::now(),
+        },
+    );
+    assert!(!tool.is_grabbed());
+    spatial_test_motion(&mut fixture, &pointer, (-145., 0.));
+    fixture.double_roundtrip(client);
+    assert!(
+        fixture.niri().shrink_expand.preview().is_some(),
+        "eligible after the foreign owner releases"
+    );
+    pointer.button(
+        fixture.niri_state(),
+        &ButtonEvent {
+            serial: Serial::from(713),
+            time: InputTime::now(),
+            button: 0x110,
+            state: ButtonState::Released,
+        },
+    );
+    fixture.double_roundtrip(client);
+    assert!(fixture.niri().layout.is_spine(&window));
 }
 
 #[test]

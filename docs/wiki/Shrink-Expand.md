@@ -285,6 +285,9 @@ nearby, explicit-ID and batch commands. Shrink input during nearby selection onl
 cancels it.
 Escape also cancels. The action dispatcher checks seat ownership before the
 native common grab side effects, preserving pointer/touch/IME constraints.
+Spatial shrinking and deferred press activation also respect tablet grabs while
+pointer or touch owns its native resize/press; that device-specific exception does
+not permit taking input from a tablet.
 
 For example, on a binary built from this branch:
 
