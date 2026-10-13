@@ -1072,6 +1072,28 @@ impl<W: LayoutElement> Workspace<W> {
         self.scrolling.spines_for_mode_request(id, column_mode)
     }
 
+    pub(super) fn spine_drop_plan(
+        &self,
+        tile: &Tile<W>,
+        position: InsertPosition,
+        width: ColumnWidth,
+        full: bool,
+    ) -> Option<super::shrink_expand::SpinePlan> {
+        let geometry = tile.spine_geometry()?;
+        let plans = match position {
+            InsertPosition::NewColumn(_) => {
+                self.scrolling
+                    .spine_new_column_plans(tile, width, full, geometry.thickness())?
+            }
+            InsertPosition::InColumn(column, member) => {
+                self.scrolling
+                    .spine_in_column_plans(column, member, tile, geometry.thickness())?
+            }
+            InsertPosition::Floating => return None,
+        };
+        Some(plans.for_move(geometry.axis))
+    }
+
     pub fn spine_plans(
         &self,
         id: &W::Id,

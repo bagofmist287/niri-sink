@@ -3249,6 +3249,12 @@ impl<W: LayoutElement> Layout<W> {
                         workspace: insert_ws,
                         position,
                         corner_radius,
+                        spine: ws.spine_drop_plan(
+                            &move_.tile,
+                            position,
+                            move_.width,
+                            move_.is_full_width,
+                        ),
                     });
                 }
                 InsertWorkspace::NewAt(_) => {
@@ -3257,10 +3263,31 @@ impl<W: LayoutElement> Layout<W> {
                     } else {
                         InsertPosition::NewColumn(0)
                     };
+                    let spine = move_.tile.spine_geometry().and_then(|geometry| {
+                        if move_.is_floating {
+                            return None;
+                        }
+                        let space = scrolling::ScrollingSpace::new(
+                            output_size(&mon.output),
+                            workspace::compute_working_area(&mon.output),
+                            mon.output.current_scale().fractional_scale(),
+                            mon.clock.clone(),
+                            mon.options.clone(),
+                        );
+                        space
+                            .spine_new_column_plans(
+                                &move_.tile,
+                                move_.width,
+                                move_.is_full_width,
+                                geometry.thickness(),
+                            )
+                            .map(|plans| plans.for_move(geometry.axis))
+                    });
                     mon.insert_hint = Some(InsertHint {
                         workspace: insert_ws,
                         position,
                         corner_radius: CornerRadius::default(),
+                        spine,
                     });
                 }
             }
@@ -4737,8 +4764,6 @@ impl<W: LayoutElement> Layout<W> {
                     };
 
                 let win_id = move_.tile.window().id().clone();
-                let tile_render_loc = move_.tile_render_location(zoom);
-
                 let ws_idx = match insert_ws {
                     InsertWorkspace::Existing(ws_id) => mon.idx_of_ws(ws_id).unwrap(),
                     InsertWorkspace::NewAt(ws_idx) => {
@@ -4754,6 +4779,16 @@ impl<W: LayoutElement> Layout<W> {
                         }
                     }
                 };
+
+                if let Some(plan) = mon.workspaces[ws_idx].spine_drop_plan(
+                    &move_.tile,
+                    position,
+                    move_.width,
+                    move_.is_full_width,
+                ) {
+                    move_.tile.apply_spine_drop(plan.geometry);
+                }
+                let tile_render_loc = move_.tile_render_location(zoom);
 
                 match position {
                     InsertPosition::NewColumn(column_idx) => {
@@ -4859,6 +4894,16 @@ impl<W: LayoutElement> Layout<W> {
                 let ws = &mut workspaces[0];
 
                 // No point in trying to use the pointer position without outputs.
+                if !move_.is_floating {
+                    if let Some(plan) = ws.spine_drop_plan(
+                        &move_.tile,
+                        InsertPosition::NewColumn(0),
+                        move_.width,
+                        move_.is_full_width,
+                    ) {
+                        move_.tile.apply_spine_drop(plan.geometry);
+                    }
+                }
                 ws.add_tile(
                     move_.tile,
                     WorkspaceAddWindowTarget::Auto,

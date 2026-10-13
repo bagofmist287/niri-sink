@@ -5687,3 +5687,107 @@ fn nearby_public_command_reveals_offscreen_identity_and_returns_valid_origin_on_
     assert!(pos.x + root.tile_size().w > 0. && pos.x < width);
     assert_eq!(fixture.niri().keyboard_focus.surface().cloned(), focus);
 }
+
+#[test]
+fn spine_pointer_drop_adapts_only_when_native_slot_requires_and_never_expands() {
+    use crate::input::move_grab::MoveGrab;
+    for floating in [false, true] {
+        let (mut fixture, client, surfaces) = timed_shrink_fixture(1, floating, 60000);
+        let window = fixture.niri().layout.focus().unwrap().window.clone();
+        let original_id = fixture.niri().layout.focus().unwrap().id().get();
+        let ticket = fixture
+            .niri_state()
+            .begin_shrink_preview(Some(ShrinkAxis::Vertical))
+            .unwrap()
+            .ticket();
+        fixture.niri_state().confirm_shrink_preview(ticket).unwrap();
+        fixture.double_roundtrip(client);
+        fixture
+            .niri()
+            .layout
+            .set_window_width(Some(&window), niri_ipc::SizeChange::SetFixed(2500));
+        fixture.double_roundtrip(client);
+        fixture.niri_complete_animations();
+        let configs = fixture
+            .client(client)
+            .window(&surfaces[0])
+            .configures_received
+            .len();
+        let size = fixture
+            .client(client)
+            .window(&surfaces[0])
+            .configures_received
+            .last()
+            .unwrap()
+            .1
+            .size;
+        let requested = fixture
+            .niri()
+            .layout
+            .windows()
+            .find(|(_, mapped)| mapped.window == window)
+            .unwrap()
+            .1
+            .requested_size();
+        let pos = spine_test_point(
+            &mut fixture,
+            &window,
+            (if floating { 0.05 } else { 0.25 }, 0.5),
+        );
+        let pointer = spine_test_press(&mut fixture, pos);
+        assert!(pointer.with_grab(|_, grab| grab.is::<MoveGrab>()).unwrap());
+        spine_test_pointer_motion(
+            &mut fixture,
+            &pointer,
+            pos + smithay::utils::Point::from((300., 120.)),
+            true,
+        );
+        fixture.double_roundtrip(client);
+        assert!(pointer.is_grabbed());
+        assert!(fixture.niri().layout.is_spine(&window));
+        spine_test_release(&mut fixture, &pointer);
+        fixture.double_roundtrip(client);
+        assert!(!pointer.is_grabbed());
+        let tile = fixture
+            .niri()
+            .layout
+            .workspaces()
+            .flat_map(|(_, _, ws)| ws.tiles())
+            .find(|tile| tile.window().window == window)
+            .unwrap();
+        assert_eq!(tile.window().id().get(), original_id);
+        assert_eq!(
+            tile.form(),
+            crate::layout::shrink_expand::WindowForm::Spine(if floating {
+                ShrinkAxis::Vertical
+            } else {
+                ShrinkAxis::Horizontal
+            })
+        );
+        assert!(fixture
+            .client(client)
+            .window(&surfaces[0])
+            .configures_received
+            .iter()
+            .skip(configs)
+            .all(|(_, configure)| configure.size == size));
+        assert_eq!(
+            fixture
+                .niri()
+                .layout
+                .windows()
+                .find(|(_, mapped)| mapped.window == window)
+                .unwrap()
+                .1
+                .requested_size(),
+            requested
+        );
+        assert_eq!(fixture.niri().layout.windows().count(), 1);
+        assert!(fixture.niri().keyboard_focus.surface().is_none());
+        assert!(!fixture
+            .niri()
+            .shrink_expand
+            .records()
+            .any(|record| record.kind == crate::shrink_expand::Kind::ExpandDirect));
+    }
+}

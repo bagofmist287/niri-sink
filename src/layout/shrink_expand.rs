@@ -208,6 +208,10 @@ impl SpineGeometry {
         Some(geometry)
     }
 
+    pub fn thickness(&self) -> f64 {
+        self.thickness
+    }
+
     /// Includes the border and at least one physical pixel of interior.
     pub fn effective_thickness(&self, scale: f64, border: f64) -> f64 {
         (self.thickness.max(border * 2. + 1. / scale) * scale).ceil() / scale

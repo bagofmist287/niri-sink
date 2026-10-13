@@ -80,8 +80,20 @@ cursor warping excludes spines in both tiled and floating spaces. These layout
 paths are tested. Spine hit regions expose body and edge identity without
 forwarding input to the hidden client. Left-button, touch and pen-tip input use
 the spine body as a compositor MoveGrab entry, and its edge as a ResizeGrab entry.
-Configured mouse binds keep their native priority. Drag-time direction adaptation
-still awaits E3 integration.
+Configured mouse binds keep their native priority. The native drop gap is chosen
+before spine shape planning. Both legal axes preserve the moving axis; only the
+other axis fitting switches it. If neither fits, the old axis enters the native
+overflow allocation. Floating placement preserves the axis. The independent insert
+hint uses the planned shape; a new-workspace marker fits that aspect into its
+native gap. The moving window keeps its original shape until release.
+
+Release replans against the final native slot and applies compositor geometry to
+the same Tile. The pointer retains its native proportion within the new shape;
+no client size request or automatic expansion is introduced. Native closest-gap
+selection, tie behavior, thresholds and view ownership remain in their original
+paths. Current checks cover new-column planning/commit, fallback, revalidation
+and real Wayland pointer drops; shared-column/Overview/output and rendered-hint
+combinations still require E3/E4 qualification.
 
 A valid body release below the native 8 px recognition threshold directly expands
 the spine through the current-slot allocator. Reaching the threshold forms a move:

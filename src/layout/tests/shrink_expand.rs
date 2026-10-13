@@ -4921,3 +4921,191 @@ fn spine_search_native_vertical_members_keep_direct_sides_ahead_of_same_axis_cha
     );
     layout.verify_invariants();
 }
+
+#[test]
+fn spine_drop_hint_and_commit_share_native_plan_preserve_client_and_pointer_ratio() {
+    for scale in [1., 1.25] {
+        for case in ["both", "other", "neither", "floating", "normal"] {
+            let mut options = Options::default();
+            options.animations.off = true;
+            let mut layout = Layout::with_options(Clock::with_time(Duration::ZERO), options);
+            layout.clock.set_complete_instantly(true);
+            Op::AddScaledOutput {
+                id: 1,
+                scale,
+                layout_config: None,
+            }
+            .apply(&mut layout);
+            Op::AddWindow {
+                params: TestWindowParams::new(1),
+            }
+            .apply(&mut layout);
+            Op::Communicate(1).apply(&mut layout);
+            let output = layout.outputs().next().unwrap().clone();
+            if case != "normal" {
+                assert!(layout.commit_shrink(&1, ShrinkAxis::Vertical, 40.));
+            }
+            if case == "floating" {
+                layout.set_window_floating(Some(&1), true);
+            }
+            let client = layout
+                .windows()
+                .find(|(_, win)| win.id() == &1)
+                .unwrap()
+                .1
+                .clone();
+            let request = client.requested_size();
+            layout.advance_animations();
+            let start = {
+                let ws = layout.active_workspace().unwrap();
+                let (tile, pos, _) = ws
+                    .tiles_with_render_positions()
+                    .find(|(tile, _, _)| tile.window().id() == &1)
+                    .unwrap();
+                let geometry = tile.move_anchor_geometry();
+                pos + geometry.loc + Point::from((geometry.size.w * 0.3, geometry.size.h * 0.6))
+            };
+            assert!(layout.interactive_move_begin(1, &output, start));
+            assert!(layout.interactive_move_update(
+                &1,
+                (300., 0.).into(),
+                output.clone(),
+                (500., 250.).into()
+            ));
+            let Some(InteractiveMoveState::Moving(move_)) = &mut layout.interactive_move else {
+                panic!()
+            };
+            if case == "other" {
+                move_.width = ColumnWidth::Fixed(2500.);
+            }
+            if case == "neither" {
+                output.change_current_state(
+                    Some(smithay::output::Mode {
+                        size: (20, 20).into(),
+                        refresh: 60000,
+                    }),
+                    None,
+                    None,
+                    None,
+                );
+                smithay::desktop::layer_map_for_output(&output).arrange();
+                layout.update_output_size(&output);
+            }
+            layout.update_render_elements(None);
+            let mon = layout.monitors().find(|mon| mon.output == output).unwrap();
+            let hint = mon.insert_hint.as_ref().unwrap();
+            let native_position = hint.position;
+            assert_eq!(
+                native_position,
+                if case == "floating" {
+                    InsertPosition::Floating
+                } else {
+                    InsertPosition::NewColumn(0)
+                }
+            );
+            let planned = hint.spine;
+            let Some(InteractiveMoveState::Moving(move_)) = &layout.interactive_move else {
+                panic!()
+            };
+            if case != "normal" {
+                assert_eq!(move_.tile.form(), WindowForm::Spine(ShrinkAxis::Vertical));
+            }
+            let ratio = move_.pointer_ratio_within_window;
+            assert!((ratio.0 - 0.3).abs() < 1e-9 && (ratio.1 - 0.6).abs() < 1e-9);
+            let expected_axis = if case == "other" {
+                ShrinkAxis::Horizontal
+            } else {
+                ShrinkAxis::Vertical
+            };
+            if case == "normal" || case == "floating" {
+                assert!(planned.is_none());
+            } else {
+                let plan = planned.unwrap();
+                assert_eq!(plan.geometry.axis, expected_axis);
+                assert_eq!(plan.fits, case != "neither");
+                // Exercise the actual Moving owner's anchor with the planned shape.
+                let zoom = layout.overview_zoom();
+                let Some(InteractiveMoveState::Moving(move_)) = &mut layout.interactive_move else {
+                    panic!()
+                };
+                let original = move_.tile.spine_geometry().unwrap();
+                move_.tile.apply_spine_drop(plan.geometry);
+                let geometry = move_.tile.move_anchor_geometry();
+                let anchor = move_.tile_render_location(zoom)
+                    + (geometry.loc
+                        + Point::from((geometry.size.w * ratio.0, geometry.size.h * ratio.1))
+                        - move_.tile.render_offset())
+                    .upscale(zoom);
+                let pixel = 1. / scale;
+                assert!((anchor.x - move_.pointer_pos_within_output.x).abs() <= pixel);
+                assert!((anchor.y - move_.pointer_pos_within_output.y).abs() <= pixel);
+                move_.tile.apply_spine_drop(original);
+            }
+            layout.interactive_move_end(&1);
+            let ws = layout
+                .workspaces()
+                .find(|(_, _, ws)| ws.has_window(&1))
+                .unwrap()
+                .2;
+            let retained = ws.tiles().find(|tile| tile.window().id() == &1).unwrap();
+            if case == "normal" {
+                assert_eq!(retained.form(), WindowForm::Normal);
+            } else {
+                assert_eq!(retained.form(), WindowForm::Spine(expected_axis));
+                if let Some(plan) = planned {
+                    assert_eq!(retained.tile_size(), plan.geometry.outer_size());
+                }
+                assert_eq!(client.requested_size(), request);
+            }
+            assert!(Rc::ptr_eq(&retained.window().0, &client.0));
+            assert_eq!(layout.windows().count(), 1);
+            layout.verify_invariants();
+        }
+    }
+}
+
+#[test]
+fn spine_drop_revalidates_after_layout_change_instead_of_committing_stale_hint() {
+    let mut layout = Layout::with_options(Clock::with_time(Duration::ZERO), Options::default());
+    layout.clock.set_complete_instantly(true);
+    Op::AddOutput(1).apply(&mut layout);
+    Op::AddWindow {
+        params: TestWindowParams::new(1),
+    }
+    .apply(&mut layout);
+    Op::Communicate(1).apply(&mut layout);
+    assert!(layout.commit_shrink(&1, ShrinkAxis::Vertical, 40.));
+    let output = layout.outputs().next().unwrap().clone();
+    assert!(layout.interactive_move_begin(1, &output, (60., 30.).into()));
+    assert!(layout.interactive_move_update(
+        &1,
+        (300., 0.).into(),
+        output.clone(),
+        (500., 250.).into()
+    ));
+    layout.update_render_elements(None);
+    let old = layout
+        .monitors()
+        .next()
+        .unwrap()
+        .insert_hint
+        .as_ref()
+        .unwrap()
+        .spine
+        .unwrap();
+    assert_eq!(old.geometry.axis, ShrinkAxis::Vertical);
+    let Some(InteractiveMoveState::Moving(move_)) = &mut layout.interactive_move else {
+        panic!()
+    };
+    move_.width = ColumnWidth::Fixed(2500.);
+    layout.interactive_move_end(&1);
+    assert!(layout.is_spine(&1));
+    let tile = layout
+        .active_workspace()
+        .unwrap()
+        .tiles()
+        .find(|tile| tile.window().id() == &1)
+        .unwrap();
+    assert_eq!(tile.form(), WindowForm::Spine(ShrinkAxis::Horizontal));
+    layout.verify_invariants();
+}

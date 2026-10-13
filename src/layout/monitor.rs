@@ -147,6 +147,7 @@ pub(super) struct InsertHint {
     pub workspace: InsertWorkspace,
     pub position: InsertPosition,
     pub corner_radius: CornerRadius,
+    pub spine: Option<super::shrink_expand::SpinePlan>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1170,6 +1171,12 @@ impl<W: LayoutElement> Monitor<W> {
                     if let Some(idx) = self.idx_of_ws(ws_id) {
                         let ws = &self.workspaces[idx];
                         if let Some(mut area) = ws.insert_hint_area(hint.position) {
+                            if let Some(plan) = hint.spine {
+                                let size = plan.geometry.outer_size();
+                                area.loc += (area.size - size).to_point().downscale(2.);
+                                area.size = size;
+                            }
+
                             let scale = ws.scale().fractional_scale();
                             let view_size = ws.view_size();
 
@@ -1225,9 +1232,18 @@ impl<W: LayoutElement> Monitor<W> {
                     let hint_x =
                         round_logical_in_physical(scale, (next_ws_geo.size.w - hint_width) / 2.);
 
-                    let hint_loc_diff = Point::from((-hint_x, hint_height + hint_gap));
-                    let hint_loc = Point::from((next_ws_geo.loc.x, next_top)) - hint_loc_diff;
-                    let hint_size = Size::from((hint_width, hint_height));
+                    let mut hint_loc_diff = Point::from((-hint_x, hint_height + hint_gap));
+                    let mut hint_loc = Point::from((next_ws_geo.loc.x, next_top)) - hint_loc_diff;
+                    let mut hint_size = Size::from((hint_width, hint_height));
+                    if let Some(plan) = hint.spine {
+                        let size = plan.geometry.outer_size();
+                        let zoom = (hint_size.w / size.w).min(hint_size.h / size.h);
+                        let size = size.upscale(zoom);
+                        let delta = (hint_size - size).to_point().downscale(2.);
+                        hint_loc += delta;
+                        hint_loc_diff -= delta;
+                        hint_size = size;
+                    }
 
                     // Sometimes the hint ends up 1 px wider than necessary and/or 1 px
                     // narrower than necessary. The values here seem correct. Might have to do with

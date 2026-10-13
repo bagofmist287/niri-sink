@@ -1271,6 +1271,20 @@ impl<W: LayoutElement> Tile<W> {
             .map_or(WindowForm::Normal, |spine| WindowForm::Spine(spine.axis))
     }
 
+    pub(super) fn spine_geometry(&self) -> Option<SpineGeometry> {
+        self.spine
+    }
+
+    /// Apply only compositor geometry at a native drop; the same hidden client remains owned here.
+    pub(super) fn apply_spine_drop(&mut self, geometry: SpineGeometry) {
+        if self.spine.is_some() {
+            self.spine = Some(geometry);
+            self.spine_ui.clear();
+            self.committed_shrink_presentation = None;
+            self.unmap_snapshot = None;
+        }
+    }
+
     pub fn is_spine(&self) -> bool {
         self.spine.is_some()
     }
