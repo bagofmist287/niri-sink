@@ -5284,6 +5284,11 @@ impl<W: LayoutElement> Column<W> {
                 } else {
                     tile.request_maximized(self.parent_area.size, animate, transaction);
                 }
+                // A pending normal restore holds a synchronous allocation even while its
+                // client has not committed. Native mode requests retarget that allocation.
+                if tile.has_normal_restore_allocation() {
+                    self.data[tile_idx].update(tile);
+                }
             }
             return;
         }

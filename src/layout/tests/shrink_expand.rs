@@ -5,6 +5,75 @@ use crate::layout::shrink_expand::{ShrinkAxis, SpineGeometry, WindowForm};
 use crate::layout::workspace::{Workspace, WorkspaceAddWindowTarget};
 
 #[test]
+fn shrink_expand_then_native_mode_keeps_pending_allocation_and_column_cache_in_sync() {
+    for scale in [1., 1.25] {
+        for mode in [SizingMode::Fullscreen, SizingMode::Maximized] {
+            let mut layout =
+                Layout::with_options(Clock::with_time(Duration::ZERO), Options::default());
+            // The exhaustive starting-state test found this on an inactive workspace,
+            // with a shared column and another output already present.
+            for op in [
+                Op::AddScaledOutput {
+                    id: 1,
+                    scale,
+                    layout_config: None,
+                },
+                Op::AddWindow {
+                    params: TestWindowParams::new(1),
+                },
+                Op::MoveWindowToWorkspaceDown(true),
+                Op::AddWindow {
+                    params: TestWindowParams::new(2),
+                },
+                Op::AddWindow {
+                    params: TestWindowParams::new(3),
+                },
+                Op::FocusColumnLeft,
+                Op::ConsumeWindowIntoColumn,
+                Op::AddWindow {
+                    params: TestWindowParams::new(4),
+                },
+                Op::AddOutput(2),
+                Op::AddWindow {
+                    params: TestWindowParams::new(5),
+                },
+                Op::MoveWindowToOutput {
+                    window_id: None,
+                    output_id: 2,
+                    target_ws_idx: None,
+                },
+                Op::FocusOutput(1),
+                Op::Communicate(1),
+                Op::Communicate(2),
+                Op::Communicate(3),
+                Op::Communicate(4),
+                Op::Communicate(5),
+            ] {
+                op.apply(&mut layout);
+            }
+            assert!(layout.commit_shrink(&1, ShrinkAxis::Horizontal, 32.));
+            Op::ExpandWindow(1).apply(&mut layout);
+            match mode {
+                SizingMode::Fullscreen => layout.set_fullscreen(&1, true),
+                SizingMode::Maximized => layout.set_maximized(&1, true),
+                SizingMode::Normal => unreachable!(),
+            }
+            // No communicate between expansion and the legacy/native mode entry.
+            layout.verify_invariants();
+            let client = layout
+                .windows()
+                .find(|(_, w)| w.id() == &1)
+                .unwrap()
+                .1
+                .clone();
+            assert_eq!(client.pending_sizing_mode(), mode);
+            Op::Communicate(1).apply(&mut layout);
+            layout.verify_invariants();
+        }
+    }
+}
+
+#[test]
 fn moving_spine_mode_intent_waits_for_native_drop_and_toggles_virtual_flags() {
     for scale in [1., 1.25] {
         for floating in [false, true] {
@@ -573,8 +642,9 @@ fn spine_search_uses_native_slots_and_keeps_scope_separate_from_floating_and_sin
 
 #[test]
 fn all_spine_search_includes_hidden_tabs_then_spatial_floats_with_stable_id_ties() {
-    use crate::layout::spine_search::SpineSearchMode;
     use niri_ipc::PositionChange;
+
+    use crate::layout::spine_search::SpineSearchMode;
     let mut layout = Layout::with_options(Clock::with_time(Duration::ZERO), Options::default());
     Op::AddOutput(1).apply(&mut layout);
     for id in 1..=4 {
@@ -2996,10 +3066,11 @@ fn spine_rule_update_requantizes_border_without_configuring_hidden_client() {
 }
 
 fn spine_test_renderer() -> smithay::backend::renderer::gles::GlesRenderer {
-    use crate::render_helpers::{resources, shaders};
     use smithay::backend::egl::native::EGLSurfacelessDisplay;
     use smithay::backend::egl::{EGLContext, EGLDisplay};
     use smithay::backend::renderer::gles::GlesRenderer;
+
+    use crate::render_helpers::{resources, shaders};
     let mut renderer = unsafe {
         let display = EGLDisplay::new(EGLSurfacelessDisplay).unwrap();
         let context = EGLContext::new(&display).unwrap();
@@ -3013,12 +3084,13 @@ fn spine_test_renderer() -> smithay::backend::renderer::gles::GlesRenderer {
 #[test]
 #[ignore = "requires explicit software EGL committed-shrink rendering"]
 fn early_shrink_commit_and_immediate_expand_preserve_the_visible_pose() {
-    use crate::layout::shrink_expand::NormalSizePlan;
-    use crate::render_helpers::solid_color::SolidColorBuffer;
-    use crate::render_helpers::{render_and_download, RenderTarget};
     use smithay::backend::allocator::Fourcc;
     use smithay::backend::renderer::element::Element as _;
     use smithay::backend::renderer::ExportMem as _;
+
+    use crate::layout::shrink_expand::NormalSizePlan;
+    use crate::render_helpers::solid_color::SolidColorBuffer;
+    use crate::render_helpers::{render_and_download, RenderTarget};
     let mut renderer = spine_test_renderer();
     for axis in [ShrinkAxis::Horizontal, ShrinkAxis::Vertical] {
         for anchor in [(0., 0.), (1., 1.)] {
@@ -3139,11 +3211,12 @@ fn early_shrink_commit_and_immediate_expand_preserve_the_visible_pose() {
 #[test]
 #[ignore = "requires an explicit software EGL restoration rendering run"]
 fn normal_restore_presentation_hides_stale_content_and_releases_without_input_delay() {
+    use smithay::backend::allocator::Fourcc;
+    use smithay::backend::renderer::ExportMem as _;
+
     use crate::layout::shrink_expand::NormalSizePlan;
     use crate::render_helpers::solid_color::SolidColorBuffer;
     use crate::render_helpers::{render_and_download, RenderTarget};
-    use smithay::backend::allocator::Fourcc;
-    use smithay::backend::renderer::ExportMem as _;
     let mut renderer = spine_test_renderer();
     for scale in [1., 1.25] {
         for axis in [ShrinkAxis::Horizontal, ShrinkAxis::Vertical] {
@@ -3336,11 +3409,12 @@ fn normal_restore_presentation_hides_stale_content_and_releases_without_input_de
 #[test]
 #[ignore = "requires an explicit software EGL preview rendering run"]
 fn shrink_preview_gray_source_constant_gradient_and_capture_cache_are_independent() {
-    use crate::render_helpers::solid_color::SolidColorBuffer;
-    use crate::render_helpers::{render_and_download, RenderTarget};
     use smithay::backend::allocator::Fourcc;
     use smithay::backend::renderer::element::Element as _;
     use smithay::backend::renderer::ExportMem as _;
+
+    use crate::render_helpers::solid_color::SolidColorBuffer;
+    use crate::render_helpers::{render_and_download, RenderTarget};
     let mut renderer = spine_test_renderer();
     for scale in [1., 1.25] {
         let mut options = Options::default();
@@ -3541,10 +3615,11 @@ fn shrink_preview_gray_source_constant_gradient_and_capture_cache_are_independen
 #[test]
 #[ignore = "requires surfaceless EGL and the isolated desktop/icon fixture environment"]
 fn spine_application_icon_stays_upright_and_private() {
-    use crate::render_helpers::{render_and_download, RenderTarget};
     use smithay::backend::allocator::Fourcc;
     use smithay::backend::renderer::element::Element as _;
     use smithay::backend::renderer::ExportMem as _;
+
+    use crate::render_helpers::{render_and_download, RenderTarget};
     let app_id =
         std::env::var("NIRI_SPINE_ICON_APP_ID").expect("supply isolated desktop fixture app ID");
     let mut renderer = spine_test_renderer();
@@ -4875,13 +4950,14 @@ fn explicit_unfullscreen_of_windowed_client_keeps_other_book_tabs_collapsed() {
 #[test]
 #[ignore = "requires an explicit software EGL selected-content preview rendering run"]
 fn expand_preview_projects_only_selected_content_without_configure_and_isolates_capture() {
+    use smithay::backend::allocator::Fourcc;
+    use smithay::backend::renderer::element::Element as _;
+    use smithay::backend::renderer::ExportMem as _;
+
     use crate::layout::shrink_expand::NormalSizePlan;
     use crate::layout::workspace::WorkspaceRenderElement;
     use crate::render_helpers::solid_color::SolidColorBuffer;
     use crate::render_helpers::{render_and_download, RenderTarget};
-    use smithay::backend::allocator::Fourcc;
-    use smithay::backend::renderer::element::Element as _;
-    use smithay::backend::renderer::ExportMem as _;
     let mut renderer = spine_test_renderer();
     for scale in [1., 1.25] {
         for axis in [ShrinkAxis::Horizontal, ShrinkAxis::Vertical] {
@@ -5003,7 +5079,8 @@ fn expand_preview_projects_only_selected_content_without_configure_and_isolates_
                     );
                     assert_eq!(green, target_id == output_id);
                     if !green {
-                        // Collecting the book itself in a capture pass must preserve output feedback.
+                        // Collecting the book itself in a capture pass must preserve output
+                        // feedback.
                         tile.render(
                             RenderCtx {
                                 renderer: &mut renderer,
@@ -5119,12 +5196,13 @@ fn expand_preview_retargets_current_pose_without_changing_the_native_spine() {
 #[test]
 #[ignore = "requires explicit software EGL live selection handoff rendering"]
 fn expand_selection_handoff_retains_visible_content_pose_and_has_a_finite_input_barrier() {
-    use crate::layout::shrink_expand::NormalSizePlan;
-    use crate::render_helpers::solid_color::SolidColorBuffer;
-    use crate::render_helpers::{render_and_download, RenderTarget};
     use smithay::backend::allocator::Fourcc;
     use smithay::backend::renderer::element::Element as _;
     use smithay::backend::renderer::ExportMem as _;
+
+    use crate::layout::shrink_expand::NormalSizePlan;
+    use crate::render_helpers::solid_color::SolidColorBuffer;
+    use crate::render_helpers::{render_and_download, RenderTarget};
     let mut renderer = spine_test_renderer();
     for scale in [1., 1.25] {
         for axis in [ShrinkAxis::Horizontal, ShrinkAxis::Vertical] {
@@ -5932,10 +6010,11 @@ fn spine_drop_cross_output_and_output_loss_keep_native_owner_and_client_identity
 #[test]
 #[ignore = "requires an explicit software EGL drop-hint rendering run"]
 fn spine_drop_workspace_gap_hint_renders_planned_aspect_without_client_sampling() {
-    use crate::render_helpers::render_and_download;
     use smithay::backend::allocator::Fourcc;
     use smithay::backend::renderer::element::Element as _;
     use smithay::backend::renderer::ExportMem as _;
+
+    use crate::render_helpers::render_and_download;
     let mut renderer = spine_test_renderer();
     for scale in [1., 1.25] {
         for axis in [ShrinkAxis::Horizontal, ShrinkAxis::Vertical] {
@@ -6198,10 +6277,11 @@ fn spine_drop_live_layout_changes_replan_without_replacing_the_native_gap() {
 #[test]
 #[ignore = "requires an explicit software EGL existing-workspace hint run"]
 fn spine_drop_existing_workspace_hint_renders_native_planned_size_and_zoom() {
-    use crate::render_helpers::{render_and_download, RenderTarget};
     use smithay::backend::allocator::Fourcc;
     use smithay::backend::renderer::element::Element as _;
     use smithay::backend::renderer::ExportMem as _;
+
+    use crate::render_helpers::{render_and_download, RenderTarget};
     let mut renderer = spine_test_renderer();
     for scale in [1., 1.25] {
         for axis in [ShrinkAxis::Horizontal, ShrinkAxis::Vertical] {
@@ -6288,7 +6368,8 @@ fn spine_drop_existing_workspace_hint_renders_native_planned_size_and_zoom() {
                         .geometry
                         .outer_size();
                     let mut elements = Vec::new();
-                    // Mock normal clients have no render buffer; the real monitor path supplies the hint.
+                    // Mock normal clients have no render buffer; the real monitor path supplies the
+                    // hint.
                     mon.render_workspaces(
                         RenderCtx {
                             renderer: &mut renderer,

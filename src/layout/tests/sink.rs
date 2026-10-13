@@ -1,7 +1,8 @@
+use approx::assert_abs_diff_eq;
+
 use super::*;
 use crate::layout::sink::{RestorePlacement, SinkEntry, SinkSpace};
 use crate::layout::workspace::Workspace;
-use approx::assert_abs_diff_eq;
 
 fn entry(id: usize) -> SinkEntry<TestWindow> {
     let workspace = Workspace::new_no_outputs(Clock::with_time(Duration::ZERO), Rc::default());
@@ -382,7 +383,8 @@ fn overview_expansion_preserves_sources_aligns_foreground_and_limits_tail_hits()
                                 Some(ws.id())
                             );
                         } else {
-                            // The aggregated tail is a visible hint, never an arbitrary-depth recall.
+                            // The aggregated tail is a visible hint, never an arbitrary-depth
+                            // recall.
                             let point = geo.loc
                                 + Point::from((
                                     rect.loc.x + rect.size.w / 2.,

@@ -4,13 +4,13 @@ use wayland_client::Proxy as _;
 
 use super::Fixture;
 use crate::layout::shrink_expand::{ShrinkAxis, WindowForm};
-use crate::layout::LayoutElement as _;
-use crate::layout::SizingMode;
+use crate::layout::{LayoutElement as _, SizingMode};
 
 #[test]
 fn shrink_explicit_activation_policy_precedes_form_and_preview_changes() {
-    use smithay::wayland::xdg_activation::{XdgActivationHandler, XdgActivationTokenData};
     use std::time::{Duration, Instant};
+
+    use smithay::wayland::xdg_activation::{XdgActivationHandler, XdgActivationTokenData};
 
     for policy in ["ignore", "set-urgent", "focus", "urgent-only", "expired"] {
         let SelectionFixture {
@@ -245,9 +245,10 @@ fn shrink_mru_browsing_cancel_and_confirmation_keep_identity_and_restore_only_on
 
 #[test]
 fn shrink_explicit_focus_and_foreign_activation_respect_input_owner_and_late_focus() {
+    use niri_config::Action;
+
     use crate::niri::KeyboardFocus;
     use crate::protocols::foreign_toplevel::ForeignToplevelHandler;
-    use niri_config::Action;
     for foreign in [false, true] {
         for navigate in [false, true] {
             let SelectionFixture {
@@ -528,15 +529,104 @@ fn shrink_real_tab_indicator_click_expands_hidden_identity_and_keeps_own_press_f
 }
 
 #[test]
+fn shrink_overview_selection_confirmation_exits_to_current_target_and_keeps_commit_barrier() {
+    for floating in [false, true] {
+        for navigate in [false, true] {
+            let SelectionFixture {
+                mut fixture,
+                client,
+                surfaces,
+                windows,
+            } = selection_fixture(true, floating);
+            fixture.niri_state().reload_config(Ok(expand_test_config()));
+            for surface in &surfaces {
+                let w = fixture.client(client).window(surface);
+                w.xdg_toplevel.set_min_size(720, 480);
+                w.commit();
+            }
+            fixture.double_roundtrip(client);
+            fixture.niri().layout.open_overview();
+            fixture.niri_complete_animations();
+            fixture.double_roundtrip(client);
+            let record = fixture.niri_state().begin_expand_selection().unwrap();
+            let id = record.targets[0];
+            let index = windows.iter().position(|(wid, _)| *wid == id).unwrap();
+            let target = &windows[index].1;
+            fixture
+                .niri_state()
+                .confirm_shrink_preview(record.ticket())
+                .unwrap();
+            fixture.double_roundtrip(client);
+            assert!(
+                !fixture.niri().layout.is_overview_open(),
+                "confirmation hands off to the native workspace"
+            );
+            assert!(!fixture.niri().layout.is_spine(target));
+            assert!(fixture.niri().shrink_expand_focus.is_some());
+            assert!(fixture.niri().keyboard_focus.surface().is_none());
+            let deadline = fixture
+                .niri()
+                .layout
+                .find_window_and_output(target.toplevel().unwrap().wl_surface())
+                .unwrap()
+                .0
+                .normal_restore_deadline()
+                .unwrap();
+            let w = fixture.client(client).window(&surfaces[index]);
+            let size = w.configures_received.last().unwrap().1.size;
+            w.ack_last();
+            fixture.double_roundtrip(client);
+            assert!(
+                fixture.niri().keyboard_focus.surface().is_none(),
+                "ack-only must not activate"
+            );
+            assert_eq!(
+                fixture
+                    .niri()
+                    .layout
+                    .find_window_and_output(target.toplevel().unwrap().wl_surface())
+                    .unwrap()
+                    .0
+                    .normal_restore_deadline(),
+                Some(deadline)
+            );
+            if navigate {
+                fixture.niri().layout.open_overview();
+                fixture.double_roundtrip(client);
+                assert!(
+                    fixture.niri().shrink_expand_focus.is_none(),
+                    "new overview invalidates late focus"
+                );
+            }
+            let w = fixture.client(client).window(&surfaces[index]);
+            w.set_size(size.0.max(720) as u16, size.1.max(480) as u16);
+            w.commit();
+            fixture.double_roundtrip(client);
+            if navigate {
+                assert!(fixture.niri().layout.is_overview_open());
+                assert!(fixture.niri().keyboard_focus.surface().is_none());
+            } else {
+                assert_eq!(
+                    fixture.niri().keyboard_focus.surface(),
+                    Some(target.toplevel().unwrap().wl_surface())
+                );
+                assert!(fixture.niri().shrink_expand_focus.is_none());
+            }
+        }
+    }
+}
+
+#[test]
 fn shrink_backend_touch_and_tablet_tab_activation_preserve_native_press_and_restore_barrier() {
+    use smithay::backend::input::{InputEvent, TabletToolTipState};
+    use smithay::input::tablet::{TabletDescriptor, TabletSeatTrait};
+    use smithay::utils::Point;
+
     use super::test_input_backend::{
         TestInputBackend, TestInputDevice, TestTabletEvent, TestTouchEvent,
     };
     use crate::layout::HitType;
     use crate::shrink_expand::SpatialInput;
-    use smithay::backend::input::{InputEvent, TabletToolTipState};
-    use smithay::input::tablet::{TabletDescriptor, TabletSeatTrait};
-    use smithay::utils::Point;
 
     for input in [SpatialInput::Touch, SpatialInput::Tablet] {
         for overview in [false, true] {
@@ -674,10 +764,11 @@ fn shrink_backend_touch_and_tablet_tab_activation_preserve_native_press_and_rest
 
 #[test]
 fn shrink_system_idle_and_vrr_ignore_book_content_preview_without_erasing_output_feedback() {
+    use std::sync::atomic::Ordering;
+
     use smithay::desktop::utils::surface_primary_scanout_output;
     use smithay::wayland::compositor::with_states;
     use smithay::wayland::idle_inhibit::IdleInhibitHandler;
-    use std::sync::atomic::Ordering;
     for preview in [false, true] {
         let SelectionFixture {
             mut fixture,
@@ -1216,8 +1307,9 @@ fn shrink_transient_lock_defers_and_reparent_close_or_unlock_rechecks_live_ident
 
 #[test]
 fn shrink_late_parent_revokes_child_grabs_and_defers_only_while_native_owner_is_active() {
-    use crate::input::click_grab::ClickGrab;
     use smithay::input::pointer::{Focus, GrabStartData};
+
+    use crate::input::click_grab::ClickGrab;
     for device in ["pointer", "touch"] {
         let SelectionFixture {
             mut fixture,
@@ -1308,9 +1400,11 @@ fn spatial_test_pointer_for_window(
     smithay::desktop::Window,
     smithay::input::pointer::PointerHandle<crate::niri::State>,
 ) {
-    use crate::input::{resize_grab::ResizeGrab, AnyStartData};
     use smithay::input::pointer::{ButtonEvent, Focus, GrabStartData};
     use smithay::utils::Serial;
+
+    use crate::input::resize_grab::ResizeGrab;
+    use crate::input::AnyStartData;
     assert!(fixture
         .niri()
         .layout
@@ -1516,8 +1610,10 @@ fn disabling_spine_during_recognition_ends_its_grab_without_moving_restored_cont
 
 #[test]
 fn spine_touch_tap_drag_and_cancel_follow_existing_move_grab_lifecycle() {
-    use crate::input::{move_grab::MoveGrab, AnyStartData};
     use smithay::input::touch::{DownEvent, GrabStartData, MotionEvent, UpEvent};
+
+    use crate::input::move_grab::MoveGrab;
+    use crate::input::AnyStartData;
     for floating in [false, true] {
         for overview in [false, true] {
             for gesture in ["tap", "drag", "cancel"] {
@@ -1600,7 +1696,6 @@ fn spine_touch_tap_drag_and_cancel_follow_existing_move_grab_lifecycle() {
 
 #[test]
 fn spine_tablet_tip_and_proximity_out_distinguish_click_from_move_and_cancel() {
-    use crate::input::{move_grab::MoveGrab, AnyStartData};
     use smithay::backend::input::{
         InputTime, TabletToolCapabilities, TabletToolDescriptor, TabletToolType,
     };
@@ -1610,6 +1705,9 @@ fn spine_tablet_tip_and_proximity_out_distinguish_click_from_move_and_cancel() {
         UpEvent,
     };
     use smithay::input::tablet::{TabletDescriptor, TabletSeatTrait};
+
+    use crate::input::move_grab::MoveGrab;
+    use crate::input::AnyStartData;
     for floating in [false, true] {
         for overview in [false, true] {
             for gesture in ["tap", "drag", "cancel"] {
@@ -1717,8 +1815,10 @@ fn spine_tablet_tip_and_proximity_out_distinguish_click_from_move_and_cancel() {
 
 #[test]
 fn spine_move_right_button_toggle_keeps_initiating_grab_and_normal_csd_pan_is_unchanged() {
-    use crate::input::{move_grab::MoveGrab, AnyStartData};
     use smithay::input::pointer::{ButtonEvent, Focus, GrabStartData};
+
+    use crate::input::move_grab::MoveGrab;
+    use crate::input::AnyStartData;
     let (mut fixture, client, _) = timed_shrink_fixture(2, false, 60000);
     let window = fixture.niri().layout.focus().unwrap().window.clone();
     let ticket = fixture
@@ -2107,8 +2207,10 @@ fn floating_spine_resize_preserves_client_choice_extent_while_restore_is_pending
 
 #[test]
 fn disable_runtime_ends_book_move_through_existing_pointer_grab_but_keeps_normal_move() {
-    use crate::input::{move_grab::MoveGrab, AnyStartData};
     use smithay::input::pointer::{ButtonEvent, Focus, GrabStartData};
+
+    use crate::input::move_grab::MoveGrab;
+    use crate::input::AnyStartData;
     for spine in [false, true] {
         for floating in [false, true] {
             for detach in [false, true] {
@@ -2512,9 +2614,10 @@ fn disable_runtime_rebases_book_resize_and_keeps_the_native_pointer_grab() {
 
 #[test]
 fn spine_resize_expands_rebases_same_grab_and_can_shrink_again() {
+    use smithay::input::pointer::ButtonEvent;
+
     use crate::shrink_expand::{Kind, Phase};
     use crate::utils::ResizeEdge;
-    use smithay::input::pointer::ButtonEvent;
     for floating in [false, true] {
         for (axis, edges, grow, further, fold) in [
             (
@@ -2648,8 +2751,9 @@ fn spine_resize_expands_rebases_same_grab_and_can_shrink_again() {
 
 #[test]
 fn spine_resize_free_axis_stays_collapsed_and_last_motion_can_expand() {
-    use crate::utils::ResizeEdge;
     use smithay::input::pointer::{ButtonEvent, MotionEvent};
+
+    use crate::utils::ResizeEdge;
     for axis in [ShrinkAxis::Horizontal, ShrinkAxis::Vertical] {
         let (mut fixture, client, _) = timed_shrink_fixture(2, true, 60000);
         let window = fixture.niri().layout.focus().unwrap().window.clone();
@@ -2699,9 +2803,10 @@ fn spine_resize_free_axis_stays_collapsed_and_last_motion_can_expand() {
 
 #[test]
 fn spatial_real_pointer_enters_exits_and_release_submits_without_timer() {
+    use smithay::input::pointer::ButtonEvent;
+
     use crate::shrink_expand::{Kind, Phase};
     use crate::utils::ResizeEdge;
-    use smithay::input::pointer::ButtonEvent;
     for floating in [false, true] {
         for (edges, axis, delta) in [
             (ResizeEdge::RIGHT, ShrinkAxis::Horizontal, (-140., 0.)),
@@ -2777,7 +2882,6 @@ fn spatial_real_pointer_enters_exits_and_release_submits_without_timer() {
 
 #[test]
 fn spatial_shrink_foreign_tablet_grab_does_not_use_pointer_resize_exception() {
-    use crate::utils::ResizeEdge;
     use smithay::backend::input::{
         ButtonState, InputTime, TabletToolCapabilities, TabletToolDescriptor, TabletToolType,
     };
@@ -2785,6 +2889,8 @@ fn spatial_shrink_foreign_tablet_grab_does_not_use_pointer_resize_exception() {
     use smithay::input::tablet::tool::{DownEvent, ProximityInEvent, UpEvent};
     use smithay::input::tablet::{TabletDescriptor, TabletSeatTrait};
     use smithay::utils::Serial;
+
+    use crate::utils::ResizeEdge;
 
     let (mut fixture, client, surfaces) = timed_shrink_fixture(2, true, 60000);
     let source = surfaces.last().unwrap();
@@ -2880,8 +2986,9 @@ fn spatial_shrink_foreign_tablet_grab_does_not_use_pointer_resize_exception() {
 
 #[test]
 fn spatial_cancel_inhibits_current_zone_and_forced_ungrab_never_folds() {
-    use crate::utils::ResizeEdge;
     use smithay::utils::Serial;
+
+    use crate::utils::ResizeEdge;
     for mode in ["abort", "command", "escape"] {
         let (mut fixture, client, surfaces) = timed_shrink_fixture(2, true, 60000);
         fixture
@@ -2910,8 +3017,9 @@ fn spatial_cancel_inhibits_current_zone_and_forced_ungrab_never_folds() {
                     .niri_state()
                     .do_action(niri_config::Action::CancelShrinkExpand, false);
             } else {
-                use super::test_input_backend::{TestInputBackend, TestKeyboardKeyEvent};
                 use smithay::backend::input::{InputEvent, InputTime, KeyState};
+
+                use super::test_input_backend::{TestInputBackend, TestKeyboardKeyEvent};
                 let keyboard = fixture.niri().seat.get_keyboard().unwrap();
                 let code = keyboard.with_xkb_state(fixture.niri_state(), |xkb| {
                     unsafe { xkb.xkb().lock().unwrap().keymap() }
@@ -2955,10 +3063,11 @@ fn spatial_cancel_inhibits_current_zone_and_forced_ungrab_never_folds() {
 
 #[test]
 fn spatial_release_flushes_only_a_candidate_and_preserves_ordinary_frame_batching() {
-    use crate::utils::ResizeEdge;
     use smithay::backend::input::{ButtonState, InputTime};
     use smithay::input::pointer::{ButtonEvent, MotionEvent};
     use smithay::utils::Serial;
+
+    use crate::utils::ResizeEdge;
     for (enabled, delta, fold) in [
         (false, -140., false),
         (true, -20., false),
@@ -3010,9 +3119,10 @@ fn spatial_release_flushes_only_a_candidate_and_preserves_ordinary_frame_batchin
 
 #[test]
 fn keyboard_minimum_boundary_repeats_keep_axis_and_grow_restores_native_resize() {
-    use crate::shrink_expand::{Kind, Phase};
     use niri_config::Action;
     use niri_ipc::SizeChange;
+
+    use crate::shrink_expand::{Kind, Phase};
     for floating in [false, true] {
         for axis in [ShrinkAxis::Horizontal, ShrinkAxis::Vertical] {
             let (mut fixture, client, surfaces) = timed_shrink_fixture(2, floating, 60000);
@@ -3188,10 +3298,11 @@ fn keyboard_boundary_by_id_requires_actual_focus_and_free_axis_keeps_deadline() 
 
 #[test]
 fn shrink_ipc_disabled_and_pointer_grab_rejections_preserve_native_ownership() {
-    use crate::input::click_grab::ClickGrab;
     use niri_ipc::{Action, Request, Response, ShrinkExpandOutcome};
     use smithay::input::pointer::{Focus, GrabStartData};
     use smithay::utils::Serial;
+
+    use crate::input::click_grab::ClickGrab;
     let (mut fixture, _, _) = timed_shrink_fixture(1, false, 60000);
     let target = fixture.niri().layout.focus().unwrap().window.clone();
     let mut ipc = ShrinkIpcClient::new(&mut fixture);
@@ -3610,9 +3721,10 @@ fn early_shrink_confirmation_settles_and_hands_off_focus_before_visual_completio
 
 #[test]
 fn shrink_and_expand_preserve_the_actual_input_method_keyboard_grab() {
-    use crate::shrink_expand::{FinishReason, Phase};
     use smithay::utils::Serial;
     use smithay::wayland::input_method::InputMethodKeyboardGrab;
+
+    use crate::shrink_expand::{FinishReason, Phase};
     for floating in [false, true] {
         let (mut fixture, client, surfaces) = timed_shrink_fixture(2, floating, 60000);
         let target = fixture.niri().layout.focus().unwrap().window.clone();
@@ -4211,9 +4323,10 @@ fn expand_selection_zero_timer_confirms_the_current_identity_only() {
 
 #[test]
 fn expand_selection_keeps_normal_client_keys_and_balances_escape_cancellation() {
+    use smithay::backend::input::{InputEvent, InputTime, KeyState};
+
     use super::client::KeyboardEvent;
     use super::test_input_backend::{TestInputBackend, TestKeyboardKeyEvent};
-    use smithay::backend::input::{InputEvent, InputTime, KeyState};
     let SelectionFixture {
         mut fixture,
         client,
@@ -4803,9 +4916,10 @@ fn timed_shrink_actual_zero_timer_submits_and_scope_change_or_disable_cancels() 
 
 #[test]
 fn timed_shrink_keyboard_suppression_balances_old_and_new_presses_across_escape() {
+    use smithay::backend::input::{InputEvent, InputTime, KeyState};
+
     use super::client::KeyboardEvent;
     use super::test_input_backend::{TestInputBackend, TestKeyboardKeyEvent};
-    use smithay::backend::input::{InputEvent, InputTime, KeyState};
     let (mut fixture, client, surfaces) = timed_shrink_fixture(1, false, 60000);
     let surface = &surfaces[0];
     let _ = fixture
@@ -5886,8 +6000,9 @@ fn normal_restore_destroy_after_ack_removes_waiter_without_stealing_focus() {
 
 #[test]
 fn normal_restore_output_migration_and_no_outputs_keep_original_deadline_and_identity() {
-    use crate::layout::ActivateWindow;
     use smithay::wayland::seat::WaylandFocus as _;
+
+    use crate::layout::ActivateWindow;
 
     for floating in [false, true] {
         let (mut fixture, client, surfaces, ids) =

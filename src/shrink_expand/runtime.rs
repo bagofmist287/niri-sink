@@ -58,6 +58,7 @@ pub(crate) struct ExpandFocusLease {
     resize_input: Option<SpatialInput>,
     activation_press: Option<(SpatialInput, Serial)>,
     warp_output_on_ready: bool,
+    overview_generation: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -383,8 +384,9 @@ impl State {
 
     /// Intercepts only eligible boundary/repeated Shrink intent before common grab side effects.
     pub(crate) fn handle_keyboard_shrink_boundary(&mut self, action: &niri_config::Action) -> bool {
-        use niri_config::Action;
         use std::cmp::Ordering;
+
+        use niri_config::Action;
         if !self.niri.config.borrow().shrink_expand.enabled || self.niri.screenshot_ui.is_open() {
             return false;
         }
@@ -444,9 +446,10 @@ impl State {
         &mut self,
         action: &niri_config::Action,
     ) -> Option<Result<niri_ipc::ShrinkExpandActionReceipt, String>> {
-        use super::Phase;
         use niri_config::Action;
         use niri_ipc::{ShrinkExpandActionReceipt as Receipt, ShrinkExpandOutcome as Outcome};
+
+        use super::Phase;
         if !matches!(
             action,
             Action::ShrinkWindow
@@ -865,6 +868,17 @@ impl State {
         if let Some(window) = focus {
             self.cancel_expand_focus_lease();
             if resize.is_none() {
+                if self.niri.layout.is_overview_open() {
+                    let target = self.niri.layout.workspaces().find_map(|(mon, idx, ws)| {
+                        (ws.id().get() == workspace)
+                            .then(|| mon.map(|mon| (mon.output().clone(), idx)))
+                            .flatten()
+                    });
+                    if let Some((output, idx)) = target {
+                        self.niri.layout.focus_output(&output);
+                        self.niri.layout.toggle_overview_to_workspace(idx);
+                    }
+                }
                 self.niri.layout.activate_window(&window);
             }
             self.niri.shrink_expand_focus = Some(ExpandFocusLease {
@@ -874,6 +888,7 @@ impl State {
                 resize_input: resize.map(|(_, input)| input),
                 activation_press: None,
                 warp_output_on_ready: false,
+                overview_generation: self.niri.layout.overview_generation(),
             });
         }
         self.refresh_shrink_expand_operations();
@@ -985,6 +1000,7 @@ impl State {
             self.can_expand_spines()
         };
         let valid = self.niri.config.borrow().shrink_expand.enabled
+            && self.niri.layout.overview_generation() == lease.overview_generation
             && seat_allowed
             && self.niri.layout.active_output() == lease.output.as_ref()
             && self.niri.layout.active_workspace().is_some_and(|ws| {

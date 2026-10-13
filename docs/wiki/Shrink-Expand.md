@@ -223,6 +223,9 @@ expansion includes hidden tabs and floating spines in one transaction, preservin
 ordinary focus or the absence of focus. Submitted operation records distinguish
 Ready, Deadline and TargetsRemoved; a late commit does not rewrite a terminal
 result. These paths are tested with real Wayland fixtures and real IPC sockets.
+Confirming a selected spine in Overview exits to its current workspace. Direct
+expansion with a focus handoff also exits Overview; batch expansion preserves it.
+Reopening Overview during the pending restore cancels the deferred client focus.
 Committed restoration has an independent visual transition. A pure-color shape
 grows from the current spine rectangle toward the native normal allocation. While
 the processed-commit barrier is pending, neither the old client nor its popups are

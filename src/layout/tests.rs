@@ -2319,13 +2319,19 @@ fn operations_from_starting_state_dont_panic() {
                     op.clone().apply(&mut layout);
                 }
 
-                layout.verify_invariants();
-                first.clone().apply(&mut layout);
-                layout.verify_invariants();
-                second.clone().apply(&mut layout);
-                layout.verify_invariants();
-                third.clone().apply(&mut layout);
-                layout.verify_invariants();
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    layout.verify_invariants();
+                    first.clone().apply(&mut layout);
+                    layout.verify_invariants();
+                    second.clone().apply(&mut layout);
+                    layout.verify_invariants();
+                    third.clone().apply(&mut layout);
+                    layout.verify_invariants();
+                }));
+                if let Err(error) = result {
+                    eprintln!("failing operations: {first:?}, {second:?}, {third:?}");
+                    std::panic::resume_unwind(error);
+                }
             }
         }
     }
