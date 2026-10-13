@@ -528,18 +528,15 @@ fn shrink_real_tab_indicator_click_expands_hidden_identity_and_keeps_own_press_f
 }
 
 #[test]
-fn shrink_tab_touch_and_tablet_activation_preserve_native_press_and_restore_barrier() {
+fn shrink_backend_touch_and_tablet_tab_activation_preserve_native_press_and_restore_barrier() {
+    use super::test_input_backend::{
+        TestInputBackend, TestInputDevice, TestTabletEvent, TestTouchEvent,
+    };
     use crate::layout::HitType;
     use crate::shrink_expand::SpatialInput;
-    use smithay::backend::input::{
-        InputTime, TabletToolCapabilities, TabletToolDescriptor, TabletToolType,
-    };
-    use smithay::input::tablet::tool::{
-        DownEvent as TabletDown, ProximityInEvent, UpEvent as TabletUp,
-    };
+    use smithay::backend::input::{InputEvent, TabletToolTipState};
     use smithay::input::tablet::{TabletDescriptor, TabletSeatTrait};
-    use smithay::input::touch::{DownEvent as TouchDown, UpEvent as TouchUp};
-    use smithay::utils::{Point, Serial};
+    use smithay::utils::Point;
 
     for input in [SpatialInput::Touch, SpatialInput::Tablet] {
         for overview in [false, true] {
@@ -579,64 +576,42 @@ fn shrink_tab_touch_and_tablet_activation_preserve_native_press_and_restore_barr
                         })
                     })
                     .expect("native hidden book tab");
+                let normalized = (pos.x / 1280., pos.y / 720.);
                 let touch = fixture.niri().seat.add_touch();
                 let tool = if input == SpatialInput::Tablet {
                     let seat = fixture.niri().seat.tablet_seat();
-                    let tablet = seat.add_tablet(&TabletDescriptor {
-                        name: "tab-test".into(),
-                        usb_id: None,
-                        syspath: None,
-                    });
-                    let tool = seat.add_tool(&TabletToolDescriptor {
-                        tool_type: TabletToolType::Pen,
-                        hardware_serial: 72,
-                        hardware_id_wacom: 72,
-                        capabilities: TabletToolCapabilities::empty(),
-                    });
-                    tool.proximity_in(
-                        fixture.niri_state(),
-                        None,
-                        tablet,
-                        &ProximityInEvent {
-                            location: pos,
-                            axis: Default::default(),
-                            serial: Serial::from(720),
-                            time: InputTime::now(),
+                    seat.add_tablet(&TabletDescriptor::from(&TestInputDevice));
+                    let event = TestTabletEvent::new(normalized);
+                    let descriptor = event.tool.clone();
+                    fixture.niri_state().process_input_event(
+                        InputEvent::<TestInputBackend>::TabletToolProximity { event },
+                    );
+                    let tool = seat.get_tool(&descriptor).unwrap();
+                    assert!(
+                        fixture.niri().layout.is_spine(target),
+                        "proximity is passive"
+                    );
+                    fixture.niri_state().process_input_event(
+                        InputEvent::<TestInputBackend>::TabletToolTip {
+                            event: TestTabletEvent::new(normalized),
                         },
                     );
+                    assert!(tool.is_grabbed());
                     Some(tool)
                 } else {
+                    fixture.niri_state().process_input_event(
+                        InputEvent::<TestInputBackend>::TouchDown {
+                            event: TestTouchEvent::new(normalized),
+                        },
+                    );
+                    fixture.niri_state().process_input_event(
+                        InputEvent::<TestInputBackend>::TouchFrame {
+                            event: TestTouchEvent::new(normalized),
+                        },
+                    );
+                    assert!(touch.is_grabbed());
                     None
                 };
-                let serial = Serial::from(721);
-                assert!(fixture
-                    .niri_state()
-                    .try_activate_spine_tab(pos, input, serial));
-                // Match the native handler's order: tab activation before forwarding the
-                // same press to the original device handle with no client target.
-                let slot = Some(0).into();
-                if let Some(tool) = &tool {
-                    tool.down(
-                        fixture.niri_state(),
-                        &TabletDown {
-                            serial,
-                            time: InputTime::now(),
-                        },
-                    );
-                    assert!(tool.has_grab(serial));
-                } else {
-                    touch.down(
-                        fixture.niri_state(),
-                        None,
-                        &TouchDown {
-                            slot,
-                            location: pos,
-                            serial,
-                            time: InputTime::now(),
-                        },
-                    );
-                    assert!(touch.has_grab(serial));
-                }
                 fixture.double_roundtrip(client);
                 assert!(!fixture.niri().layout.is_spine(target));
                 assert!(fixture.niri().layout.is_spine(&windows[2]));
@@ -647,21 +622,21 @@ fn shrink_tab_touch_and_tablet_activation_preserve_native_press_and_restore_barr
                 );
                 assert!(fixture.niri().keyboard_focus.surface().is_none());
                 let release = |fixture: &mut Fixture| {
-                    if let Some(tool) = &tool {
-                        tool.up(
-                            fixture.niri_state(),
-                            &TabletUp {
-                                serial: Serial::from(722),
-                                time: InputTime::now(),
-                            },
+                    if tool.is_some() {
+                        let mut event = TestTabletEvent::new(normalized);
+                        event.tip = TabletToolTipState::Up;
+                        fixture.niri_state().process_input_event(
+                            InputEvent::<TestInputBackend>::TabletToolTip { event },
                         );
                     } else {
-                        touch.up(
-                            fixture.niri_state(),
-                            &TouchUp {
-                                slot,
-                                serial: Serial::from(722),
-                                time: InputTime::now(),
+                        fixture.niri_state().process_input_event(
+                            InputEvent::<TestInputBackend>::TouchUp {
+                                event: TestTouchEvent::new(normalized),
+                            },
+                        );
+                        fixture.niri_state().process_input_event(
+                            InputEvent::<TestInputBackend>::TouchFrame {
+                                event: TestTouchEvent::new(normalized),
                             },
                         );
                     }
@@ -865,6 +840,196 @@ fn shrink_moving_xdg_mode_requests_keep_grab_and_form_until_final_native_owner()
             assert_eq!(mapped.id().get(), id);
             assert!(mapped.normal_restore_ready());
             assert_eq!(fixture.niri().layout.windows().count(), 2);
+        }
+    }
+}
+
+#[test]
+fn shrink_moving_mode_disable_and_late_child_keep_original_restore_barrier() {
+    for floating in [false, true] {
+        for detach in [false, true] {
+            for disable in [false, true] {
+                for mode in ["fullscreen", "maximized", "windowed"] {
+                    let (mut fixture, client, surfaces) = timed_shrink_fixture(2, floating, 60000);
+                    let target = fixture.niri().layout.focus().unwrap().window.clone();
+                    let id = fixture.niri().layout.focus().unwrap().id().get();
+                    let ticket = fixture
+                        .niri_state()
+                        .begin_shrink_preview(Some(ShrinkAxis::Horizontal))
+                        .unwrap()
+                        .ticket();
+                    fixture.niri_state().confirm_shrink_preview(ticket).unwrap();
+                    fixture.double_roundtrip(client);
+                    let pos = spine_test_point(&mut fixture, &target, (0.5, 0.5));
+                    let pointer = spine_test_press(&mut fixture, pos);
+                    spine_test_pointer_motion(
+                        &mut fixture,
+                        &pointer,
+                        pos + smithay::utils::Point::from((if detach { 350. } else { 20. }, 0.)),
+                        true,
+                    );
+                    fixture.double_roundtrip(client);
+                    assert!(!fixture.niri().layout.can_transfer_sink());
+                    let parent_top = fixture
+                        .client(client)
+                        .window(surfaces.last().unwrap())
+                        .xdg_toplevel
+                        .clone();
+                    if mode == "windowed" {
+                        fixture.niri_state().do_action(
+                            niri_config::Action::ToggleWindowedFullscreenById(id),
+                            false,
+                        );
+                    } else if mode == "fullscreen" {
+                        parent_top.set_fullscreen(None);
+                    } else {
+                        parent_top.set_maximized();
+                    }
+                    fixture.double_roundtrip(client);
+                    assert!(fixture.niri().layout.is_spine(&target));
+                    let child = fixture.client(client).create_window().surface.clone();
+                    fixture
+                        .client(client)
+                        .window(&child)
+                        .xdg_toplevel
+                        .set_parent(Some(&parent_top));
+                    fixture.client(client).window(&child).commit();
+                    fixture.roundtrip(client);
+                    let w = fixture.client(client).window(&child);
+                    w.attach_new_buffer();
+                    w.set_size(200, 100);
+                    w.ack_last_and_commit();
+                    fixture.double_roundtrip(client);
+                    let child_server = fixture
+                        .niri()
+                        .layout
+                        .windows()
+                        .find(|(_, w)| {
+                            w.toplevel().wl_surface().id().protocol_id() == child.id().protocol_id()
+                        })
+                        .unwrap()
+                        .1
+                        .window
+                        .clone();
+                    assert!(
+                        fixture.niri().layout.is_spine(&target),
+                        "parent conversion waits for native owner"
+                    );
+                    assert!(
+                        fixture
+                            .niri()
+                            .layout
+                            .find_window_and_output(child_server.toplevel().unwrap().wl_surface())
+                            .unwrap()
+                            .0
+                            .sink_parent_input_blocked
+                    );
+                    if disable {
+                        let mut config = expand_test_config();
+                        config.shrink_expand.enabled = false;
+                        fixture.niri_state().reload_config(Ok(config));
+                        fixture.double_roundtrip(client);
+                        // The old native grab cleans itself on its next motion/release.
+                        spine_test_pointer_motion(
+                            &mut fixture,
+                            &pointer,
+                            pos + smithay::utils::Point::from((360., 0.)),
+                            true,
+                        );
+                    } else {
+                        spine_test_release(&mut fixture, &pointer);
+                    }
+                    fixture.double_roundtrip(client);
+                    assert!(!fixture.niri().layout.is_spine(&target));
+                    assert!(fixture.niri().layout.can_transfer_sink());
+                    assert!(!pointer.is_grabbed());
+                    let mapped = fixture
+                        .niri()
+                        .layout
+                        .find_window_and_output(target.toplevel().unwrap().wl_surface())
+                        .unwrap()
+                        .0;
+                    let deadline = mapped
+                        .normal_restore_deadline()
+                        .expect("one native finite barrier after final slot");
+                    assert_eq!(mapped.id().get(), id);
+                    assert_eq!(
+                        mapped.pending_sizing_mode(),
+                        if mode == "fullscreen" {
+                            SizingMode::Fullscreen
+                        } else if mode == "maximized" {
+                            SizingMode::Maximized
+                        } else {
+                            SizingMode::Normal
+                        }
+                    );
+                    assert_eq!(mapped.is_pending_windowed_fullscreen(), mode == "windowed");
+                    assert!(
+                        fixture
+                            .niri()
+                            .layout
+                            .find_window_and_output(child_server.toplevel().unwrap().wl_surface())
+                            .unwrap()
+                            .0
+                            .sink_parent_input_blocked
+                    );
+                    assert_ne!(
+                        fixture.niri().keyboard_focus.surface(),
+                        Some(child_server.toplevel().unwrap().wl_surface())
+                    );
+                    let w = fixture.client(client).window(surfaces.last().unwrap());
+                    let config = &w.configures_received.last().unwrap().1;
+                    assert!(config.states.contains(&if mode == "maximized" {
+                        xdg_toplevel::State::Maximized
+                    } else {
+                        xdg_toplevel::State::Fullscreen
+                    }));
+                    let size = config.size;
+                    w.ack_last();
+                    fixture.double_roundtrip(client);
+                    assert_eq!(
+                        fixture
+                            .niri()
+                            .layout
+                            .find_window_and_output(target.toplevel().unwrap().wl_surface())
+                            .unwrap()
+                            .0
+                            .normal_restore_deadline(),
+                        Some(deadline)
+                    );
+                    assert!(
+                        fixture
+                            .niri()
+                            .layout
+                            .find_window_and_output(child_server.toplevel().unwrap().wl_surface())
+                            .unwrap()
+                            .0
+                            .sink_parent_input_blocked,
+                        "ack-only cannot deliver the child"
+                    );
+                    let w = fixture.client(client).window(surfaces.last().unwrap());
+                    w.set_size(size.0.max(300) as u16, size.1.max(200) as u16);
+                    w.commit();
+                    fixture.double_roundtrip(client);
+                    assert!(fixture
+                        .niri()
+                        .layout
+                        .find_window_and_output(target.toplevel().unwrap().wl_surface())
+                        .unwrap()
+                        .0
+                        .normal_restore_ready());
+                    assert!(
+                        !fixture
+                            .niri()
+                            .layout
+                            .find_window_and_output(child_server.toplevel().unwrap().wl_surface())
+                            .unwrap()
+                            .0
+                            .sink_parent_input_blocked
+                    );
+                    assert_eq!(fixture.niri().layout.windows().count(), 3);
+                }
+            }
         }
     }
 }

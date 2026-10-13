@@ -53,6 +53,8 @@ NIRI_VISUAL_TEST_CASE='Layout - Shrink Floating / Move / Deferred Mode' cargo ru
 
 These scenes show both spine axes with mixed long captions, hidden tabs and batch restoration, or a floating spine moving between native layouts with a mode request deferred until drop. Each stage stays visible for inspection. They use mock clients and internal form conversion; input permissions and configure/ack/commit deadlines require the real protocol fixtures.
 
+The Shrink protocol fixtures also dispatch normalized touch and tablet events through `TestInputBackend` into the production input handlers. The tab activation case checks proximity, native press ownership, Overview exit, and actual Wayland ack/commit focus barriers. These backend fixtures remain distinct from physical device testing.
+
 
 ## Profiling
 

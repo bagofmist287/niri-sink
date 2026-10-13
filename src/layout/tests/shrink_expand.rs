@@ -105,6 +105,370 @@ fn moving_spine_mode_intent_waits_for_native_drop_and_toggles_virtual_flags() {
     }
 }
 
+fn shrink_mode_matrix_layout(scale: f64, empty_above: bool) -> Layout<TestWindow> {
+    let mut options = Options::default();
+    options.animations.off = true;
+    options.layout.empty_workspace_above_first = empty_above;
+    let mut layout = Layout::with_options(Clock::with_time(Duration::ZERO), options);
+    layout.clock.set_complete_instantly(true);
+    Op::AddScaledOutput {
+        id: 1,
+        scale,
+        layout_config: None,
+    }
+    .apply(&mut layout);
+    for id in [1, 2] {
+        Op::AddWindow {
+            params: TestWindowParams::new(id),
+        }
+        .apply(&mut layout);
+        Op::Communicate(id).apply(&mut layout);
+    }
+    layout
+}
+
+fn request_moving_spine_test_mode(layout: &mut Layout<TestWindow>, mode: &str) {
+    match mode {
+        "full" => layout.request_fullscreen(&1, true),
+        "max" => layout.request_maximized(&1, true),
+        "latent" => {
+            layout.request_fullscreen(&1, true);
+            layout.request_maximized(&1, true);
+        }
+        "windowed" => {
+            layout.request_maximized(&1, true);
+            layout.request_toggle_windowed_fullscreen(&1);
+        }
+        "cancel" => {
+            layout.request_toggle_fullscreen(&1);
+            layout.request_toggle_fullscreen(&1);
+        }
+        _ => unreachable!(),
+    }
+}
+
+#[test]
+fn shrink_moving_mode_final_shared_and_tabbed_slot_restores_only_required_members() {
+    for scale in [1., 1.25] {
+        for display in [ColumnDisplay::Normal, ColumnDisplay::Tabbed] {
+            for destination in [
+                SizingMode::Normal,
+                SizingMode::Fullscreen,
+                SizingMode::Maximized,
+            ] {
+                for mode in ["full", "max", "latent", "windowed", "cancel"] {
+                    let mut layout = shrink_mode_matrix_layout(scale, false);
+                    Op::AddWindow {
+                        params: TestWindowParams::new(3),
+                    }
+                    .apply(&mut layout);
+                    Op::Communicate(3).apply(&mut layout);
+                    layout.consume_or_expel_window_left(Some(&3));
+                    layout.set_column_display(display);
+                    Op::Communicate(2).apply(&mut layout);
+                    Op::Communicate(3).apply(&mut layout);
+                    assert!(layout.commit_shrink(&3, ShrinkAxis::Horizontal, 32.));
+                    match destination {
+                        SizingMode::Fullscreen => layout.request_fullscreen(&2, true),
+                        SizingMode::Maximized => layout.request_maximized(&2, true),
+                        SizingMode::Normal => (),
+                    }
+                    Op::Communicate(2).apply(&mut layout);
+                    Op::Communicate(3).apply(&mut layout);
+                    assert!(layout.commit_shrink(&1, ShrinkAxis::Vertical, 40.));
+                    let client = layout
+                        .windows()
+                        .find(|(_, w)| w.id() == &1)
+                        .unwrap()
+                        .1
+                        .clone();
+                    let request = client.requested_size();
+                    let peer_book = layout.is_spine(&3);
+                    let output = layout.outputs().next().unwrap().clone();
+                    layout.advance_animations();
+                    assert!(layout.interactive_move_begin(1, &output, (60., 30.).into()));
+                    assert!(layout.interactive_move_update(
+                        &1,
+                        (300., 0.).into(),
+                        output.clone(),
+                        (500., 250.).into()
+                    ));
+                    request_moving_spine_test_mode(&mut layout, mode);
+                    assert!(layout.is_spine(&1));
+                    assert_eq!(client.requested_size(), request);
+                    assert_eq!(
+                        layout.is_spine(&3),
+                        peer_book,
+                        "intent must not change destination before drop"
+                    );
+                    layout.advance_animations();
+                    let ws = layout.active_workspace().unwrap();
+                    let columns_before = ws.scrolling().columns().count();
+                    let column = ws
+                        .scrolling()
+                        .columns()
+                        .position(|col| col.tiles().any(|(t, _)| t.window().id() == &2))
+                        .unwrap();
+                    let size = output_size(&output);
+                    let point = (0..size.h as i32).step_by(10).find_map(|y| {
+                        (0..size.w as i32).step_by(10).find_map(|x| {
+                            let p = Point::from((f64::from(x), f64::from(y)));
+                            matches!(ws.scrolling_insert_position(p), InsertPosition::InColumn(i, _) if i == column).then_some(p)
+                        })
+                    }).expect("real shared-column gap");
+                    assert!(layout.interactive_move_update(&1, (0., 0.).into(), output, point));
+                    layout.update_render_elements(None);
+                    assert!(
+                        matches!(layout.monitors().next().unwrap().insert_hint.as_ref().unwrap().position, InsertPosition::InColumn(i, _) if i == column)
+                    );
+                    layout.verify_invariants();
+                    layout.interactive_move_end(&1);
+                    assert!(layout.moving_spine_mode.is_none());
+                    assert!(!layout.is_spine(&1));
+                    let expected = match mode {
+                        "full" | "latent" => SizingMode::Fullscreen,
+                        "max" | "windowed" => SizingMode::Maximized,
+                        _ => SizingMode::Normal,
+                    };
+                    assert_eq!(
+                        client.pending_sizing_mode(),
+                        expected,
+                        "{display:?}/{destination:?}/{mode}"
+                    );
+                    assert_eq!(client.is_pending_windowed_fullscreen(), mode == "windowed");
+                    assert_eq!(
+                        layout.is_spine(&3),
+                        peer_book && (display == ColumnDisplay::Normal || mode == "cancel"),
+                        "native column scope: {display:?}/{destination:?}/{mode}"
+                    );
+                    let ws = layout
+                        .workspaces()
+                        .find(|(_, _, ws)| ws.has_window(&1))
+                        .unwrap()
+                        .2;
+                    assert!(ws.has_window(&2) && ws.has_window(&3));
+                    assert_eq!(
+                        ws.scrolling().columns().count(),
+                        columns_before
+                            + usize::from(display == ColumnDisplay::Normal && mode != "cancel"),
+                        "native mode extraction: {display:?}/{destination:?}/{mode}"
+                    );
+                    assert!(Rc::ptr_eq(
+                        &ws.tiles()
+                            .find(|t| t.window().id() == &1)
+                            .unwrap()
+                            .window()
+                            .0,
+                        &client.0
+                    ));
+                    if mode == "latent" {
+                        layout.request_fullscreen(&1, false);
+                        assert_eq!(client.pending_sizing_mode(), SizingMode::Maximized);
+                    }
+                    for id in [1, 2, 3] {
+                        Op::Communicate(id).apply(&mut layout);
+                    }
+                    layout.refresh(true);
+                    layout.verify_invariants();
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn shrink_moving_mode_output_loss_and_live_config_use_final_owner() {
+    for floating in [false, true] {
+        for case in ["cross", "source-lost", "target-lost", "all-lost", "reload"] {
+            for mode in ["full", "max", "latent", "windowed", "cancel"] {
+                let mut layout = shrink_mode_matrix_layout(1., false);
+                Op::AddScaledOutput {
+                    id: 2,
+                    scale: 1.25,
+                    layout_config: None,
+                }
+                .apply(&mut layout);
+                if floating {
+                    layout.set_window_floating(Some(&1), true);
+                }
+                Op::Communicate(1).apply(&mut layout);
+                assert!(layout.commit_shrink(&1, ShrinkAxis::Vertical, 40.));
+                let client = layout
+                    .windows()
+                    .find(|(_, w)| w.id() == &1)
+                    .unwrap()
+                    .1
+                    .clone();
+                let request = client.requested_size();
+                let source = layout
+                    .outputs()
+                    .find(|o| o.name() == "output1")
+                    .unwrap()
+                    .clone();
+                let target = layout
+                    .outputs()
+                    .find(|o| o.name() == "output2")
+                    .unwrap()
+                    .clone();
+                assert!(layout.interactive_move_begin(1, &source, (60., 30.).into()));
+                assert!(layout.interactive_move_update(
+                    &1,
+                    (300., 0.).into(),
+                    target.clone(),
+                    (400., 250.).into()
+                ));
+                request_moving_spine_test_mode(&mut layout, mode);
+                if case == "reload" {
+                    let mut config = niri_config::Config::default();
+                    config.animations.off = true;
+                    config.shrink_expand.enabled = true;
+                    config.shrink_expand.thickness = 48.;
+                    config.layout.border.off = false;
+                    config.layout.border.width = 7.;
+                    layout.update_config(&config);
+                }
+                if case == "source-lost" || case == "all-lost" {
+                    layout.remove_output(&source);
+                }
+                if case == "target-lost" || case == "all-lost" {
+                    layout.remove_output(&target);
+                }
+                assert!(layout.is_spine(&1));
+                assert_eq!(client.requested_size(), request);
+                layout.verify_invariants();
+                layout.interactive_move_end(&1);
+                assert!(layout.interactive_move.is_none() && layout.moving_spine_mode.is_none());
+                assert!(!layout.is_spine(&1));
+                let expected = match mode {
+                    "full" | "latent" => SizingMode::Fullscreen,
+                    "max" | "windowed" => SizingMode::Maximized,
+                    _ => SizingMode::Normal,
+                };
+                assert_eq!(
+                    client.pending_sizing_mode(),
+                    expected,
+                    "{floating}/{case}/{mode}"
+                );
+                assert_eq!(client.is_pending_windowed_fullscreen(), mode == "windowed");
+                let (output, _, ws) = layout
+                    .workspaces()
+                    .find(|(_, _, ws)| ws.has_window(&1))
+                    .unwrap();
+                assert!(Rc::ptr_eq(
+                    &ws.tiles()
+                        .find(|t| t.window().id() == &1)
+                        .unwrap()
+                        .window()
+                        .0,
+                    &client.0
+                ));
+                match case {
+                    "target-lost" => assert_eq!(output.map(|m| &m.output), Some(&source)),
+                    "all-lost" => assert!(output.is_none()),
+                    _ => assert_eq!(output.map(|m| &m.output), Some(&target)),
+                }
+                if mode == "latent" {
+                    layout.request_fullscreen(&1, false);
+                    assert_eq!(client.pending_sizing_mode(), SizingMode::Maximized);
+                }
+                Op::Communicate(1).apply(&mut layout);
+                layout.refresh(true);
+                layout.verify_invariants();
+            }
+        }
+    }
+}
+
+#[test]
+fn shrink_moving_mode_overview_gap_keeps_new_workspace_identity() {
+    for scale in [1., 1.25] {
+        for gap in ["top", "middle", "bottom"] {
+            for mode in ["full", "max", "windowed", "cancel"] {
+                let mut layout = shrink_mode_matrix_layout(scale, gap == "top");
+                let source_idx = usize::from(gap == "top");
+                layout.move_to_workspace(Some(&2), source_idx + 1, ActivateWindow::No);
+                assert!(layout.commit_shrink(&1, ShrinkAxis::Vertical, 40.));
+                let client = layout
+                    .windows()
+                    .find(|(_, w)| w.id() == &1)
+                    .unwrap()
+                    .1
+                    .clone();
+                let request = client.requested_size();
+                let output = layout.outputs().next().unwrap().clone();
+                assert!(layout.interactive_move_begin(1, &output, (60., 30.).into()));
+                assert!(layout.interactive_move_update(
+                    &1,
+                    (300., 0.).into(),
+                    output.clone(),
+                    (500., 250.).into()
+                ));
+                request_moving_spine_test_mode(&mut layout, mode);
+                layout.open_overview();
+                if gap == "top" {
+                    layout.switch_workspace(0);
+                }
+                if gap == "bottom" {
+                    layout.switch_workspace(source_idx + 1);
+                }
+                layout.clock.set_unadjusted(Duration::from_millis(1));
+                layout.advance_animations();
+                let mon = layout.monitors().next().unwrap();
+                let desired = match gap {
+                    "top" => 0,
+                    "middle" => source_idx + 1,
+                    _ => mon.workspaces.len() - 1,
+                };
+                let size = output_size(&output);
+                let point = (0..size.h as i32)
+                    .find_map(|y| {
+                        let p = Point::from((size.w / 2., f64::from(y)));
+                        (mon.insert_position(p).0 == InsertWorkspace::NewAt(desired)).then_some(p)
+                    })
+                    .expect("visible native overview workspace gap");
+                let old_ids = mon.workspaces.iter().map(|ws| ws.id()).collect::<Vec<_>>();
+                assert!(layout.interactive_move_update(&1, (0., 0.).into(), output, point));
+                layout.update_render_elements(None);
+                assert_eq!(
+                    layout
+                        .monitors()
+                        .next()
+                        .unwrap()
+                        .insert_hint
+                        .as_ref()
+                        .unwrap()
+                        .workspace,
+                    InsertWorkspace::NewAt(desired)
+                );
+                assert!(layout.is_spine(&1));
+                assert_eq!(client.requested_size(), request);
+                layout.interactive_move_end(&1);
+                let ws = layout
+                    .workspaces()
+                    .find(|(_, _, ws)| ws.has_window(&1))
+                    .unwrap()
+                    .2;
+                assert_eq!(!old_ids.contains(&ws.id()), gap == "middle");
+                assert!(!layout.is_spine(&1));
+                assert!(layout.moving_spine_mode.is_none());
+                assert!(Rc::ptr_eq(
+                    &ws.tiles().next().unwrap().window().0,
+                    &client.0
+                ));
+                assert!(layout.is_overview_open());
+                let expected = match mode {
+                    "full" => SizingMode::Fullscreen,
+                    "max" | "windowed" => SizingMode::Maximized,
+                    _ => SizingMode::Normal,
+                };
+                assert_eq!(client.pending_sizing_mode(), expected);
+                Op::Communicate(1).apply(&mut layout);
+                layout.verify_invariants();
+            }
+        }
+    }
+}
+
 #[test]
 fn moving_spine_mode_close_removes_intent_and_normal_move_keeps_native_policy() {
     for spine in [false, true] {
