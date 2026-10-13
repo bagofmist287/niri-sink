@@ -1,4 +1,3 @@
-use crate::layout::sink_presentation::SinkInputBarrier;
 use std::cell::{Cell, Ref, RefCell};
 use std::rc::Rc;
 use std::time::{Duration, Instant};
@@ -25,6 +24,7 @@ use wayland_backend::server::Credentials;
 
 use super::{ResolvedWindowRules, WindowRef};
 use crate::handlers::KdeDecorationsModeState;
+use crate::layout::sink_presentation::SinkInputBarrier;
 use crate::layout::{
     ConfigureIntent, InteractiveResizeData, LayoutElement, LayoutElementRenderElement,
     LayoutElementRenderSnapshot, SizingMode,

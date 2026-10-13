@@ -1,7 +1,9 @@
 //! Sink presentation and commit barrier metadata. None of these objects owns a window.
-use crate::animation::{Animation, Clock};
-use smithay::utils::{Logical, Point, Rectangle, Serial, Size};
 use std::time::Instant;
+
+use smithay::utils::{Logical, Point, Rectangle, Serial, Size};
+
+use crate::animation::{Animation, Clock};
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct SinkPose {
@@ -205,8 +207,9 @@ impl SinkInputBarrier {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use std::time::Duration;
+
+    use super::*;
     #[test]
     fn fit_center_and_horizon_preserve_native_sizes() {
         let area = Rectangle::new((30., 50.).into(), (1000., 600.).into());

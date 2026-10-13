@@ -373,9 +373,10 @@ impl ActionHandler for Handler {
 
 #[cfg(test)]
 mod sink_tests {
+    use niri_config::{Action, Config, MruDirection};
+
     use super::*;
     use crate::tests::Fixture;
-    use niri_config::{Action, Config, MruDirection};
 
     #[test]
     fn system_accessibility_mru_announces_sunk_title_without_passive_recall() {

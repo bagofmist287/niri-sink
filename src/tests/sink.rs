@@ -302,9 +302,10 @@ fn overview_real_pointer_is_passive_then_unwinds_on_release_after_own_grab() {
 
 #[test]
 fn overview_confirmation_rejects_stale_cycle_membership_and_competing_grab() {
-    use crate::input::click_grab::ClickGrab;
     use smithay::input::pointer::{Focus, GrabStartData};
     use smithay::utils::Serial;
+
+    use crate::input::click_grab::ClickGrab;
 
     for change in ["close", "reopen", "resink", "grab", "remove"] {
         let mut config = Config::default();
@@ -369,11 +370,12 @@ fn overview_confirmation_rejects_stale_cycle_membership_and_competing_grab() {
 
 #[test]
 fn overview_touch_tap_confirms_but_cancel_motion_and_second_contact_do_not() {
-    use crate::input::touch_overview_grab::TouchOverviewGrab;
-    use crate::input::AnyStartData;
     use smithay::backend::input::InputTime;
     use smithay::input::touch::{DownEvent, GrabStartData, MotionEvent, UpEvent};
     use smithay::utils::Serial;
+
+    use crate::input::touch_overview_grab::TouchOverviewGrab;
+    use crate::input::AnyStartData;
 
     for gesture in ["tap", "cancel", "motion", "second"] {
         let mut config = Config::default();
@@ -565,9 +567,10 @@ fn system_new_transient_unwinds_parent_and_child_waits_for_parent_commit() {
 
 #[test]
 fn system_transient_defers_during_input_owner_and_reparent_or_close_clears_block() {
-    use crate::input::click_grab::ClickGrab;
     use smithay::input::pointer::{Focus, GrabStartData};
     use smithay::utils::Serial;
+
+    use crate::input::click_grab::ClickGrab;
     for finish in ["permit", "reparent", "parent-close", "child-close"] {
         let mut config = Config::default();
         config.sink.enabled = true;
@@ -1013,9 +1016,10 @@ fn input_method_keyboard_grab_allows_sink_pull_and_recall_without_ending_grab() 
 
 #[test]
 fn real_pointer_grab_rejects_transfers_and_recall_without_ending_grab() {
-    use crate::input::click_grab::ClickGrab;
     use smithay::input::pointer::{Focus, GrabStartData};
     use smithay::utils::Serial;
+
+    use crate::input::click_grab::ClickGrab;
     let mut config = Config::default();
     config.sink.enabled = true;
     let (mut fixture, client, windows) = setup(config);
@@ -1781,9 +1785,10 @@ fn system_real_output_membership_ids_and_independent_stacks_survive_no_outputs()
 
 #[test]
 fn system_late_parent_change_revokes_child_owned_pointer_and_touch_grabs() {
-    use crate::input::click_grab::ClickGrab;
     use smithay::input::pointer::{Focus, GrabStartData};
     use smithay::utils::Serial;
+
+    use crate::input::click_grab::ClickGrab;
     for device in ["pointer", "touch"] {
         let mut config = Config::default();
         config.sink.enabled = true;

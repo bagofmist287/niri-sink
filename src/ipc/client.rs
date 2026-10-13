@@ -940,14 +940,15 @@ mod tests {
 
     #[test]
     fn shrink_cli_wait_handles_prefix_race_expired_ids_and_bounded_silent_server() {
-        use niri_ipc::{
-            ShrinkExpandFinishReason as Reason, ShrinkExpandKind, ShrinkExpandOperation,
-            ShrinkExpandPhase as Phase, ShrinkExpandState,
-        };
         use std::io::{BufRead as _, Write as _};
         use std::os::unix::net::UnixListener;
         use std::sync::atomic::{AtomicU64, Ordering};
         use std::time::{Duration, Instant};
+
+        use niri_ipc::{
+            ShrinkExpandFinishReason as Reason, ShrinkExpandKind, ShrinkExpandOperation,
+            ShrinkExpandPhase as Phase, ShrinkExpandState,
+        };
         static NEXT: AtomicU64 = AtomicU64::new(0);
         struct Cleanup(std::path::PathBuf);
         impl Drop for Cleanup {

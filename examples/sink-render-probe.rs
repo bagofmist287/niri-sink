@@ -1,4 +1,6 @@
 //! GPU oracle for projection sampling across output transforms and clipped edges.
+use std::rc::Rc;
+
 use niri::layout::tile::TileRenderElement;
 use niri::render_helpers::background_effect::{BackgroundEffectElement, RenderParams};
 use niri::render_helpers::blur::BlurOptions;
@@ -18,7 +20,6 @@ use smithay::backend::renderer::{
 };
 use smithay::utils::user_data::UserDataMap;
 use smithay::utils::{Logical, Physical, Point, Rectangle, Scale, Size, Transform};
-use std::rc::Rc;
 
 fn solid(
     location: (f64, f64),

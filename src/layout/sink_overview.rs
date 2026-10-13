@@ -2,8 +2,9 @@
 //!
 //! The same rectangles must feed rendering and passive input. Converting the resulting poses
 //! back to workspace coordinates is the only place that divides by the Overview zoom.
-use smithay::utils::{Logical, Point, Rectangle, Size};
 use std::rc::Rc;
+
+use smithay::utils::{Logical, Point, Rectangle, Size};
 
 use super::sink_presentation::SinkPose;
 
@@ -245,11 +246,13 @@ pub fn tween_bounds(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::animation::{Animation, Clock};
+    use std::time::Duration;
+
     use approx::assert_abs_diff_eq;
     use proptest::prelude::*;
-    use std::time::Duration;
+
+    use super::*;
+    use crate::animation::{Animation, Clock};
 
     fn budget() -> SinkOverviewBudget {
         SinkOverviewBudget::new(Default::default(), 2, 1000.)

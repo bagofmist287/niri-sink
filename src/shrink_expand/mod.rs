@@ -1,14 +1,12 @@
 //! Seat operation coordination. Records contain identities/results, never layout history.
 mod runtime;
-pub(crate) use runtime::ExpandFocusLease;
-pub(crate) use runtime::ExpandSelectionLease;
-pub(crate) use runtime::PreviewLease;
-pub use runtime::Rejected;
-pub(crate) use runtime::SpineClick;
-pub(crate) use runtime::{SpatialInput, SpatialSession};
-
 use std::collections::VecDeque;
 use std::time::{Duration, Instant};
+
+pub use runtime::Rejected;
+pub(crate) use runtime::{
+    ExpandFocusLease, ExpandSelectionLease, PreviewLease, SpatialInput, SpatialSession, SpineClick,
+};
 
 use crate::layout::shrink_expand::ShrinkAxis;
 

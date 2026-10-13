@@ -3590,8 +3590,8 @@ impl<W: LayoutElement> Layout<W> {
                             .unwrap_or_else(|| win.expected_size().unwrap_or_default());
 
                         // Apply min/max size window rules. If requesting a concrete size, apply
-                        // completely; if requesting (0, 0), apply only when min/max results in a fixed
-                        // size.
+                        // completely; if requesting (0, 0), apply only when min/max results in a
+                        // fixed size.
                         let min_size = win.min_size();
                         let max_size = win.max_size();
                         size.w = ensure_min_max_size_maybe_zero(size.w, min_size.w, max_size.w);

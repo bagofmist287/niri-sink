@@ -1,14 +1,7 @@
 //! Composite a projected native window only after its real lower scene is available.
-use crate::backend::tty::{TtyFrame, TtyRenderer, TtyRendererError};
-use crate::layout::opening_window::OpenPresentation;
-use crate::layout::tile::TileRenderElement;
-use crate::render_helpers::background_effect::RenderParams;
-use crate::render_helpers::encompassing_geo;
-use crate::render_helpers::framebuffer_effect::FramebufferEffect;
-use crate::render_helpers::offscreen::{OffscreenBuffer, OffscreenData, OffscreenRenderElement};
-use crate::render_helpers::renderer::AsGlesFrame as _;
-use crate::render_helpers::texture::{TextureBuffer, TextureRenderElement};
-use crate::render_helpers::RenderTarget;
+use std::cell::RefCell;
+use std::rc::Rc;
+
 use smithay::backend::allocator::Fourcc;
 use smithay::backend::renderer::element::{Element, Id, Kind, RenderElement};
 use smithay::backend::renderer::gles::{GlesError, GlesFrame, GlesRenderer, GlesTexture};
@@ -19,10 +12,18 @@ use smithay::backend::renderer::{
 };
 use smithay::utils::user_data::UserDataMap;
 use smithay::utils::{Buffer, Logical, Physical, Point, Rectangle, Scale, Transform};
-use std::cell::RefCell;
-use std::rc::Rc;
 
-use crate::render_helpers::offscreen::OffscreenDataSlot;
+use crate::backend::tty::{TtyFrame, TtyRenderer, TtyRendererError};
+use crate::layout::opening_window::OpenPresentation;
+use crate::layout::tile::TileRenderElement;
+use crate::render_helpers::background_effect::RenderParams;
+use crate::render_helpers::framebuffer_effect::FramebufferEffect;
+use crate::render_helpers::offscreen::{
+    OffscreenBuffer, OffscreenData, OffscreenDataSlot, OffscreenRenderElement,
+};
+use crate::render_helpers::renderer::AsGlesFrame as _;
+use crate::render_helpers::texture::{TextureBuffer, TextureRenderElement};
+use crate::render_helpers::{encompassing_geo, RenderTarget};
 type Signature = Vec<(Id, CommitCounter, Rectangle<i32, Physical>, u32)>;
 
 #[derive(Debug)]
@@ -323,7 +324,8 @@ impl ProjectedGroup {
                 None,
             )?;
             // Resolve each popup/main effect against the lower scene, including previously drawn
-            // parts of this same window, never foreground windows or the window's own future pixels.
+            // parts of this same window, never foreground windows or the window's own future
+            // pixels.
             for (index, element) in self.elements.iter().enumerate().rev() {
                 let mut dst = element.geometry(self.native_scale);
                 dst.loc -= self
