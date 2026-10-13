@@ -5194,6 +5194,135 @@ fn expand_preview_retargets_current_pose_without_changing_the_native_spine() {
 }
 
 #[test]
+#[ignore = "requires explicit software EGL native mode restoration rendering"]
+fn expand_selection_restoration_inherits_native_fullscreen_opacity_and_backdrop() {
+    use smithay::backend::allocator::Fourcc;
+    use smithay::backend::renderer::element::Element as _;
+    use smithay::backend::renderer::ExportMem as _;
+
+    use crate::layout::workspace::WorkspaceRenderElement;
+    use crate::render_helpers::{render_and_download, RenderTarget};
+    let mut renderer = spine_test_renderer();
+    for scale in [1., 1.25] {
+        for mode in [SizingMode::Fullscreen, SizingMode::Maximized] {
+            let mut options = Options::default();
+            options.layout.border.off = true;
+            options.layout.focus_ring.off = true;
+            options.layout.shadow.on = false;
+            let mut params = TestWindowParams::new(1);
+            params.bbox = Rectangle::from_size((120, 80).into());
+            params.rules = Some(ResolvedWindowRules {
+                opacity: Some(0.5),
+                block_out_from: Some(niri_config::BlockOutFrom::ScreenCapture),
+                ..Default::default()
+            });
+            let client = TestWindow::new(params);
+            *client.0.render_solid.borrow_mut() =
+                Some(SolidColorBuffer::new((120., 80.), [0., 0.5, 0., 0.5]));
+            *client.0.render_solid_blocked.borrow_mut() =
+                Some(SolidColorBuffer::new((120., 80.), [0., 0., 0., 1.]));
+            let mut clock = Clock::with_time(Duration::ZERO);
+            let mut tile = Tile::new(
+                client.clone(),
+                (1280., 720.).into(),
+                scale,
+                clock.clone(),
+                Rc::new(options),
+            );
+            tile.set_spine(ShrinkAxis::Horizontal, 40.);
+            let plan = crate::layout::shrink_expand::NormalSizePlan {
+                allocation: (240., 160.).into(),
+                client_size: (240, 160).into(),
+                sizing_mode: mode,
+            };
+            tile.set_expand_preview(plan, 0.5, true);
+            clock.set_unadjusted(Duration::from_millis(50));
+            tile.update_render_elements(false, Rectangle::from_size((1280., 720.).into()));
+            let pixel_at_center = |tile: &Tile<TestWindow>, renderer: &mut _, target| {
+                let mut elements: Vec<WorkspaceRenderElement<_>> = Vec::new();
+                let projected = tile
+                    .render_expand_preview(
+                        RenderCtx {
+                            renderer,
+                            target,
+                            xray: None,
+                        },
+                        (300., 200.).into(),
+                        XrayPos::default(),
+                        false,
+                        &mut |elem| elements.push(elem.into()),
+                    )
+                    .unwrap();
+                let geo = projected.geometry(Scale::from(scale));
+                let center = geo.loc + geo.size.to_point().downscale(2);
+                elements.push(projected.into());
+                let size = Size::from((900., 700.)).to_physical_precise_round(scale);
+                let download = render_and_download(
+                    renderer,
+                    size,
+                    Scale::from(scale),
+                    Transform::Normal,
+                    Fourcc::Abgr8888,
+                    elements.into_iter().rev(),
+                )
+                .unwrap();
+                let data = renderer.map_texture(&download).unwrap();
+                let at = (center.y as usize * size.w as usize + center.x as usize) * 4;
+                <[u8; 4]>::try_from(&data[at..at + 4]).unwrap()
+            };
+            let selected = pixel_at_center(&tile, &mut renderer, RenderTarget::Output);
+            assert!(
+                selected[1].abs_diff(64) <= 1 && selected[3].abs_diff(64) <= 1,
+                "selection stays normal: {selected:?}"
+            );
+            tile.commit_expand_preview();
+            tile.prepare_normal_restore(plan);
+            tile.submit_normal_restore(false, Transaction::new(), false);
+            client.communicate();
+            client
+                .0
+                .render_solid
+                .borrow_mut()
+                .as_mut()
+                .unwrap()
+                .resize((240., 160.));
+            client
+                .0
+                .render_solid_blocked
+                .borrow_mut()
+                .as_mut()
+                .unwrap()
+                .resize((240., 160.));
+            tile.update_window();
+            assert_eq!(tile.sizing_mode(), mode);
+            assert!(
+                tile.expand_preview_size().is_some(),
+                "geometry transition still holds the projection"
+            );
+            tile.update_render_elements(true, Rectangle::from_size((1280., 720.).into()));
+            let pixel = pixel_at_center(&tile, &mut renderer, RenderTarget::Output);
+            let expected = if mode.is_fullscreen() {
+                [0, 128, 0, 255]
+            } else {
+                [0, 64, 0, 64]
+            };
+            let capture = pixel_at_center(&tile, &mut renderer, RenderTarget::ScreenCapture);
+            assert_eq!(&capture[..3], &[0, 0, 0]);
+            assert!(
+                capture[3].abs_diff(if mode.is_fullscreen() { 255 } else { 128 }) <= 1,
+                "private {mode:?}: {capture:?}"
+            );
+            for (got, want) in pixel.iter().zip(expected) {
+                assert!(
+                    got.abs_diff(want) <= 1,
+                    "{mode:?} {scale} {pixel:?} != {expected:?}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
 #[ignore = "requires explicit software EGL live selection handoff rendering"]
 fn expand_selection_handoff_retains_visible_content_pose_and_has_a_finite_input_barrier() {
     use smithay::backend::allocator::Fourcc;

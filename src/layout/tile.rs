@@ -860,6 +860,22 @@ impl<W: LayoutElement> Tile<W> {
             is_active
         };
         let animated_native_size = self.animated_tile_size();
+        // Selection keeps normal source effects. After submission, native mode
+        // progress also applies while the independent preview geometry moves.
+        let restoring_preview = self
+            .expand_preview
+            .as_ref()
+            .is_some_and(|p| p.restoring.is_some());
+        let preview_fullscreen_progress = if restoring_preview {
+            self.fullscreen_progress()
+        } else {
+            0.
+        };
+        let preview_expanded_progress = if restoring_preview {
+            self.expanded_progress()
+        } else {
+            0.
+        };
         let source_border_width = self.visual_border_width().unwrap_or(0.);
         if let Some(preview) = &mut self.expand_preview {
             if preview.restoring.is_some() {
@@ -877,6 +893,8 @@ impl<W: LayoutElement> Tile<W> {
                 1.
             } else {
                 self.window.rules().opacity.unwrap_or(1.).clamp(0., 1.)
+                    * (1. - preview_fullscreen_progress as f32)
+                    + preview_fullscreen_progress as f32
             };
             let tile_alpha = self
                 .alpha_animation
@@ -903,7 +921,8 @@ impl<W: LayoutElement> Tile<W> {
             let radius = self
                 .window
                 .geometry_corner_radius()
-                .expanded_by(source_border_width as f32);
+                .expanded_by(source_border_width as f32)
+                .scaled_by(1. - preview_expanded_progress as f32);
             preview
                 .source_border
                 .update_config(self.options.layout.border.merged_with(&rules.border).into());
@@ -917,7 +936,7 @@ impl<W: LayoutElement> Tile<W> {
                 source_view,
                 radius,
                 self.scale,
-                1.,
+                1. - preview_expanded_progress as f32,
             );
             preview
                 .source_shadow
@@ -927,7 +946,7 @@ impl<W: LayoutElement> Tile<W> {
                 preview_active,
                 radius,
                 self.scale,
-                1.,
+                1. - preview_expanded_progress as f32,
             );
             let config = self
                 .options
@@ -948,7 +967,9 @@ impl<W: LayoutElement> Tile<W> {
                         preview.inset_scale(self.options.shrink_expand.preview_scale) as f32,
                     ),
                 self.scale,
-                (opacity * (1. - progress as f32) + progress as f32) * tile_alpha,
+                (opacity * (1. - progress as f32) + progress as f32)
+                    * tile_alpha
+                    * (1. - preview_expanded_progress as f32),
             );
         }
         let rules = self.window.rules();
@@ -2549,13 +2570,27 @@ impl<W: LayoutElement> Tile<W> {
             zoom: xray_pos.zoom * zoom,
         };
         let rules = self.window.rules();
+        let fullscreen_progress = if preview.restoring.is_some() {
+            self.fullscreen_progress()
+        } else {
+            0.
+        };
+        let expanded_progress = if preview.restoring.is_some() {
+            self.expanded_progress()
+        } else {
+            0.
+        };
         let alpha = if self.window.is_ignoring_opacity_window_rule() {
             1.
         } else {
-            rules.opacity.unwrap_or(1.).clamp(0., 1.)
+            rules.opacity.unwrap_or(1.).clamp(0., 1.) * (1. - fullscreen_progress as f32)
+                + fullscreen_progress as f32
         };
-        let clip = rules.clip_to_geometry == Some(true);
-        let radius = self.window.geometry_corner_radius();
+        let clip = fullscreen_progress < 1. && rules.clip_to_geometry == Some(true);
+        let radius = self
+            .window
+            .geometry_corner_radius()
+            .scaled_by(1. - expanded_progress as f32);
         let slot = self.window.offscreen_data_slot();
         let previous = slot.as_ref().and_then(|s| s.borrow_mut().take());
         let mut ctx = ctx.as_gles();
@@ -2577,6 +2612,39 @@ impl<W: LayoutElement> Tile<W> {
             radius,
             &mut |elem| elements.push(elem),
         );
+        if fullscreen_progress > 0. {
+            let alpha = fullscreen_progress as f32;
+            if fullscreen_progress < 1. && BorderRenderElement::has_shader(ctx.renderer) {
+                let color = Color::from_color32f(self.fullscreen_backdrop.color());
+                let elem = BorderRenderElement::new(
+                    source_size,
+                    Rectangle::from_size(source_size),
+                    GradientInterpolation::default(),
+                    color,
+                    color,
+                    0.,
+                    Rectangle::from_size(source_size),
+                    0.,
+                    radius,
+                    self.scale as f32,
+                    alpha,
+                );
+                elements.push(elem.into());
+            } else {
+                // A new buffer ID each frame would defeat damage caching.
+                let mut backdrop = self.fullscreen_backdrop.clone();
+                backdrop.resize(source_size);
+                elements.push(
+                    SolidColorRenderElement::from_buffer(
+                        &backdrop,
+                        (0., 0.),
+                        alpha,
+                        Kind::Unspecified,
+                    )
+                    .into(),
+                );
+            }
+        }
         preview
             .source_border
             .render(ctx.renderer, (0., 0.).into(), &mut |elem| {
