@@ -44,6 +44,16 @@ env RUN_SLOW_TESTS=1 PROPTEST_CASES=200000 PROPTEST_MAX_GLOBAL_REJECTS=200000 RU
 
 The `niri-visual-tests` sub-crate is a GTK application that runs hard-coded test cases so that you can visually check that they look right. It uses mock windows with the real layout and rendering code. It is especially helpful when working on animations.
 
+Select a Shrink scene directly with the existing scene selector:
+
+```sh
+NIRI_VISUAL_TEST_CASE='Layout - Shrink Axes / Tabs / Batch Restore' cargo run --locked -p niri-visual-tests
+NIRI_VISUAL_TEST_CASE='Layout - Shrink Floating / Move / Deferred Mode' cargo run --locked -p niri-visual-tests
+```
+
+These scenes show both spine axes with mixed long captions, hidden tabs and batch restoration, or a floating spine moving between native layouts with a mode request deferred until drop. Each stage stays visible for inspection. They use mock clients and internal form conversion; input permissions and configure/ack/commit deadlines require the real protocol fixtures.
+
+
 ## Profiling
 
 We have integration with the [Tracy](https://github.com/wolfpld/tracy) profiler which you can enable by building niri with a feature flag:

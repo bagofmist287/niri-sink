@@ -25,6 +25,7 @@ struct TestWindowInner {
     max_size: Size<i32, Logical>,
     buffer: SolidColorBuffer,
     pending_sizing_mode: SizingMode,
+    sizing_mode: SizingMode,
     csd_shadow_width: i32,
     csd_shadow_buffer: SolidColorBuffer,
 }
@@ -52,6 +53,7 @@ impl TestWindow {
                 max_size,
                 buffer,
                 pending_sizing_mode: SizingMode::Normal,
+                sizing_mode: SizingMode::Normal,
                 csd_shadow_width: 0,
                 csd_shadow_buffer: SolidColorBuffer::new((0., 0.), [0., 0., 0., 0.3]),
             })),
@@ -87,6 +89,11 @@ impl TestWindow {
     pub fn communicate(&self) -> bool {
         let mut rv = false;
         let mut inner = self.inner.borrow_mut();
+
+        if inner.sizing_mode != inner.pending_sizing_mode {
+            inner.sizing_mode = inner.pending_sizing_mode;
+            rv = true;
+        }
 
         let mut new_size = inner.size;
 
@@ -135,6 +142,16 @@ impl LayoutElement for TestWindow {
 
     fn id(&self) -> &Self::Id {
         &self.id
+    }
+
+    fn spine_caption(&self) -> (String, String) {
+        (
+            format!(
+                "Window {} · 收缩 / Expand · Long title for clipping",
+                self.id
+            ),
+            String::new(),
+        )
     }
 
     fn size(&self) -> Size<i32, Logical> {
@@ -232,7 +249,7 @@ impl LayoutElement for TestWindow {
     }
 
     fn sizing_mode(&self) -> SizingMode {
-        SizingMode::Normal
+        self.inner.borrow().sizing_mode
     }
 
     fn requested_size(&self) -> Option<Size<i32, Logical>> {

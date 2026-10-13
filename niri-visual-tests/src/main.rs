@@ -103,6 +103,14 @@ fn build_ui(app: &adw::Application) {
     );
 
     s.add(Layout::sink_stack, "Layout - Sink Stack / Reverse / Unwind");
+    s.add(
+        Layout::shrink_axes_and_batch_restore,
+        "Layout - Shrink Axes / Tabs / Batch Restore",
+    );
+    s.add(
+        Layout::shrink_floating_move_and_mode,
+        "Layout - Shrink Floating / Move / Deferred Mode",
+    );
     s.add(Layout::open_in_between, "Layout - Open In-Between");
     s.add(
         Layout::open_multiple_quickly,
