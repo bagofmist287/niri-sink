@@ -202,6 +202,8 @@ pub struct PickedColor {
 pub enum Action {
     /// Preview shrinking the focused normal window; repeated input changes axis.
     ShrinkWindow {},
+    /// Preview the next adjacent spine, or the next spine in an all-spine workspace.
+    ExpandNearbyWindow {},
     /// Directly expand a spine by its stable window identity.
     ExpandWindow {
         /// Required window ID.

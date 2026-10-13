@@ -1848,8 +1848,17 @@ impl<W: LayoutElement> Layout<W> {
                     tile.clear_expand_preview();
                 }
             }
+            if let Some(plan) = plan {
+                changed |= ws.reveal_expand_preview(id, plan.allocation.upscale(factor));
+            }
         }
         changed
+    }
+
+    pub(crate) fn reveal_expand_origin(&mut self, id: &W::Id) {
+        if let Some(ws) = self.workspaces_mut().find(|ws| ws.has_window(id)) {
+            ws.reveal_expand_origin(id);
+        }
     }
 
     /// Protocol readiness also invalidates the held allocation without a new client commit.

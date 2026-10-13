@@ -439,6 +439,7 @@ impl State {
         if !matches!(
             action,
             Action::ShrinkWindow
+                | Action::ExpandNearbyWindow
                 | Action::ExpandWindow(_)
                 | Action::ExpandAllWindows
                 | Action::ConfirmShrinkExpand
@@ -456,6 +457,7 @@ impl State {
         }
         let result = match action {
             Action::ShrinkWindow => self.begin_shrink_preview(None).map(Some),
+            Action::ExpandNearbyWindow => self.begin_expand_selection().map(Some),
             Action::ExpandWindow(id) => self.expand_spine_window(*id),
             Action::ExpandAllWindows => self.expand_all_spines(),
             Action::ConfirmShrinkExpand => {
@@ -902,8 +904,7 @@ impl State {
             .then_some(candidates)
     }
 
-    /// Internal selection entry; the public command awaits its content presentation adapter.
-    #[doc(hidden)]
+    /// Shared nearby command entry: selection preserves the original ordinary focus.
     pub fn begin_expand_selection(&mut self) -> Result<Record, Rejected> {
         if !self.niri.config.borrow().shrink_expand.enabled {
             return Err(Rejected::Disabled);
@@ -1195,7 +1196,24 @@ impl State {
             self.niri.event_loop.remove(token);
         }
         self.niri.shrink_preview_lease = None;
-        self.niri.expand_selection_lease = None;
+        if let Some(lease) = self.niri.expand_selection_lease.take() {
+            if !self.niri.is_locked()
+                && self.niri.layout.can_transfer_sink()
+                && self.niri.layout.active_output() == Some(&lease.output)
+                && self
+                    .niri
+                    .layout
+                    .active_workspace()
+                    .is_some_and(|ws| ws.id().get() == lease.workspace)
+                && self.niri.layout.focus().map(|win| &win.window) == lease.origin.as_ref()
+                && self.niri.layout.is_overview_open() == lease.overview_open
+                && self.niri.layout.overview_generation() == lease.overview_generation
+            {
+                if let Some(origin) = lease.origin {
+                    self.niri.layout.reveal_expand_origin(&origin);
+                }
+            }
+        }
         self.niri.layout.clear_shrink_previews();
         self.niri.layout.clear_expand_previews();
         let record = self.niri.shrink_expand.cancel();

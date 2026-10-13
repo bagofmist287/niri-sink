@@ -865,6 +865,14 @@ impl<W: LayoutElement> Workspace<W> {
 
     /// Read-only normal insertion requests for a batch, resolved from one native snapshot.
     /// IDs absent from this workspace, normal windows and Sink members are omitted.
+    pub(super) fn reveal_expand_preview(&mut self, id: &W::Id, extent: Size<f64, Logical>) -> bool {
+        self.scrolling.reveal_expand_preview(id, extent)
+    }
+
+    pub(super) fn reveal_expand_origin(&mut self, id: &W::Id) {
+        self.scrolling.reveal_expand_origin(id);
+    }
+
     pub fn normal_spine_plans(
         &self,
         ids: &[W::Id],

@@ -1492,6 +1492,67 @@ impl<W: LayoutElement> ScrollingSpace<W> {
         }
     }
 
+    /// Reveal only the selected frame; do not activate a column or hidden tab.
+    pub(super) fn reveal_expand_preview(&mut self, id: &W::Id, extent: Size<f64, Logical>) -> bool {
+        // A feature preview must not commandeer a native resize or scrolling gesture.
+        if self.interactive_resize.is_some() || matches!(self.view_offset, ViewOffset::Gesture(_)) {
+            return false;
+        }
+        let Some((tile, pos, _)) = self
+            .tiles_with_render_positions()
+            .find(|(tile, _, _)| tile.window().id() == id)
+        else {
+            return false;
+        };
+        if !tile.is_spine() || self.working_area.size.w <= 0. {
+            return false;
+        }
+        let width = extent.w.max(tile.tile_size().w);
+        let center = pos.x + self.view_pos() + tile.tile_size().w / 2.;
+        let area = self.working_area;
+        let target = self.target_view_pos();
+        let left = center - width / 2. - target;
+        let right = left + width;
+        let new_target = if width >= area.size.w {
+            center - (area.loc.x + area.size.w / 2.)
+        } else if left < area.loc.x {
+            target + left - area.loc.x
+        } else if right > area.loc.x + area.size.w {
+            target + right - area.loc.x - area.size.w
+        } else {
+            return false;
+        };
+        if (new_target - target).abs() < 1. / self.scale {
+            return false;
+        }
+        let config = niri_config::Animation {
+            off: self.options.animations.off
+                || self.options.animations.horizontal_view_movement.0.off,
+            ..self.options.animations.horizontal_view_movement.0
+        };
+        self.animate_view_offset_with_config(
+            self.active_column_idx,
+            new_target - self.column_x(self.active_column_idx),
+            config,
+        );
+        true
+    }
+
+    /// Bring a still-focused origin back using its native column visibility policy.
+    pub(super) fn reveal_expand_origin(&mut self, id: &W::Id) {
+        if self.interactive_resize.is_some() || matches!(self.view_offset, ViewOffset::Gesture(_)) {
+            return;
+        }
+        if let Some(idx) = self.columns.iter().position(|column| column.contains(id)) {
+            let config = niri_config::Animation {
+                off: self.options.animations.off
+                    || self.options.animations.horizontal_view_movement.0.off,
+                ..self.options.animations.horizontal_view_movement.0
+            };
+            self.animate_view_offset_to_column_with_config(None, idx, None, config);
+        }
+    }
+
     pub fn scroll_amount_to_activate(&self, window: &W::Id) -> f64 {
         let column_idx = self
             .columns

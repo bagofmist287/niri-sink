@@ -1,8 +1,8 @@
 # Shrink / Expand development configuration
 
-The `shrink/development` branch provides the five base commands below when
+The `shrink/development` branch provides the six commands below when
 `enabled true`, with independent spine rendering and compositor-owned hit regions.
-Adjacent selection remains under development. This is a partial development candidate;
+Adjacent selection includes a content preview. This is a partial development candidate;
 the installed Sink session has not been replaced by this branch.
 
 ```kdl
@@ -186,18 +186,50 @@ only the current insertion's visual pose and drops its caches once the transitio
 ends; it does not retain a pre-shrink size. Software EGL verifies pixels, fractional
 scale and capture isolation; this is not physical-device or nested-session evidence.
 
+Nearby expansion pins the current ordinary tiled origin. It lists all direct
+spines before same-axis chains, in right/down/left/up and native member order.
+Traversal stops at ordinary or differently oriented windows and uses shortest
+paths. In a nonempty workspace containing only spines, it visits the full scrolling
+start order, including hidden tabs, then floating positions from top to bottom,
+left to right, with window-ID ties. A mixed workspace's floating ordinary focus
+does not start a tiling search. Repeating the command cycles the current list and
+refreshes its timer; passive changes preserve the selected ID and deadline. An
+invalid selected identity or search scope cancels rather than choosing another.
+
+Only the selected client is sampled into a compositor-owned content preview.
+The estimated normal allocation times `preview-scale` defines the frame; existing
+content fits uniformly inside it, centered over the spine. Preview does not
+configure, activate or occupy a new layout slot. In scrolling space the native
+horizontal viewport can reveal that frame, while the original ordinary focus is
+retained. Oversized frames are centered; normal output clipping still applies.
+Native resize and scroll-gesture ownership take priority over this reveal. Cancel
+brings a still-valid, still-focused ordinary origin back using native column
+visibility policy; a different focus or scene scope is preserved.
+
+Confirm submits only the selected identity and continues from its displayed pose
+into the current native insertion. The same client/capture caches survive the
+handoff, then the normal Tile owns the presentation. Input releases on processed
+commit or the original deadline, independently of animation. The held allocation
+also releases at that deadline without requiring another client commit, and
+presentation resources drop when the visual finishes. Native effects/capture
+policy remain in the rendering path; controlled software EGL and Wayland fixtures
+cover geometry, focus, receipts and lifetime, with broader system qualification
+still pending.
+
 ## Base commands and operation observation
 
 | KDL action | CLI action | Behavior |
 | --- | --- | --- |
 | `shrink-window` | `shrink-window` | First-axis prediction; repeat changes axis and refreshes the same timer. |
+| `expand-nearby-window` | `expand-nearby-window` | Preview/cycle nearby or all-spine candidates; confirm or buffer expiry expands the selected identity. |
 | `expand-window id=42` | `expand-window --id 42` | Direct expansion by ID, without a selection preview. |
 | `expand-all-windows` | `expand-all-windows` | One current-workspace batch including hidden tabs and floating spines. |
 | `confirm-shrink-expand` | `confirm-shrink-expand` | Revalidate and submit the current preview. |
 | `cancel-shrink-expand` | `cancel-shrink-expand` | Cancel the current preview. |
 
-`expand-nearby-window` is not available yet. Opposite Expand input during a Shrink
-preview only cancels that preview, including explicit-ID and batch commands.
+Opposite Expand input during a Shrink preview only cancels that preview, including
+nearby, explicit-ID and batch commands. Shrink input during nearby selection only
+cancels it.
 Escape also cancels. The action dispatcher checks seat ownership before the
 native common grab side effects, preserving pointer/touch/IME constraints.
 
@@ -205,12 +237,13 @@ For example, on a binary built from this branch:
 
 ```sh
 niri msg --json action shrink-window
+niri msg --json action expand-nearby-window
 niri msg --json action --wait expand-window --id 42
 niri msg --json action --wait=2000 expand-all-windows
 niri msg --json shrink-expand-state --operation-id 7
 ```
 
-The five actions return `ShrinkExpandAction` receipts with operation/workspace IDs,
+The six actions return `ShrinkExpandAction` receipts with operation/workspace IDs,
 actual targets, Previewing/Submitted/Cancelled/NoChange and `waiting_for_clients`.
 Ordinary actions retain `Handled`. Submitted asserts native form/allocation, not a
 client response. `--wait` subscribes to the event stream and includes its terminal

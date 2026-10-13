@@ -1832,6 +1832,7 @@ fn shrink_ipc_disabled_and_pointer_grab_rejections_preserve_native_ownership() {
     );
     for action in [
         Action::ShrinkWindow {},
+        Action::ExpandNearbyWindow {},
         Action::ExpandWindow { id: u64::MAX },
         Action::ExpandAllWindows {},
     ] {
@@ -2447,6 +2448,10 @@ struct SelectionFixture {
 }
 
 fn selection_fixture(all: bool, floating: bool) -> SelectionFixture {
+    selection_fixture_axis(all, floating, ShrinkAxis::Horizontal)
+}
+
+fn selection_fixture_axis(all: bool, floating: bool, axis: ShrinkAxis) -> SelectionFixture {
     let (mut fixture, client, surfaces) = timed_shrink_fixture(4, floating, 60000);
     fixture
         .niri()
@@ -2463,10 +2468,7 @@ fn selection_fixture(all: bool, floating: bool) -> SelectionFixture {
     windows.sort_by_key(|(id, _)| *id);
     for (index, (_, window)) in windows.iter().enumerate() {
         if all || index > 0 {
-            assert!(fixture
-                .niri()
-                .layout
-                .commit_shrink(window, ShrinkAxis::Horizontal, 32.));
+            assert!(fixture.niri().layout.commit_shrink(window, axis, 32.));
         }
         if floating {
             use niri_ipc::PositionChange;
@@ -5471,4 +5473,217 @@ fn expand_selection_handoff_keeps_original_deadline_independent_of_long_visual_m
             }
         }
     }
+}
+
+#[test]
+fn nearby_public_ipc_receipts_cycle_cancel_and_confirm_without_focus_or_preview_configure() {
+    use niri_ipc::{Action, Request, Response, ShrinkExpandOutcome as Outcome};
+    for all in [false, true] {
+        for floating in [false, true] {
+            let SelectionFixture {
+                mut fixture,
+                client,
+                surfaces,
+                windows,
+            } = selection_fixture(all, floating);
+            let mut ipc = ShrinkIpcClient::new(&mut fixture);
+            if floating && !all {
+                assert!(ipc
+                    .request(&mut fixture, Request::Action(Action::ExpandNearbyWindow {}))
+                    .is_err());
+                continue;
+            }
+            let focus = fixture.niri().keyboard_focus.surface().cloned();
+            let configs = surfaces
+                .iter()
+                .map(|surface| {
+                    fixture
+                        .client(client)
+                        .window(surface)
+                        .configures_received
+                        .len()
+                })
+                .collect::<Vec<_>>();
+            let Response::ShrinkExpandAction(first) = ipc
+                .request(&mut fixture, Request::Action(Action::ExpandNearbyWindow {}))
+                .unwrap()
+            else {
+                panic!()
+            };
+            let start = if all { 0 } else { 1 };
+            assert_eq!(first.outcome, Outcome::Previewing);
+            assert_eq!(first.targets, [windows[start].0]);
+            let Response::ShrinkExpandAction(next) = ipc
+                .request(&mut fixture, Request::Action(Action::ExpandNearbyWindow {}))
+                .unwrap()
+            else {
+                panic!()
+            };
+            assert_eq!(next.operation_id, first.operation_id);
+            assert_eq!(next.targets, [windows[start + 1].0]);
+            assert!(!next.waiting_for_clients);
+            assert_eq!(fixture.niri().keyboard_focus.surface().cloned(), focus);
+            assert_eq!(
+                surfaces
+                    .iter()
+                    .map(|surface| fixture
+                        .client(client)
+                        .window(surface)
+                        .configures_received
+                        .len())
+                    .collect::<Vec<_>>(),
+                configs
+            );
+            let Response::ShrinkExpandAction(cancelled) = ipc
+                .request(&mut fixture, Request::Action(Action::ShrinkWindow {}))
+                .unwrap()
+            else {
+                panic!()
+            };
+            assert_eq!(cancelled.outcome, Outcome::Cancelled);
+            assert_eq!(cancelled.operation_id, first.operation_id);
+            assert!(fixture.niri().expand_selection_lease.is_none());
+            assert!(fixture
+                .niri()
+                .layout
+                .active_workspace()
+                .unwrap()
+                .tiles()
+                .all(|tile| tile.expand_preview_size().is_none()));
+            let Response::ShrinkExpandAction(selected) = ipc
+                .request(&mut fixture, Request::Action(Action::ExpandNearbyWindow {}))
+                .unwrap()
+            else {
+                panic!()
+            };
+            let Response::ShrinkExpandAction(submitted) = ipc
+                .request(
+                    &mut fixture,
+                    Request::Action(Action::ConfirmShrinkExpand {}),
+                )
+                .unwrap()
+            else {
+                panic!()
+            };
+            assert_eq!(submitted.operation_id, selected.operation_id);
+            assert_eq!(submitted.targets, [windows[start].0]);
+            assert!(!fixture.niri().layout.is_spine(&windows[start].1));
+            assert!(windows
+                .iter()
+                .enumerate()
+                .filter(|(index, _)| *index != start && (all || *index > 0))
+                .all(|(_, (_, window))| fixture.niri().layout.is_spine(window)));
+            let Response::ShrinkExpandState(state) = ipc
+                .request(&mut fixture, Request::ShrinkExpandState)
+                .unwrap()
+            else {
+                panic!()
+            };
+            assert!(state
+                .operations
+                .iter()
+                .any(|op| Some(op.operation_id) == selected.operation_id
+                    && op.kind == niri_ipc::ShrinkExpandKind::ExpandSelection));
+        }
+    }
+}
+
+#[test]
+fn nearby_public_command_reveals_offscreen_identity_and_returns_valid_origin_on_cancel() {
+    use niri_ipc::{Action, Request, Response};
+    let SelectionFixture {
+        mut fixture,
+        client,
+        surfaces,
+        windows,
+    } = selection_fixture_axis(false, false, ShrinkAxis::Vertical);
+    // Three wide horizontal spines in native columns put the last candidate offscreen.
+    for (_, window) in windows.iter().skip(1) {
+        fixture
+            .niri()
+            .layout
+            .set_window_width(Some(window), niri_ipc::SizeChange::SetFixed(1000));
+    }
+    fixture.double_roundtrip(client);
+    fixture.niri_complete_animations();
+    let target = &windows[3].1;
+    let rect = |fixture: &mut Fixture, preview: bool| {
+        let ws = fixture.niri().layout.active_workspace().unwrap();
+        ws.tiles_with_render_positions()
+            .find(|(tile, _, _)| &tile.window().window == target)
+            .map(|(tile, pos, _)| {
+                if preview {
+                    tile.expand_preview_rect(pos).unwrap()
+                } else {
+                    smithay::utils::Rectangle::new(pos, tile.tile_size())
+                }
+            })
+            .unwrap()
+    };
+    let width = fixture
+        .niri()
+        .layout
+        .active_output()
+        .unwrap()
+        .current_mode()
+        .unwrap()
+        .size
+        .w as f64;
+    assert!(rect(&mut fixture, false).loc.x > width);
+    let focus = fixture.niri().keyboard_focus.surface().cloned();
+    let configs = surfaces
+        .iter()
+        .map(|surface| {
+            fixture
+                .client(client)
+                .window(surface)
+                .configures_received
+                .len()
+        })
+        .collect::<Vec<_>>();
+    let mut ipc = ShrinkIpcClient::new(&mut fixture);
+    for _ in 0..3 {
+        ipc.request(&mut fixture, Request::Action(Action::ExpandNearbyWindow {}))
+            .unwrap();
+    }
+    fixture.niri_complete_animations();
+    let frame = rect(&mut fixture, true);
+    assert!(
+        frame.loc.x >= -1. && frame.loc.x + frame.size.w <= width + 1.,
+        "{frame:?} width={width}"
+    );
+    let preview = fixture.niri().shrink_expand.preview().unwrap().clone();
+    assert_eq!(preview.record.targets, [windows[3].0]);
+    assert_eq!(fixture.niri().keyboard_focus.surface().cloned(), focus);
+    assert_eq!(
+        surfaces
+            .iter()
+            .map(|surface| fixture
+                .client(client)
+                .window(surface)
+                .configures_received
+                .len())
+            .collect::<Vec<_>>(),
+        configs
+    );
+    fixture.double_roundtrip(client);
+    assert_eq!(
+        fixture.niri().shrink_expand.preview().unwrap().deadline,
+        preview.deadline
+    );
+    let Response::ShrinkExpandAction(cancelled) = ipc
+        .request(&mut fixture, Request::Action(Action::CancelShrinkExpand {}))
+        .unwrap()
+    else {
+        panic!()
+    };
+    assert_eq!(cancelled.outcome, niri_ipc::ShrinkExpandOutcome::Cancelled);
+    fixture.niri_complete_animations();
+    let ws = fixture.niri().layout.active_workspace().unwrap();
+    let (root, pos, _) = ws
+        .tiles_with_render_positions()
+        .find(|(tile, _, _)| tile.window().window == windows[0].1)
+        .unwrap();
+    assert!(pos.x + root.tile_size().w > 0. && pos.x < width);
+    assert_eq!(fixture.niri().keyboard_focus.surface().cloned(), focus);
 }

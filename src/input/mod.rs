@@ -769,6 +769,7 @@ impl State {
 
         match action {
             Action::ShrinkWindow
+            | Action::ExpandNearbyWindow
             | Action::ExpandWindow(_)
             | Action::ExpandAllWindows
             | Action::ConfirmShrinkExpand

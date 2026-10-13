@@ -4778,3 +4778,146 @@ fn expand_selection_handoff_retains_visible_content_pose_and_has_a_finite_input_
         }
     }
 }
+
+#[test]
+fn nearby_preview_view_reveal_preserves_focus_native_requests_query_and_input_owners() {
+    for scale in [1., 1.25] {
+        let mut options = Options::default();
+        options.animations.off = true;
+        let mut clock = Clock::with_time(Duration::ZERO);
+        let mut layout = Layout::with_options(clock.clone(), options);
+        Op::AddScaledOutput {
+            id: 1,
+            scale,
+            layout_config: None,
+        }
+        .apply(&mut layout);
+        for id in 1..=40 {
+            Op::AddWindow {
+                params: TestWindowParams::new(id),
+            }
+            .apply(&mut layout);
+            Op::Communicate(id).apply(&mut layout);
+        }
+        for id in 2..=40 {
+            assert!(layout.commit_shrink(&id, ShrinkAxis::Horizontal, 32.));
+        }
+        layout.activate_window(&1);
+        clock.set_complete_instantly(true);
+        layout.advance_animations();
+        clock.set_complete_instantly(false);
+        let query = layout
+            .active_workspace()
+            .unwrap()
+            .spine_candidates(Some(&1), |a, b| a.id().cmp(b.id()))
+            .unwrap();
+        let requests = layout
+            .windows()
+            .map(|(_, win)| (*win.id(), win.requested_size()))
+            .collect::<Vec<_>>();
+        let width = 1280. / scale;
+        let before = layout
+            .active_workspace()
+            .unwrap()
+            .tiles_with_render_positions()
+            .find(|(tile, _, _)| tile.window().id() == &35)
+            .unwrap()
+            .1;
+        assert!(before.x > width);
+        assert!(layout.set_expand_preview(&35, 0.75, false));
+        // Native zero-duration view animations retain their initial pose within the same cycle.
+        clock.set_unadjusted(Duration::from_millis(1));
+        layout.advance_animations();
+        let ws = layout.active_workspace().unwrap();
+        let frame = ws
+            .tiles_with_render_positions()
+            .find(|(tile, _, _)| tile.window().id() == &35)
+            .and_then(|(tile, pos, _)| tile.expand_preview_rect(pos))
+            .unwrap();
+        assert!(
+            frame.loc.x >= -1. / scale && frame.loc.x + frame.size.w <= width + 1. / scale,
+            "{frame:?}"
+        );
+        assert_eq!(*layout.focus().unwrap().id(), 1);
+        assert_eq!(
+            layout
+                .active_workspace()
+                .unwrap()
+                .spine_candidates(Some(&1), |a, b| a.id().cmp(b.id())),
+            Some(query)
+        );
+        assert_eq!(
+            layout
+                .windows()
+                .map(|(_, win)| (*win.id(), win.requested_size()))
+                .collect::<Vec<_>>(),
+            requests
+        );
+        assert!(!layout.set_expand_preview(&35, 0.75, false));
+        assert!(layout.interactive_resize_begin(1, ResizeEdge::RIGHT));
+        let target = layout
+            .active_workspace()
+            .unwrap()
+            .scrolling()
+            .target_view_pos();
+        layout.set_expand_preview(&36, 0.75, false);
+        assert_eq!(
+            layout
+                .active_workspace()
+                .unwrap()
+                .scrolling()
+                .target_view_pos(),
+            target
+        );
+        layout.interactive_resize_end(&1);
+        layout
+            .active_workspace_mut()
+            .unwrap()
+            .scrolling_mut()
+            .view_offset_gesture_begin(true);
+        let view = layout.active_workspace().unwrap().scrolling().view_pos();
+        layout.set_expand_preview(&37, 0.75, false);
+        assert_eq!(
+            layout.active_workspace().unwrap().scrolling().view_pos(),
+            view
+        );
+        layout.verify_invariants();
+    }
+}
+
+#[test]
+fn spine_search_native_vertical_members_keep_direct_sides_ahead_of_same_axis_chain() {
+    let mut options = Options::default();
+    options.animations.off = true;
+    let mut layout = Layout::with_options(Clock::with_time(Duration::ZERO), options);
+    Op::AddOutput(1).apply(&mut layout);
+    for id in 1..=4 {
+        Op::AddWindow {
+            params: TestWindowParams::new(id),
+        }
+        .apply(&mut layout);
+        Op::Communicate(id).apply(&mut layout);
+    }
+    layout.consume_or_expel_window_left(Some(&2));
+    layout.consume_or_expel_window_left(Some(&3));
+    assert!(layout.commit_shrink(&2, ShrinkAxis::Vertical, 32.));
+    assert!(layout.commit_shrink(&3, ShrinkAxis::Vertical, 32.));
+    assert!(layout.commit_shrink(&4, ShrinkAxis::Horizontal, 32.));
+    layout.set_window_height(Some(&1), SizeChange::SetFixed(200));
+    Op::Communicate(1).apply(&mut layout);
+    layout.activate_window(&1);
+    let candidates = layout
+        .active_workspace()
+        .unwrap()
+        .spine_candidates(Some(&1), |a, b| a.id().cmp(b.id()))
+        .unwrap()
+        .candidates;
+    assert_eq!(
+        candidates
+            .iter()
+            .map(|candidate| (candidate.id, candidate.distance))
+            .collect::<Vec<_>>(),
+        [(4, 1), (2, 1), (3, 2)]
+    );
+    layout.verify_invariants();
+}

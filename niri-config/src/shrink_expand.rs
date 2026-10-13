@@ -219,6 +219,25 @@ mod tests {
     use crate::Config;
 
     #[test]
+    fn nearby_action_binding_and_ipc_conversion_have_no_target_argument() {
+        let config = Config::parse_mem("binds { Mod+E { expand-nearby-window; }; }").unwrap();
+        assert!(matches!(
+            config.binds.0[0].action,
+            crate::Action::ExpandNearbyWindow
+        ));
+        assert!(matches!(
+            crate::Action::from(niri_ipc::Action::ExpandNearbyWindow {}),
+            crate::Action::ExpandNearbyWindow
+        ));
+        for property in ["id=7", "axis=\"horizontal\""] {
+            assert!(Config::parse_mem(&format!(
+                "binds {{ Mod+E {{ expand-nearby-window {property}; }}; }}"
+            ))
+            .is_err());
+        }
+    }
+
+    #[test]
     fn defaults_and_partial_behavior_merge() {
         let defaults = Config::load_default();
         assert_eq!(defaults.shrink_expand, ShrinkExpand::default());

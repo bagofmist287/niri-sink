@@ -1038,6 +1038,11 @@ mod tests {
     #[test]
     fn shrink_cli_actions_require_id_and_bounded_wait_option() {
         use clap::Parser as _;
+        let encoded = serde_json::to_string(&Action::ExpandNearbyWindow {}).unwrap();
+        assert!(matches!(
+            serde_json::from_str::<Action>(&encoded).unwrap(),
+            Action::ExpandNearbyWindow {}
+        ));
         let cli = crate::cli::Cli::try_parse_from([
             "niri",
             "msg",
@@ -1071,6 +1076,33 @@ mod tests {
                 ..
             })
         ));
+        let cli = crate::cli::Cli::try_parse_from([
+            "niri",
+            "msg",
+            "action",
+            "--wait=40",
+            "expand-nearby-window",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.subcommand,
+            Some(crate::cli::Sub::Msg {
+                msg: Msg::Action {
+                    action: Action::ExpandNearbyWindow {},
+                    wait: Some(40)
+                },
+                ..
+            })
+        ));
+        assert!(crate::cli::Cli::try_parse_from([
+            "niri",
+            "msg",
+            "action",
+            "expand-nearby-window",
+            "--id",
+            "7"
+        ])
+        .is_err());
         for args in [
             vec!["niri", "msg", "action", "expand-window"],
             vec!["niri", "msg", "action", "--wait=60001", "shrink-window"],
