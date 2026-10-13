@@ -5109,3 +5109,421 @@ fn spine_drop_revalidates_after_layout_change_instead_of_committing_stale_hint()
     assert_eq!(tile.form(), WindowForm::Spine(ShrinkAxis::Horizontal));
     layout.verify_invariants();
 }
+
+#[test]
+fn spine_drop_into_shared_and_tabbed_columns_matches_hint_without_expanding() {
+    for scale in [1., 1.25] {
+        for display in [ColumnDisplay::Normal, ColumnDisplay::Tabbed] {
+            for (wide, mode) in [
+                (false, SizingMode::Normal),
+                (true, SizingMode::Normal),
+                (true, SizingMode::Fullscreen),
+                (true, SizingMode::Maximized),
+            ] {
+                let mut options = Options::default();
+                options.animations.off = true;
+                let mut layout = Layout::with_options(Clock::with_time(Duration::ZERO), options);
+                layout.clock.set_complete_instantly(true);
+                Op::AddScaledOutput {
+                    id: 1,
+                    scale,
+                    layout_config: None,
+                }
+                .apply(&mut layout);
+                for id in [1, 2] {
+                    Op::AddWindow {
+                        params: TestWindowParams::new(id),
+                    }
+                    .apply(&mut layout);
+                    Op::Communicate(id).apply(&mut layout);
+                }
+                layout.set_column_display(display);
+                layout.set_window_width(
+                    Some(&2),
+                    SizeChange::SetFixed(if wide { 2500 } else { 600 }),
+                );
+                match mode {
+                    SizingMode::Fullscreen => layout.set_fullscreen(&2, true),
+                    SizingMode::Maximized => layout.set_maximized(&2, true),
+                    SizingMode::Normal => (),
+                }
+                Op::Communicate(2).apply(&mut layout);
+                assert!(layout.commit_shrink(&1, ShrinkAxis::Vertical, 40.));
+                let client = layout
+                    .windows()
+                    .find(|(_, w)| w.id() == &1)
+                    .unwrap()
+                    .1
+                    .clone();
+                let request = client.requested_size();
+                let output = layout.outputs().next().unwrap().clone();
+                layout.advance_animations();
+                assert!(layout.interactive_move_begin(1, &output, (60., 30.).into()));
+                assert!(layout.interactive_move_update(
+                    &1,
+                    (300., 0.).into(),
+                    output.clone(),
+                    (500., 250.).into()
+                ));
+                layout.advance_animations();
+                // Choose a genuine nearest-gap InColumn result, without forcing InsertHint.
+                let ws = layout.active_workspace().unwrap();
+                let view_size = output_size(&output);
+                let point = (0..view_size.h as i32)
+                    .step_by(10)
+                    .find_map(|y| {
+                        (0..view_size.w as i32).step_by(10).find_map(|x| {
+                            let point = Point::from((f64::from(x), f64::from(y)));
+                            matches!(
+                                ws.scrolling_insert_position(point),
+                                InsertPosition::InColumn(0, _)
+                            )
+                            .then_some(point)
+                        })
+                    })
+                    .expect("native shared-column gap");
+                assert!(layout.interactive_move_update(&1, (0., 0.).into(), output, point));
+                layout.update_render_elements(None);
+                let hint = layout
+                    .monitors()
+                    .next()
+                    .unwrap()
+                    .insert_hint
+                    .as_ref()
+                    .unwrap();
+                assert!(matches!(hint.position, InsertPosition::InColumn(0, _)));
+                let plan = hint.spine.unwrap();
+                if mode == SizingMode::Normal {
+                    assert_eq!(
+                        plan.geometry.axis,
+                        if wide {
+                            ShrinkAxis::Horizontal
+                        } else {
+                            ShrinkAxis::Vertical
+                        }
+                    );
+                }
+                let Some(InteractiveMoveState::Moving(move_)) = &layout.interactive_move else {
+                    panic!()
+                };
+                assert_eq!(move_.tile.form(), WindowForm::Spine(ShrinkAxis::Vertical));
+                layout.interactive_move_end(&1);
+                let ws = layout
+                    .workspaces()
+                    .find(|(_, _, ws)| ws.has_window(&1))
+                    .unwrap()
+                    .2;
+                let tile = ws.tiles().find(|tile| tile.window().id() == &1).unwrap();
+                assert_eq!(tile.form(), WindowForm::Spine(plan.geometry.axis));
+                assert_eq!(tile.tile_size(), plan.geometry.outer_size());
+                assert!(Rc::ptr_eq(&tile.window().0, &client.0));
+                assert_eq!(client.requested_size(), request);
+                assert_eq!(ws.scrolling().columns().count(), 1);
+                let neighbor = ws
+                    .tiles()
+                    .find(|tile| tile.window().id() == &2)
+                    .unwrap()
+                    .window();
+                assert_eq!(
+                    neighbor.pending_sizing_mode(),
+                    if display == ColumnDisplay::Tabbed {
+                        mode
+                    } else {
+                        SizingMode::Normal
+                    }
+                );
+                assert_eq!(layout.windows().count(), 2);
+                layout.verify_invariants();
+            }
+        }
+    }
+}
+
+#[test]
+fn spine_drop_overview_workspace_gaps_use_native_insertion_and_keep_identity() {
+    for scale in [1., 1.25] {
+        for gap in ["top", "middle", "bottom"] {
+            let mut options = Options::default();
+            options.animations.off = true;
+            options.layout.empty_workspace_above_first = gap == "top";
+            let mut layout = Layout::with_options(Clock::with_time(Duration::ZERO), options);
+            layout.clock.set_complete_instantly(true);
+            Op::AddScaledOutput {
+                id: 1,
+                scale,
+                layout_config: None,
+            }
+            .apply(&mut layout);
+            for id in [1, 2] {
+                Op::AddWindow {
+                    params: TestWindowParams::new(id),
+                }
+                .apply(&mut layout);
+                Op::Communicate(id).apply(&mut layout);
+            }
+            let source_idx = usize::from(gap == "top");
+            layout.move_to_workspace(Some(&2), source_idx + 1, ActivateWindow::No);
+            assert!(layout.commit_shrink(&1, ShrinkAxis::Vertical, 40.));
+            let client = layout
+                .windows()
+                .find(|(_, w)| w.id() == &1)
+                .unwrap()
+                .1
+                .clone();
+            let request = client.requested_size();
+            let output = layout.outputs().next().unwrap().clone();
+            assert!(layout.interactive_move_begin(1, &output, (60., 30.).into()));
+            assert!(layout.interactive_move_update(
+                &1,
+                (300., 0.).into(),
+                output.clone(),
+                (500., 250.).into()
+            ));
+            layout.open_overview();
+            if gap == "top" {
+                layout.switch_workspace(0);
+            }
+            if gap == "bottom" {
+                layout.switch_workspace(source_idx + 1);
+            }
+            layout.clock.set_unadjusted(Duration::from_millis(1));
+            layout.advance_animations();
+            let mon = layout.monitors().next().unwrap();
+            let desired = match gap {
+                "top" => 0,
+                "middle" => source_idx + 1,
+                "bottom" => mon.workspaces.len() - 1,
+                _ => unreachable!(),
+            };
+            let logical_size = output_size(&output);
+            let point = (0..logical_size.h as i32)
+                .find_map(|y| {
+                    let point = Point::from((logical_size.w / 2., f64::from(y)));
+                    (mon.insert_position(point).0 == InsertWorkspace::NewAt(desired))
+                        .then_some(point)
+                })
+                .unwrap_or_else(|| panic!("visible native {gap} gap at scale {scale}"));
+            let old_workspace_ids = mon.workspaces.iter().map(|ws| ws.id()).collect::<Vec<_>>();
+            assert!(layout.interactive_move_update(&1, (0., 0.).into(), output, point));
+            layout.update_render_elements(None);
+            let hint = layout
+                .monitors()
+                .next()
+                .unwrap()
+                .insert_hint
+                .as_ref()
+                .unwrap();
+            assert_eq!(hint.workspace, InsertWorkspace::NewAt(desired));
+            assert_eq!(hint.position, InsertPosition::NewColumn(0));
+            let plan = hint.spine.unwrap();
+            layout.interactive_move_end(&1);
+            let ws = layout
+                .workspaces()
+                .find(|(_, _, ws)| ws.has_window(&1))
+                .unwrap()
+                .2;
+            let tile = ws.tiles().find(|tile| tile.window().id() == &1).unwrap();
+            assert_eq!(tile.form(), WindowForm::Spine(plan.geometry.axis));
+            assert_eq!(tile.tile_size(), plan.geometry.outer_size());
+            assert_eq!(client.requested_size(), request);
+            assert!(Rc::ptr_eq(&tile.window().0, &client.0));
+            if gap == "middle" {
+                assert!(!old_workspace_ids.contains(&ws.id()));
+            } else {
+                assert!(old_workspace_ids.contains(&ws.id()));
+            }
+            assert!(layout.is_overview_open());
+            assert_eq!(layout.windows().count(), 2);
+            layout.verify_invariants();
+        }
+    }
+}
+
+#[test]
+fn spine_drop_cross_output_and_output_loss_keep_native_owner_and_client_identity() {
+    for case in ["cross", "source-lost", "target-lost", "all-lost"] {
+        let mut options = Options::default();
+        options.animations.off = true;
+        let mut layout = Layout::with_options(Clock::with_time(Duration::ZERO), options);
+        layout.clock.set_complete_instantly(true);
+        for (id, scale) in [(1, 1.), (2, 1.25)] {
+            Op::AddScaledOutput {
+                id,
+                scale,
+                layout_config: None,
+            }
+            .apply(&mut layout);
+        }
+        Op::AddWindow {
+            params: TestWindowParams::new(1),
+        }
+        .apply(&mut layout);
+        Op::Communicate(1).apply(&mut layout);
+        assert!(layout.commit_shrink(&1, ShrinkAxis::Vertical, 40.));
+        let client = layout.windows().next().unwrap().1.clone();
+        let request = client.requested_size();
+        let source = layout
+            .outputs()
+            .find(|o| o.name() == "output1")
+            .unwrap()
+            .clone();
+        let target = layout
+            .outputs()
+            .find(|o| o.name() == "output2")
+            .unwrap()
+            .clone();
+        assert!(layout.interactive_move_begin(1, &source, (60., 30.).into()));
+        assert!(layout.interactive_move_update(
+            &1,
+            (300., 0.).into(),
+            target.clone(),
+            (400., 250.).into()
+        ));
+        let Some(InteractiveMoveState::Moving(move_)) = &mut layout.interactive_move else {
+            panic!()
+        };
+        move_.width = ColumnWidth::Fixed(2500.);
+        layout.update_render_elements(None);
+        let plan = layout
+            .monitor_for_output(&target)
+            .unwrap()
+            .insert_hint
+            .as_ref()
+            .unwrap()
+            .spine
+            .unwrap();
+        assert_eq!(plan.geometry.axis, ShrinkAxis::Horizontal);
+        if case == "source-lost" || case == "all-lost" {
+            layout.remove_output(&source);
+        }
+        if case == "target-lost" || case == "all-lost" {
+            layout.remove_output(&target);
+        }
+        layout.interactive_move_end(&1);
+        assert!(layout.interactive_move.is_none());
+        let (output, tile) = layout
+            .workspaces()
+            .find_map(|(output, _, ws)| {
+                ws.tiles()
+                    .find(|tile| tile.window().id() == &1)
+                    .map(|tile| (output, tile))
+            })
+            .unwrap();
+        assert_eq!(tile.form(), WindowForm::Spine(ShrinkAxis::Horizontal));
+        assert_eq!(tile.spine_geometry().unwrap().thickness(), 40.);
+        assert_eq!(client.requested_size(), request);
+        assert!(Rc::ptr_eq(&tile.window().0, &client.0));
+        if case == "cross" || case == "source-lost" {
+            assert_eq!(output.map(|mon| &mon.output), Some(&target));
+            assert_eq!(tile.tile_size(), plan.geometry.outer_size());
+        } else if case == "target-lost" {
+            assert_eq!(output.map(|mon| &mon.output), Some(&source));
+        } else {
+            assert!(output.is_none());
+        }
+        assert_eq!(layout.windows().count(), 1);
+        layout.verify_invariants();
+    }
+}
+
+#[test]
+#[ignore = "requires an explicit software EGL drop-hint rendering run"]
+fn spine_drop_workspace_gap_hint_renders_planned_aspect_without_client_sampling() {
+    use crate::render_helpers::render_and_download;
+    use smithay::backend::allocator::Fourcc;
+    use smithay::backend::renderer::element::Element as _;
+    use smithay::backend::renderer::ExportMem as _;
+    let mut renderer = spine_test_renderer();
+    for scale in [1., 1.25] {
+        for axis in [ShrinkAxis::Horizontal, ShrinkAxis::Vertical] {
+            let mut options = Options::default();
+            options.animations.off = true;
+            options.layout.insert_hint.color =
+                niri_config::Color::from_array_unpremul([1., 0., 0., 1.]);
+            options.layout.insert_hint.gradient = None;
+            let mut layout = Layout::with_options(Clock::with_time(Duration::ZERO), options);
+            layout.clock.set_complete_instantly(true);
+            Op::AddScaledOutput {
+                id: 1,
+                scale,
+                layout_config: None,
+            }
+            .apply(&mut layout);
+            Op::AddWindow {
+                params: TestWindowParams::new(1),
+            }
+            .apply(&mut layout);
+            Op::Communicate(1).apply(&mut layout);
+            assert!(layout.commit_shrink(&1, axis, 40.));
+            let client = layout.windows().next().unwrap().1.clone();
+            let request = client.requested_size();
+            let render_calls = client.0.render_normal_calls.get();
+            let output = layout.outputs().next().unwrap().clone();
+            assert!(layout.interactive_move_begin(1, &output, (60., 30.).into()));
+            assert!(layout.interactive_move_update(
+                &1,
+                (300., 0.).into(),
+                output.clone(),
+                (500., 250.).into()
+            ));
+            layout.open_overview();
+            layout.clock.set_unadjusted(Duration::from_millis(1));
+            layout.advance_animations();
+            let view_size = output_size(&output);
+            let mon = layout.monitors().next().unwrap();
+            let point = (0..view_size.h as i32)
+                .find_map(|y| {
+                    let point = Point::from((view_size.w / 2., f64::from(y)));
+                    matches!(mon.insert_position(point).0, InsertWorkspace::NewAt(_))
+                        .then_some(point)
+                })
+                .expect("visible native Overview gap");
+            assert!(layout.interactive_move_update(&1, (0., 0.).into(), output, point));
+            layout.update_render_elements(None);
+            let mon = layout.monitors().next().unwrap();
+            let size = mon
+                .insert_hint
+                .as_ref()
+                .unwrap()
+                .spine
+                .unwrap()
+                .geometry
+                .outer_size();
+            let mut elements = Vec::new();
+            mon.render_insert_hint_between_workspaces(&mut renderer, &mut |elem| {
+                elements.push(elem)
+            });
+            assert!(!elements.is_empty());
+            let physical = view_size.to_physical_precise_round(scale);
+            let bounds = elements
+                .iter()
+                .map(|elem| elem.geometry(Scale::from(scale)))
+                .reduce(|a, b| a.merge(b))
+                .unwrap();
+            let ratio_error =
+                (f64::from(bounds.size.w) * size.h - f64::from(bounds.size.h) * size.w).abs();
+            assert!(
+                ratio_error <= (size.w + size.h) * 2.,
+                "rendered {bounds:?}, plan {size:?}"
+            );
+            let download = render_and_download(
+                &mut renderer,
+                physical,
+                Scale::from(scale),
+                Transform::Normal,
+                Fourcc::Abgr8888,
+                elements.into_iter().rev(),
+            )
+            .unwrap();
+            let pixels = renderer.map_texture(&download).unwrap();
+            let center = bounds.loc + bounds.size.to_point().downscale(2);
+            assert!(Rectangle::from_size(physical).contains(center));
+            let offset = (center.y as usize * physical.w as usize + center.x as usize) * 4;
+            assert_eq!(&pixels[offset..offset + 4], &[255, 0, 0, 255]);
+            assert_eq!(client.0.render_normal_calls.get(), render_calls);
+            assert_eq!(client.requested_size(), request);
+            layout.interactive_move_end(&1);
+            layout.verify_invariants();
+        }
+    }
+}

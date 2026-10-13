@@ -92,7 +92,11 @@ the same Tile. The pointer retains its native proportion within the new shape;
 no client size request or automatic expansion is introduced. Native closest-gap
 selection, tie behavior, thresholds and view ownership remain in their original
 paths. Current checks cover new-column planning/commit, fallback, revalidation
-and real Wayland pointer drops; shared-column/Overview/output and rendered-hint
+and real Wayland pointer drops. Native layout fixtures also cover shared and
+tabbed columns (including fullscreen/maximized insertion), Overview workspace
+creation/reuse, cross-output placement and output loss. Software EGL verifies
+the workspace-gap hint's aspect and paint. Existing-workspace hint pixels,
+live configuration changes during movement and physical device/system
 combinations still require E3/E4 qualification.
 
 A valid body release below the native 8 px recognition threshold directly expands
