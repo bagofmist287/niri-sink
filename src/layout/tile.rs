@@ -2556,12 +2556,28 @@ impl<W: LayoutElement> Tile<W> {
                 .frame
                 .render(ctx.renderer, frame_location, &mut |elem| push(elem.into()));
         }
-        let source_size = self.window.size().to_f64();
+        // A later native mode request owns its resize snapshot, shader and source
+        // canvas. Project that native composition rather than only the new buffer.
+        let native_mode = preview.restoring.is_some()
+            && (!self.sizing_mode.is_normal()
+                || self
+                    .resize_animation
+                    .as_ref()
+                    .is_some_and(|resize| resize.expanded_progress.is_some()));
+        let source_size = if native_mode {
+            self.animated_tile_size()
+        } else {
+            self.window.size().to_f64()
+        };
         if source_size.w <= 0. || source_size.h <= 0. {
             return None;
         }
-        let inset = self.visual_border_width().unwrap_or(0.)
-            * preview.inset_scale(self.options.shrink_expand.preview_scale);
+        let inset = if native_mode {
+            0.
+        } else {
+            self.visual_border_width().unwrap_or(0.)
+                * preview.inset_scale(self.options.shrink_expand.preview_scale)
+        };
         let zoom = ((size.w - 2. * inset).max(1.) / source_size.w)
             .min((size.h - 2. * inset).max(1.) / source_size.h);
         let position = frame_location + (size - source_size.upscale(zoom)).to_point().downscale(2.);
@@ -2595,77 +2611,83 @@ impl<W: LayoutElement> Tile<W> {
         let previous = slot.as_ref().and_then(|s| s.borrow_mut().take());
         let mut ctx = ctx.as_gles();
         let mut elements = Vec::new();
-        self.window.render_popups(
-            ctx.r(),
-            (0., 0.).into(),
-            self.scale.into(),
-            alpha,
-            xray_pos,
-            &mut |elem| elements.push(elem.into()),
-        );
-        self.render_client_normal(
-            ctx.r(),
-            (0., 0.).into(),
-            source_size,
-            alpha,
-            clip,
-            radius,
-            &mut |elem| elements.push(elem),
-        );
-        if fullscreen_progress > 0. {
-            let alpha = fullscreen_progress as f32;
-            if fullscreen_progress < 1. && BorderRenderElement::has_shader(ctx.renderer) {
-                let color = Color::from_color32f(self.fullscreen_backdrop.color());
-                let elem = BorderRenderElement::new(
-                    source_size,
-                    Rectangle::from_size(source_size),
-                    GradientInterpolation::default(),
-                    color,
-                    color,
-                    0.,
-                    Rectangle::from_size(source_size),
-                    0.,
-                    radius,
-                    self.scale as f32,
-                    alpha,
-                );
-                elements.push(elem.into());
-            } else {
-                // A new buffer ID each frame would defeat damage caching.
-                let mut backdrop = self.fullscreen_backdrop.clone();
-                backdrop.resize(source_size);
-                elements.push(
-                    SolidColorRenderElement::from_buffer(
-                        &backdrop,
-                        (0., 0.),
+        if native_mode {
+            self.render_inner(ctx.r(), (0., 0.).into(), xray_pos, false, &mut |elem| {
+                elements.push(elem)
+            });
+        } else {
+            self.window.render_popups(
+                ctx.r(),
+                (0., 0.).into(),
+                self.scale.into(),
+                alpha,
+                xray_pos,
+                &mut |elem| elements.push(elem.into()),
+            );
+            self.render_client_normal(
+                ctx.r(),
+                (0., 0.).into(),
+                source_size,
+                alpha,
+                clip,
+                radius,
+                &mut |elem| elements.push(elem),
+            );
+            if fullscreen_progress > 0. {
+                let alpha = fullscreen_progress as f32;
+                if fullscreen_progress < 1. && BorderRenderElement::has_shader(ctx.renderer) {
+                    let color = Color::from_color32f(self.fullscreen_backdrop.color());
+                    let elem = BorderRenderElement::new(
+                        source_size,
+                        Rectangle::from_size(source_size),
+                        GradientInterpolation::default(),
+                        color,
+                        color,
+                        0.,
+                        Rectangle::from_size(source_size),
+                        0.,
+                        radius,
+                        self.scale as f32,
                         alpha,
-                        Kind::Unspecified,
-                    )
-                    .into(),
-                );
+                    );
+                    elements.push(elem.into());
+                } else {
+                    // A new buffer ID each frame would defeat damage caching.
+                    let mut backdrop = self.fullscreen_backdrop.clone();
+                    backdrop.resize(source_size);
+                    elements.push(
+                        SolidColorRenderElement::from_buffer(
+                            &backdrop,
+                            (0., 0.),
+                            alpha,
+                            Kind::Unspecified,
+                        )
+                        .into(),
+                    );
+                }
             }
+            preview
+                .source_border
+                .render(ctx.renderer, (0., 0.).into(), &mut |elem| {
+                    elements.push(elem.into())
+                });
+            let width = self.visual_border_width().unwrap_or(0.);
+            preview
+                .source_shadow
+                .render(ctx.renderer, (-width, -width).into(), &mut |elem| {
+                    elements.push(elem.into())
+                });
+            self.window.render_background_effect(
+                ctx.r(),
+                Rectangle::from_size(source_size),
+                self.scale,
+                clip,
+                Scale::from(1.),
+                radius,
+                xray_pos,
+                &mut |elem| elements.push(elem.into()),
+            );
         }
-        preview
-            .source_border
-            .render(ctx.renderer, (0., 0.).into(), &mut |elem| {
-                elements.push(elem.into())
-            });
-        let width = self.visual_border_width().unwrap_or(0.);
-        preview
-            .source_shadow
-            .render(ctx.renderer, (-width, -width).into(), &mut |elem| {
-                elements.push(elem.into())
-            });
-        self.window.render_background_effect(
-            ctx.r(),
-            Rectangle::from_size(source_size),
-            self.scale,
-            clip,
-            Scale::from(1.),
-            radius,
-            xray_pos,
-            &mut |elem| elements.push(elem.into()),
-        );
         let native_data = slot.as_ref().and_then(|s| s.borrow_mut().take());
         if let Some(slot) = &slot {
             *slot.borrow_mut() = previous;

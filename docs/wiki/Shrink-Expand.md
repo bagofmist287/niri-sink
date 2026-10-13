@@ -238,6 +238,8 @@ effective. Capture caches remain separate from output presentation feedback.
 During a selected restoration, subsequent fullscreen or maximized mode changes
 also update the projected content's native opacity, backdrop, corners and
 decoration transitions. Selecting a spine alone keeps its normal content style.
+The native mode resize animation also retains its old-content snapshot and
+shader transition before that composition is fitted into the restoring frame.
 
 The transition also applies to batch and disable restoration. Left/top floating
 edge restoration retains the opposite edge during the same resize grab. It stores
