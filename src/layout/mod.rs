@@ -1831,6 +1831,33 @@ impl<W: LayoutElement> Layout<W> {
             .is_some_and(|tile| tile.set_shrink_preview(target, animate))
     }
 
+    pub(crate) fn set_expand_preview(&mut self, id: &W::Id, factor: f64, animate: bool) -> bool {
+        let mut changed = false;
+        for ws in self.workspaces_mut() {
+            let plan = ws
+                .normal_spine_plans(std::slice::from_ref(id))
+                .into_iter()
+                .next()
+                .map(|(_, plan)| plan);
+            for tile in ws.tiles_mut() {
+                if tile.window().id() == id {
+                    if let Some(plan) = plan {
+                        changed |= tile.set_expand_preview(plan, factor, animate);
+                    }
+                } else {
+                    tile.clear_expand_preview();
+                }
+            }
+        }
+        changed
+    }
+
+    pub(crate) fn clear_expand_previews(&mut self) {
+        for tile in self.workspaces_mut().flat_map(|ws| ws.tiles_mut()) {
+            tile.clear_expand_preview();
+        }
+    }
+
     pub(crate) fn clear_shrink_previews(&mut self) {
         if let Some(InteractiveMoveState::Moving(move_)) = &mut self.interactive_move {
             move_.tile.clear_shrink_preview();

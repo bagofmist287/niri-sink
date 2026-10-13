@@ -989,6 +989,12 @@ impl State {
             )
         };
         // Store soft identities only; no layout/window ownership is transferred by selection.
+        let behavior = self.niri.config.borrow().shrink_expand;
+        self.niri.layout.set_expand_preview(
+            &lease.selected,
+            behavior.preview_scale,
+            behavior.animate,
+        );
         self.niri.expand_selection_lease = Some(lease);
         self.arm_shrink_preview_timer();
         self.ipc_refresh_shrink_expand();
@@ -1001,6 +1007,7 @@ impl State {
             return self.cancel_shrink_expand_preview();
         }
         let lease = self.niri.expand_selection_lease.take().unwrap();
+        self.niri.layout.clear_expand_previews();
         if let Some((token, _)) = self.niri.shrink_preview_timer.take() {
             self.niri.event_loop.remove(token);
         }
@@ -1190,6 +1197,7 @@ impl State {
         self.niri.shrink_preview_lease = None;
         self.niri.expand_selection_lease = None;
         self.niri.layout.clear_shrink_previews();
+        self.niri.layout.clear_expand_previews();
         let record = self.niri.shrink_expand.cancel();
         if record.is_some() {
             self.niri.queue_redraw_all();
@@ -1283,6 +1291,16 @@ impl State {
                     .as_mut()
                     .unwrap()
                     .candidates = candidates;
+            }
+        }
+        if let Some(lease) = &self.niri.expand_selection_lease {
+            let behavior = self.niri.config.borrow().shrink_expand;
+            if self.niri.layout.set_expand_preview(
+                &lease.selected,
+                behavior.preview_scale,
+                behavior.animate,
+            ) {
+                self.niri.queue_redraw_all();
             }
         }
         if let Some(preview) = self.niri.shrink_expand.preview() {

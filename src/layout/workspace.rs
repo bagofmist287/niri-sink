@@ -168,6 +168,7 @@ niri_render_elements! {
         Scrolling = ScrollingSpaceRenderElement<R>,
         Floating = FloatingSpaceRenderElement<R>,
         Projected = ProjectedGroup,
+        Preview = super::tile::TileRenderElement<R>,
     }
 }
 
@@ -2617,6 +2618,22 @@ impl<W: LayoutElement> Workspace<W> {
             self.floating.popup_target_rect(window)
         } else {
             self.scrolling.popup_target_rect(window)
+        }
+    }
+
+    pub fn render_expand_preview<R: NiriRenderer>(
+        &self,
+        mut ctx: RenderCtx<R>,
+        xray_pos: XrayPos,
+        push: &mut dyn FnMut(WorkspaceRenderElement<R>),
+    ) {
+        // Include hidden tab members: selection itself is not an activation or ownership change.
+        for (tile, pos, _) in self.tiles_with_render_positions() {
+            if let Some(element) =
+                tile.render_expand_preview(ctx.r(), pos, xray_pos, &mut |elem| push(elem.into()))
+            {
+                push(element.into());
+            }
         }
     }
 

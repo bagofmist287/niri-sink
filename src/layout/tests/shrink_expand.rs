@@ -4368,3 +4368,245 @@ fn explicit_unfullscreen_of_windowed_client_keeps_other_book_tabs_collapsed() {
     assert!(layout.is_spine(&3));
     layout.verify_invariants();
 }
+
+#[test]
+#[ignore = "requires an explicit software EGL selected-content preview rendering run"]
+fn expand_preview_projects_only_selected_content_without_configure_and_isolates_capture() {
+    use crate::layout::shrink_expand::NormalSizePlan;
+    use crate::layout::workspace::WorkspaceRenderElement;
+    use crate::render_helpers::solid_color::SolidColorBuffer;
+    use crate::render_helpers::{render_and_download, RenderTarget};
+    use smithay::backend::allocator::Fourcc;
+    use smithay::backend::renderer::element::Element as _;
+    use smithay::backend::renderer::ExportMem as _;
+    let mut renderer = spine_test_renderer();
+    for scale in [1., 1.25] {
+        for axis in [ShrinkAxis::Horizontal, ShrinkAxis::Vertical] {
+            for opacity in [1., 0.5] {
+                let mut options = Options::default();
+                options.layout.border.off = true;
+                options.layout.focus_ring.off = true;
+                options.animations.off = true;
+                let mut params = TestWindowParams::new(1);
+                params.bbox = Rectangle::from_size((120, 80).into());
+                params.rules = Some(ResolvedWindowRules {
+                    opacity: Some(opacity),
+                    block_out_from: Some(niri_config::BlockOutFrom::ScreenCapture),
+                    ..Default::default()
+                });
+                let window = TestWindow::new(params);
+                *window.0.render_solid.borrow_mut() =
+                    Some(SolidColorBuffer::new((120., 80.), [0., 1., 0., 1.]));
+                *window.0.render_solid_blocked.borrow_mut() =
+                    Some(SolidColorBuffer::new((120., 80.), [0., 0., 0., 1.]));
+                let mut tile = Tile::new(
+                    window.clone(),
+                    (1280., 720.).into(),
+                    scale,
+                    Clock::with_time(Duration::ZERO),
+                    Rc::new(options),
+                );
+                assert!(tile.set_spine(axis, 40.));
+                let spine_size = tile.tile_size();
+                let plan = NormalSizePlan {
+                    allocation: (600., 200.).into(),
+                    client_size: (600, 200).into(),
+                    sizing_mode: SizingMode::Normal,
+                };
+                tile.set_expand_preview(plan, 0.5, true);
+                tile.update_render_elements(false, Rectangle::from_size((1280., 720.).into()));
+                assert_eq!(tile.expand_preview_size(), Some((300., 100.).into()));
+                assert_eq!(tile.tile_size(), spine_size);
+                assert_eq!(window.requested_size(), None);
+                let collect = |tile: &Tile<TestWindow>, renderer: &mut _, target| {
+                    let mut elements: Vec<WorkspaceRenderElement<_>> = Vec::new();
+                    let projected = tile
+                        .render_expand_preview(
+                            RenderCtx {
+                                renderer,
+                                target,
+                                xray: None,
+                            },
+                            (300., 200.).into(),
+                            XrayPos::default(),
+                            &mut |elem| elements.push(elem.into()),
+                        )
+                        .unwrap();
+                    let geometry = projected.geometry(Scale::from(scale));
+                    let id = projected.id().clone();
+                    elements.push(projected.into());
+                    (elements, geometry, id)
+                };
+                let (output, geometry, output_id) =
+                    collect(&tile, &mut renderer, RenderTarget::Output);
+                let (blocked, capture_geo, capture_id) =
+                    collect(&tile, &mut renderer, RenderTarget::ScreenCapture);
+                let (screencast, _, screencast_id) =
+                    collect(&tile, &mut renderer, RenderTarget::Screencast);
+                assert_eq!(geometry, capture_geo);
+                assert_ne!(output_id, capture_id);
+                assert_ne!(output_id, screencast_id);
+                // The old 120x80 client is uniformly fitted into the predicted 300x100 frame.
+                assert_eq!(
+                    geometry.size,
+                    Size::from((150., 100.)).to_physical_precise_round(scale)
+                );
+                let center: Point<i32, smithay::utils::Physical> = Point::<f64, Logical>::from((
+                    300. + spine_size.w / 2.,
+                    200. + spine_size.h / 2.,
+                ))
+                .to_physical_precise_round(scale);
+                let drawn_center = geometry.loc + geometry.size.to_point().downscale(2);
+                assert!(
+                    (drawn_center.x - center.x).abs() <= 1
+                        && (drawn_center.y - center.y).abs() <= 1
+                );
+                let physical = Size::from((900., 700.)).to_physical_precise_round(scale);
+                for (elements, green, target_id) in [
+                    (output, true, output_id.clone()),
+                    (blocked, false, capture_id),
+                    (screencast, false, screencast_id),
+                ] {
+                    let download = render_and_download(
+                        &mut renderer,
+                        physical,
+                        Scale::from(scale),
+                        Transform::Normal,
+                        Fourcc::Abgr8888,
+                        elements.into_iter().rev(),
+                    )
+                    .unwrap();
+                    let data = renderer.map_texture(&download).unwrap();
+                    let at = (center.y as usize * physical.w as usize + center.x as usize) * 4;
+                    let pixel = &data[at..at + 4];
+                    assert_eq!(pixel[0], 0);
+                    assert_eq!(pixel[2], 0);
+                    assert!(
+                        pixel[1].abs_diff(if green {
+                            (255. * opacity).round() as u8
+                        } else {
+                            0
+                        }) <= 1,
+                        "{pixel:?}"
+                    );
+                    assert!(
+                        pixel[3].abs_diff((255. * opacity).round() as u8) <= 1,
+                        "{pixel:?}"
+                    );
+                    assert_eq!(
+                        window.0.offscreen_data.borrow().as_ref().unwrap().id,
+                        output_id
+                    );
+                    assert_eq!(green, target_id == output_id);
+                    if !green {
+                        // Collecting the book itself in a capture pass must preserve output feedback.
+                        tile.render(
+                            RenderCtx {
+                                renderer: &mut renderer,
+                                target: RenderTarget::ScreenCapture,
+                                xray: None,
+                            },
+                            (300., 200.).into(),
+                            XrayPos::default(),
+                            false,
+                            &mut |_| {},
+                        );
+                        assert_eq!(
+                            window.0.offscreen_data.borrow().as_ref().unwrap().id,
+                            output_id
+                        );
+                    }
+                }
+                window
+                    .0
+                    .render_solid
+                    .borrow_mut()
+                    .as_mut()
+                    .unwrap()
+                    .set_color([1., 0., 0., 1.]);
+                let (live, _, _) = collect(&tile, &mut renderer, RenderTarget::Output);
+                let download = render_and_download(
+                    &mut renderer,
+                    physical,
+                    Scale::from(scale),
+                    Transform::Normal,
+                    Fourcc::Abgr8888,
+                    live.into_iter().rev(),
+                )
+                .unwrap();
+                let data = renderer.map_texture(&download).unwrap();
+                let at = (center.y as usize * physical.w as usize + center.x as usize) * 4;
+                assert!(data[at].abs_diff((255. * opacity).round() as u8) <= 1);
+                assert_eq!(data[at + 1], 0);
+                assert_eq!(window.0.render_normal_calls.get(), 4);
+                assert_eq!(window.0.render_background_calls.get(), 4);
+                assert_eq!(window.0.render_popup_calls.get(), 4);
+                tile.clear_expand_preview();
+                assert!(tile.expand_preview_size().is_none());
+                let calls = window.0.render_normal_calls.get();
+                assert!(tile
+                    .render_expand_preview(
+                        RenderCtx {
+                            renderer: &mut renderer,
+                            target: RenderTarget::Output,
+                            xray: None
+                        },
+                        (0., 0.).into(),
+                        XrayPos::default(),
+                        &mut |_| {}
+                    )
+                    .is_none());
+                assert_eq!(window.0.render_normal_calls.get(), calls);
+                assert_eq!(window.requested_size(), None);
+            }
+        }
+    }
+}
+
+#[test]
+fn expand_preview_retargets_current_pose_without_changing_the_native_spine() {
+    use crate::layout::shrink_expand::NormalSizePlan;
+    let mut options = Options::default();
+    options.layout.border.off = true;
+    options.animations.window_movement.0 = niri_config::Animation {
+        off: false,
+        kind: niri_config::animations::Kind::Easing(niri_config::animations::EasingParams {
+            duration_ms: 200,
+            curve: niri_config::animations::Curve::Linear,
+        }),
+    };
+    let mut params = TestWindowParams::new(1);
+    params.bbox = Rectangle::from_size((120, 80).into());
+    let window = TestWindow::new(params);
+    let mut clock = Clock::with_time(Duration::ZERO);
+    let mut tile = Tile::new(
+        window.clone(),
+        (1280., 720.).into(),
+        1.,
+        clock.clone(),
+        Rc::new(options),
+    );
+    tile.set_spine(ShrinkAxis::Horizontal, 40.);
+    let native = tile.tile_size();
+    let plan = NormalSizePlan {
+        allocation: (600., 200.).into(),
+        client_size: (600, 200).into(),
+        sizing_mode: SizingMode::Normal,
+    };
+    tile.set_expand_preview(plan, 0.5, true);
+    assert_eq!(tile.expand_preview_size(), Some(native));
+    clock.set_unadjusted(Duration::from_millis(50));
+    let displayed = tile.expand_preview_size().unwrap();
+    assert_eq!(displayed, Size::from((105., 85.)));
+    tile.set_expand_preview(plan, 0.25, true);
+    assert_eq!(tile.expand_preview_size(), Some(displayed));
+    clock.set_unadjusted(Duration::from_millis(250));
+    tile.advance_animations();
+    assert_eq!(tile.expand_preview_size(), Some((150., 50.).into()));
+    assert!(!tile.are_transitions_ongoing());
+    assert_eq!(tile.tile_size(), native);
+    assert_eq!(tile.form(), WindowForm::Spine(ShrinkAxis::Horizontal));
+    assert_eq!(window.requested_size(), None);
+    tile.clear_expand_preview();
+    assert!(tile.expand_preview_size().is_none());
+}

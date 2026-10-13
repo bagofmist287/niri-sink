@@ -60,6 +60,7 @@ pub struct Tile<W: LayoutElement> {
     spine_ui: Spine,
     spine_visual_active: bool,
     shrink_preview: Option<ShrinkPreview>,
+    expand_preview: Option<ExpandPreview>,
     committed_shrink_presentation: Option<CommittedShrinkPresentation>,
     /// Ephemeral presentation of the current insertion, independent of its input barrier.
     normal_restore_presentation: Option<NormalRestorePresentation>,
@@ -168,6 +169,16 @@ niri_render_elements! {
 
 pub type TileRenderSnapshot =
     RenderSnapshot<TileRenderElement<GlesRenderer>, TileRenderElement<GlesRenderer>>;
+
+/// Selected-client presentation only; owns neither a window nor a layout allocation.
+#[derive(Debug)]
+struct ExpandPreview {
+    geometry: ShrinkPreview,
+    frame: FocusRing,
+    source_border: FocusRing,
+    source_shadow: Shadow,
+    buffer: Rc<ProjectionBuffer>,
+}
 
 #[derive(Debug)]
 struct NormalRestorePresentation {
@@ -281,6 +292,7 @@ impl<W: LayoutElement> Tile<W> {
             spine_ui: Spine::default(),
             spine_visual_active: false,
             shrink_preview: None,
+            expand_preview: None,
             committed_shrink_presentation: None,
             normal_restore_presentation: None,
             normal_restore: None,
@@ -405,6 +417,11 @@ impl<W: LayoutElement> Tile<W> {
 
     pub fn update_shaders(&mut self) {
         self.spine_ui.update_shaders();
+        if let Some(preview) = &mut self.expand_preview {
+            preview.frame.update_shaders();
+            preview.source_border.update_shaders();
+            preview.source_shadow.update_shaders();
+        }
         self.border.update_shaders();
         self.focus_ring.update_shaders();
         self.shadow.update_shaders();
@@ -586,6 +603,9 @@ impl<W: LayoutElement> Tile<W> {
                 self.committed_shrink_presentation = None;
             }
         }
+        if let Some(preview) = &mut self.expand_preview {
+            preview.geometry.advance();
+        }
         if let Some(presentation) = &mut self.normal_restore_presentation {
             presentation.ghost.advance();
             if presentation.reveal.as_ref().is_some_and(Animation::is_done) {
@@ -702,9 +722,13 @@ impl<W: LayoutElement> Tile<W> {
     }
 
     pub fn are_transitions_ongoing(&self) -> bool {
-        self.shrink_preview
+        self.expand_preview
             .as_ref()
-            .is_some_and(ShrinkPreview::is_animating)
+            .is_some_and(|p| p.geometry.is_animating())
+            || self
+                .shrink_preview
+                .as_ref()
+                .is_some_and(ShrinkPreview::is_animating)
             || self
                 .committed_shrink_presentation
                 .as_ref()
@@ -743,10 +767,75 @@ impl<W: LayoutElement> Tile<W> {
 
     pub fn update_render_elements(&mut self, is_active: bool, view_rect: Rectangle<f64, Logical>) {
         let is_active = if self.is_spine() {
-            self.spine_visual_active || self.interactive_move_offset != Point::from((0., 0.))
+            self.spine_visual_active
+                || self.expand_preview.is_some()
+                || self.interactive_move_offset != Point::from((0., 0.))
         } else {
             is_active
         };
+        let source_border_width = self.visual_border_width().unwrap_or(0.);
+        if let Some(preview) = &mut self.expand_preview {
+            let rules = self.window.rules();
+            let client_size = self.window.size().to_f64();
+            let size = preview.geometry.pose();
+            let offset = preview.geometry.offset(self.spine.unwrap().outer_size());
+            let inset = source_border_width * self.options.shrink_expand.preview_scale;
+            let zoom = ((size.w - 2. * inset).max(1.) / client_size.w.max(1.))
+                .min((size.h - 2. * inset).max(1.) / client_size.h.max(1.));
+            let source_offset =
+                offset + (size - client_size.upscale(zoom)).to_point().downscale(2.);
+            let source_view = Rectangle::new(
+                (view_rect.loc - source_offset).downscale(zoom),
+                view_rect.size.downscale(zoom),
+            );
+            let radius = self
+                .window
+                .geometry_corner_radius()
+                .expanded_by(source_border_width as f32);
+            preview
+                .source_border
+                .update_config(self.options.layout.border.merged_with(&rules.border).into());
+            preview.source_border.update_render_elements(
+                client_size,
+                true,
+                !rules
+                    .draw_border_with_background
+                    .unwrap_or_else(|| !self.window.has_ssd()),
+                self.window.is_urgent(),
+                source_view,
+                radius,
+                self.scale,
+                1.,
+            );
+            preview
+                .source_shadow
+                .update_config(self.options.layout.shadow.merged_with(&rules.shadow));
+            preview.source_shadow.update_render_elements(
+                client_size + Size::from((source_border_width, source_border_width)).upscale(2.),
+                true,
+                radius,
+                self.scale,
+                1.,
+            );
+            let config = self
+                .options
+                .layout
+                .focus_ring
+                .merged_with(&self.window.rules().focus_ring);
+            preview.frame.update_config(config);
+            preview.frame.update_render_elements(
+                size,
+                true,
+                false,
+                self.window.is_urgent(),
+                Rectangle::new(view_rect.loc - offset, view_rect.size),
+                self.window
+                    .geometry_corner_radius()
+                    .scaled_by(self.options.shrink_expand.preview_scale as f32),
+                self.scale,
+                self.window.rules().opacity.unwrap_or(1.).clamp(0., 1.),
+            );
+        }
         let rules = self.window.rules();
         let animated_tile_size = self.animated_tile_size();
         let expanded_progress = self.expanded_progress();
@@ -1143,6 +1232,58 @@ impl<W: LayoutElement> Tile<W> {
         self.spine_visual_active = self.is_spine() && active;
     }
 
+    pub(crate) fn set_expand_preview(
+        &mut self,
+        plan: NormalSizePlan,
+        factor: f64,
+        animate: bool,
+    ) -> bool {
+        let Some(spine) = self.spine else {
+            return false;
+        };
+        let preview = self.expand_preview.get_or_insert_with(|| {
+            let mut geometry = ShrinkPreview::new(self.clock.clone(), spine.outer_size());
+            geometry.set_anchor((0.5, 0.5).into());
+            ExpandPreview {
+                geometry,
+                frame: FocusRing::new(
+                    self.options
+                        .layout
+                        .focus_ring
+                        .merged_with(&self.window.rules().focus_ring),
+                ),
+                source_border: FocusRing::new(
+                    self.options
+                        .layout
+                        .border
+                        .merged_with(&self.window.rules().border)
+                        .into(),
+                ),
+                source_shadow: Shadow::new(
+                    self.options
+                        .layout
+                        .shadow
+                        .merged_with(&self.window.rules().shadow),
+                ),
+                buffer: Rc::new(ProjectionBuffer::default()),
+            }
+        });
+        preview.geometry.retarget(
+            plan.allocation.upscale(factor),
+            self.options.animations.window_movement.0,
+            animate && !self.options.animations.off,
+        )
+    }
+
+    pub(crate) fn clear_expand_preview(&mut self) {
+        self.expand_preview = None;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn expand_preview_size(&self) -> Option<Size<f64, Logical>> {
+        self.expand_preview.as_ref().map(|p| p.geometry.pose())
+    }
+
     pub(crate) fn set_shrink_preview(&mut self, target: Size<f64, Logical>, animate: bool) -> bool {
         let source = self.animated_tile_size();
         let preview = self
@@ -1195,6 +1336,7 @@ impl<W: LayoutElement> Tile<W> {
         let Some(spine) = self.spine.take() else {
             return false;
         };
+        self.clear_expand_preview();
         let (pose, offset_from) = self.committed_shrink_presentation.take().map_or(
             (spine.outer_size(), Point::from((0., 0.))),
             |presentation| (presentation.ghost.pose(), presentation.offset()),
@@ -1994,76 +2136,15 @@ impl<W: LayoutElement> Tile<W> {
         // If we're not resizing, render the window itself.
         let has_border_shader = BorderRenderElement::has_shader(ctx.renderer);
         if !pushed_resize {
-            let geo = Rectangle::new(window_render_loc, window_size);
-            let radius = radius.fit_to(window_size.w as f32, window_size.h as f32);
-
-            let clip_shader = ClippedSurfaceRenderElement::shader(ctx.renderer).cloned();
-            let clip = |elem| match elem {
-                LayoutElementRenderElement::Wayland(elem) => {
-                    // If we should clip to geometry, render a clipped window.
-                    if clip_to_geometry {
-                        if let Some(shader) = clip_shader.clone() {
-                            if ClippedSurfaceRenderElement::will_clip(&elem, scale, geo, radius) {
-                                return ClippedSurfaceRenderElement::new(
-                                    elem,
-                                    scale,
-                                    geo,
-                                    shader.clone(),
-                                    radius,
-                                )
-                                .into();
-                            }
-                        }
-                    }
-
-                    // Otherwise, render it normally.
-                    LayoutElementRenderElement::Wayland(elem).into()
-                }
-                LayoutElementRenderElement::SolidColor(elem) => {
-                    // In this branch we're rendering a blocked-out window with a solid
-                    // color. We need to render it with a rounded corner shader even if
-                    // clip_to_geometry is false, because in this case we're assuming that
-                    // the unclipped window CSD already has corners rounded to the
-                    // user-provided radius, so our blocked-out rendering should match that
-                    // radius.
-                    if radius != CornerRadius::default() && has_border_shader {
-                        return BorderRenderElement::new(
-                            geo.size,
-                            Rectangle::from_size(geo.size),
-                            GradientInterpolation::default(),
-                            Color::from_color32f(elem.color()),
-                            Color::from_color32f(elem.color()),
-                            0.,
-                            Rectangle::from_size(geo.size),
-                            0.,
-                            radius,
-                            scale.x as f32,
-                            1.,
-                        )
-                        .with_location(geo.loc)
-                        .into();
-                    }
-
-                    // Otherwise, render the solid color as is.
-                    LayoutElementRenderElement::SolidColor(elem).into()
-                }
-                elem @ LayoutElementRenderElement::BackgroundEffect(_) => {
-                    // This is only used on popups for now. If subsurface blur is implemented, this
-                    // will need to be handled somehow.
-                    error!("background effect clipping is unimplemented");
-                    elem.into()
-                }
-            };
-
-            if clip_to_geometry && clip_shader.is_some() {
-                let damage = self.rounded_corner_damage.render(geo);
-                push(damage.into());
-            }
-
-            self.window
-                .render_normal(ctx.r(), window_render_loc, scale, win_alpha, &mut |elem| {
-                    push(clip(elem))
-                });
+            self.render_client_normal(
+                ctx.r(),
+                window_render_loc,
+                window_size,
+                win_alpha,
+                clip_to_geometry,
+                radius,
+                push,
+            );
         }
 
         if fullscreen_progress > 0. {
@@ -2142,6 +2223,195 @@ impl<W: LayoutElement> Tile<W> {
         );
     }
 
+    /// Shared native clipping/block-out path for normal clients and the selected live preview.
+    #[allow(clippy::too_many_arguments)]
+    fn render_client_normal<R: NiriRenderer>(
+        &self,
+        mut ctx: RenderCtx<R>,
+        window_render_loc: Point<f64, Logical>,
+        window_size: Size<f64, Logical>,
+        win_alpha: f32,
+        clip_to_geometry: bool,
+        radius: CornerRadius,
+        push: &mut dyn FnMut(TileRenderElement<R>),
+    ) {
+        let scale = Scale::from(self.scale);
+        let has_border_shader = BorderRenderElement::has_shader(ctx.renderer);
+        let geo = Rectangle::new(window_render_loc, window_size);
+        let radius = radius.fit_to(window_size.w as f32, window_size.h as f32);
+
+        let clip_shader = ClippedSurfaceRenderElement::shader(ctx.renderer).cloned();
+        let clip = |elem| match elem {
+            LayoutElementRenderElement::Wayland(elem) => {
+                // If we should clip to geometry, render a clipped window.
+                if clip_to_geometry {
+                    if let Some(shader) = clip_shader.clone() {
+                        if ClippedSurfaceRenderElement::will_clip(&elem, scale, geo, radius) {
+                            return ClippedSurfaceRenderElement::new(
+                                elem,
+                                scale,
+                                geo,
+                                shader.clone(),
+                                radius,
+                            )
+                            .into();
+                        }
+                    }
+                }
+
+                // Otherwise, render it normally.
+                LayoutElementRenderElement::Wayland(elem).into()
+            }
+            LayoutElementRenderElement::SolidColor(elem) => {
+                // In this branch we're rendering a blocked-out window with a solid
+                // color. We need to render it with a rounded corner shader even if
+                // clip_to_geometry is false, because in this case we're assuming that
+                // the unclipped window CSD already has corners rounded to the
+                // user-provided radius, so our blocked-out rendering should match that
+                // radius.
+                if radius != CornerRadius::default() && has_border_shader {
+                    return BorderRenderElement::new(
+                        geo.size,
+                        Rectangle::from_size(geo.size),
+                        GradientInterpolation::default(),
+                        Color::from_color32f(elem.color()),
+                        Color::from_color32f(elem.color()),
+                        0.,
+                        Rectangle::from_size(geo.size),
+                        0.,
+                        radius,
+                        scale.x as f32,
+                        1.,
+                    )
+                    .with_location(geo.loc)
+                    .into();
+                }
+
+                // Otherwise, render the solid color as is.
+                LayoutElementRenderElement::SolidColor(elem).into()
+            }
+            elem @ LayoutElementRenderElement::BackgroundEffect(_) => {
+                // This is only used on popups for now. If subsurface blur is implemented, this
+                // will need to be handled somehow.
+                error!("background effect clipping is unimplemented");
+                elem.into()
+            }
+        };
+
+        if clip_to_geometry && clip_shader.is_some() {
+            let damage = self.rounded_corner_damage.render(geo);
+            push(damage.into());
+        }
+
+        self.window
+            .render_normal(ctx.r(), window_render_loc, scale, win_alpha, &mut |elem| {
+                push(clip(elem))
+            });
+    }
+
+    pub(super) fn render_expand_preview<R: NiriRenderer>(
+        &self,
+        mut ctx: RenderCtx<R>,
+        location: Point<f64, Logical>,
+        xray_pos: XrayPos,
+        push: &mut dyn FnMut(TileRenderElement<R>),
+    ) -> Option<ProjectedGroup> {
+        let preview = self.expand_preview.as_ref()?;
+        let spine = self.spine?;
+        let size = preview.geometry.pose();
+        let frame_location = (location + preview.geometry.offset(spine.outer_size()))
+            .to_physical_precise_round(self.scale)
+            .to_logical(self.scale);
+        preview
+            .frame
+            .render(ctx.renderer, frame_location, &mut |elem| push(elem.into()));
+        let source_size = self.window.size().to_f64();
+        if source_size.w <= 0. || source_size.h <= 0. {
+            return None;
+        }
+        let inset =
+            self.visual_border_width().unwrap_or(0.) * self.options.shrink_expand.preview_scale;
+        let zoom = ((size.w - 2. * inset).max(1.) / source_size.w)
+            .min((size.h - 2. * inset).max(1.) / source_size.h);
+        let position = frame_location + (size - source_size.upscale(zoom)).to_point().downscale(2.);
+        let xray_pos = XrayPos {
+            pos_in_backdrop: (xray_pos.pos_in_backdrop + position).downscale(zoom),
+            zoom: xray_pos.zoom * zoom,
+        };
+        let rules = self.window.rules();
+        let alpha = if self.window.is_ignoring_opacity_window_rule() {
+            1.
+        } else {
+            rules.opacity.unwrap_or(1.).clamp(0., 1.)
+        };
+        let clip = rules.clip_to_geometry == Some(true);
+        let radius = self.window.geometry_corner_radius();
+        let slot = self.window.offscreen_data_slot();
+        let previous = slot.as_ref().and_then(|s| s.borrow_mut().take());
+        let mut ctx = ctx.as_gles();
+        let mut elements = Vec::new();
+        self.window.render_popups(
+            ctx.r(),
+            (0., 0.).into(),
+            self.scale.into(),
+            alpha,
+            xray_pos,
+            &mut |elem| elements.push(elem.into()),
+        );
+        self.render_client_normal(
+            ctx.r(),
+            (0., 0.).into(),
+            source_size,
+            alpha,
+            clip,
+            radius,
+            &mut |elem| elements.push(elem),
+        );
+        preview
+            .source_border
+            .render(ctx.renderer, (0., 0.).into(), &mut |elem| {
+                elements.push(elem.into())
+            });
+        let width = self.visual_border_width().unwrap_or(0.);
+        preview
+            .source_shadow
+            .render(ctx.renderer, (-width, -width).into(), &mut |elem| {
+                elements.push(elem.into())
+            });
+        self.window.render_background_effect(
+            ctx.r(),
+            Rectangle::from_size(source_size),
+            self.scale,
+            clip,
+            Scale::from(1.),
+            radius,
+            xray_pos,
+            &mut |elem| elements.push(elem.into()),
+        );
+        let native_data = slot.as_ref().and_then(|s| s.borrow_mut().take());
+        if let Some(slot) = &slot {
+            *slot.borrow_mut() = previous;
+        }
+        if elements.is_empty() {
+            return None;
+        }
+        Some(ProjectedGroup::new(
+            preview.buffer.clone(),
+            elements,
+            position,
+            zoom,
+            1.,
+            self.scale,
+            ctx.target,
+            slot,
+            native_data,
+            None,
+            source_size,
+            1.,
+            false,
+        ))
+    }
+
     pub fn render<R: NiriRenderer>(
         &self,
         mut ctx: RenderCtx<R>,
@@ -2167,6 +2437,7 @@ impl<W: LayoutElement> Tile<W> {
         // Capture passes must not replace the output's presentation-feedback mapping.
         // render_inner may also write this slot while rendering a native resize animation.
         let capture_slot = ((self.shrink_preview.is_some()
+            || self.expand_preview.is_some()
             || self.normal_restore_presentation.is_some())
             && ctx.target != RenderTarget::Output)
             .then(|| self.window.offscreen_data_slot())

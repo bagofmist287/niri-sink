@@ -2529,6 +2529,25 @@ fn expand_selection_cycles_without_configuring_or_replacing_the_original_focus()
             assert_eq!(first.kind, Kind::ExpandSelection);
             assert_eq!(first.phase, Phase::Previewing);
             assert_eq!(first.targets, vec![candidate_ids[0]]);
+            let assert_preview = |fixture: &mut Fixture, selected: u64| {
+                let factor = fixture.niri().config.borrow().shrink_expand.preview_scale;
+                let ws = fixture.niri().layout.active_workspace().unwrap();
+                let previews = ws
+                    .tiles()
+                    .filter(|tile| tile.expand_preview_size().is_some())
+                    .collect::<Vec<_>>();
+                assert_eq!(previews.len(), 1);
+                assert_eq!(previews[0].window().id().get(), selected);
+                let plan =
+                    ws.normal_spine_plans(std::slice::from_ref(&previews[0].window().window))[0].1;
+                assert_eq!(
+                    previews[0].expand_preview_size(),
+                    Some(plan.allocation.upscale(factor))
+                );
+                assert!(previews[0].is_spine());
+            };
+            assert_preview(&mut fixture, candidate_ids[0]);
+
             for expected in candidate_ids
                 .iter()
                 .skip(1)
@@ -2538,6 +2557,7 @@ fn expand_selection_cycles_without_configuring_or_replacing_the_original_focus()
                 assert_eq!(repeated.id, first.id);
                 assert!(repeated.revision > first.revision);
                 assert_eq!(repeated.targets, vec![*expected]);
+                assert_preview(&mut fixture, *expected);
                 assert!(fixture
                     .niri_state()
                     .confirm_shrink_preview(first.ticket())

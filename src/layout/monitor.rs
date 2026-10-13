@@ -1986,6 +1986,7 @@ impl<W: LayoutElement> Monitor<W> {
 
                 match pass {
                     0 => {
+                        ws.render_expand_preview(ctx.r(), xray_pos, push!());
                         ws.render_sink(ctx.r(), xray_pos, true, push!());
                     }
                     1 => {
