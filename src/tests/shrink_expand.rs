@@ -5262,3 +5262,213 @@ fn explicit_xdg_unfullscreen_of_windowed_client_does_not_expand_sibling_book() {
     assert!(fixture.niri().layout.is_spine(&ids[2]));
     assert_eq!(fixture.niri().layout.windows().count(), 3);
 }
+
+fn handoff_selection_fixture(floating: bool) -> SelectionFixture {
+    let mut selection = selection_fixture(true, floating);
+    let mut config = expand_test_config();
+    config.shrink_expand.expand_buffer_ms = 60000;
+    config.animations.off = false;
+    let animation = niri_config::Animation {
+        off: false,
+        kind: niri_config::animations::Kind::Easing(niri_config::animations::EasingParams {
+            duration_ms: 10000,
+            curve: niri_config::animations::Curve::Linear,
+        }),
+    };
+    config.animations.window_movement.0 = animation;
+    config.animations.window_resize.anim = animation;
+    selection.fixture.niri_state().reload_config(Ok(config));
+    selection.fixture.double_roundtrip(selection.client);
+    selection.fixture.niri_complete_animations();
+    selection
+}
+
+#[test]
+fn expand_selection_handoff_keeps_current_frame_and_releases_input_before_animation_finishes() {
+    use crate::shrink_expand::{FinishReason, Phase};
+    for floating in [false, true] {
+        let SelectionFixture {
+            mut fixture,
+            client,
+            surfaces,
+            windows,
+        } = handoff_selection_fixture(floating);
+        let preview = fixture.niri_state().begin_expand_selection().unwrap();
+        let target = &windows[0].1;
+        let frame = |fixture: &mut Fixture| {
+            let ws = fixture.niri().layout.active_workspace().unwrap();
+            ws.tiles_with_render_positions()
+                .find(|(tile, _, _)| &tile.window().window == target)
+                .and_then(|(tile, pos, _)| tile.expand_preview_rect(pos))
+                .unwrap()
+        };
+        let before = frame(&mut fixture);
+        let submitted = fixture
+            .niri_state()
+            .confirm_shrink_preview(preview.ticket())
+            .unwrap();
+        let after = frame(&mut fixture);
+        assert_eq!(before, after, "floating={floating}");
+        assert_eq!(submitted.id, preview.id);
+        assert_eq!(submitted.phase, Phase::Submitted);
+        fixture.double_roundtrip(client);
+        let deadline = fixture
+            .niri()
+            .layout
+            .windows()
+            .find(|(_, win)| &win.window == target)
+            .unwrap()
+            .1
+            .normal_restore_deadline()
+            .unwrap();
+        fixture.client(client).window(&surfaces[0]).ack_last();
+        fixture.double_roundtrip(client);
+        let tile = fixture
+            .niri()
+            .layout
+            .active_workspace()
+            .unwrap()
+            .tiles()
+            .find(|tile| &tile.window().window == target)
+            .unwrap();
+        assert!(tile.client_input_blocked());
+        assert!(tile.expand_preview_size().is_some());
+        assert_eq!(tile.window().normal_restore_deadline(), Some(deadline));
+        let window = fixture.client(client).window(&surfaces[0]);
+        let size = window.configures_received.last().unwrap().1.size;
+        window.set_size(size.0 as u16, size.1 as u16);
+        window.commit();
+        fixture.double_roundtrip(client);
+        let tile = fixture
+            .niri()
+            .layout
+            .active_workspace()
+            .unwrap()
+            .tiles()
+            .find(|tile| &tile.window().window == target)
+            .unwrap();
+        assert!(!tile.client_input_blocked());
+        assert!(tile.expand_preview_size().is_some());
+        assert!(tile.are_transitions_ongoing());
+        assert_eq!(&fixture.niri().layout.focus().unwrap().window, target);
+        assert!(fixture
+            .niri()
+            .shrink_expand
+            .records()
+            .any(|record| record.id == preview.id
+                && record.phase == Phase::Settled
+                && record.reason == Some(FinishReason::Ready)));
+        fixture.niri_complete_animations();
+        assert!(fixture
+            .niri()
+            .layout
+            .active_workspace()
+            .unwrap()
+            .tiles()
+            .find(|tile| &tile.window().window == target)
+            .unwrap()
+            .expand_preview_size()
+            .is_none());
+        assert_eq!(fixture.niri().layout.windows().count(), 4);
+        assert!(windows
+            .iter()
+            .skip(1)
+            .all(|(_, win)| fixture.niri().layout.is_spine(win)));
+    }
+}
+
+#[test]
+fn expand_selection_handoff_keeps_original_deadline_independent_of_long_visual_motion() {
+    use crate::shrink_expand::{FinishReason, Phase};
+    for mode_change in [false, true] {
+        for selection in [false, true] {
+            for floating in [false, true] {
+                let SelectionFixture {
+                    mut fixture,
+                    client,
+                    surfaces,
+                    windows,
+                } = handoff_selection_fixture(floating);
+                let target = &windows[0].1;
+                let operation = if selection {
+                    let preview = fixture.niri_state().begin_expand_selection().unwrap();
+                    fixture
+                        .niri_state()
+                        .confirm_shrink_preview(preview.ticket())
+                        .unwrap()
+                } else {
+                    fixture
+                        .niri_state()
+                        .expand_spine_window(windows[0].0)
+                        .unwrap()
+                        .unwrap()
+                };
+                fixture.double_roundtrip(client);
+                let deadline = fixture
+                    .niri()
+                    .layout
+                    .windows()
+                    .find(|(_, win)| &win.window == target)
+                    .unwrap()
+                    .1
+                    .normal_restore_deadline()
+                    .unwrap();
+                if mode_change {
+                    fixture
+                        .client(client)
+                        .window(&surfaces[0])
+                        .xdg_toplevel
+                        .set_fullscreen(None);
+                    fixture.double_roundtrip(client);
+                }
+                fixture.client(client).window(&surfaces[0]).ack_last();
+                fixture.double_roundtrip(client);
+                assert_eq!(
+                    fixture
+                        .niri()
+                        .layout
+                        .windows()
+                        .find(|(_, win)| &win.window == target)
+                        .unwrap()
+                        .1
+                        .normal_restore_deadline(),
+                    Some(deadline)
+                );
+                let wait_until = deadline + std::time::Duration::from_millis(40);
+                while std::time::Instant::now() < wait_until {
+                    fixture.dispatch();
+                    std::thread::sleep(std::time::Duration::from_millis(2));
+                }
+                fixture.double_roundtrip(client);
+                let tile = fixture
+                    .niri()
+                    .layout
+                    .active_workspace()
+                    .unwrap()
+                    .tiles()
+                    .find(|tile| &tile.window().window == target)
+                    .unwrap();
+                assert!(!tile.client_input_blocked());
+                assert!(tile.normal_restore_visual_active());
+                assert!(tile.are_transitions_ongoing());
+                assert!(fixture
+                    .niri()
+                    .shrink_expand
+                    .records()
+                    .any(|record| record.id == operation.id
+                        && record.phase == Phase::Settled
+                        && record.reason == Some(FinishReason::Deadline)));
+                fixture.niri_complete_animations();
+                assert!(!fixture
+                    .niri()
+                    .layout
+                    .active_workspace()
+                    .unwrap()
+                    .tiles()
+                    .find(|tile| &tile.window().window == target)
+                    .unwrap()
+                    .normal_restore_visual_active());
+            }
+        }
+    }
+}

@@ -185,6 +185,7 @@ pub(super) struct InteractiveResize<W: LayoutElement> {
 pub(super) struct NormalSpineRestorePlan<Id> {
     pub requests: Vec<(Id, ColumnWidth)>,
     pub sizes: Vec<(Id, super::shrink_expand::NormalSizePlan)>,
+    pub presentation_positions: Vec<(Id, Point<f64, Logical>)>,
 }
 
 /// Read-only native resize basis, including a same-grab form-change origin.
@@ -900,7 +901,16 @@ impl<W: LayoutElement> Workspace<W> {
         let requests = self.normal_spine_requests(ids);
         let mut sizes = self.scrolling.normal_spine_plans(&requests);
         sizes.extend(self.floating.normal_spine_plans(ids));
-        NormalSpineRestorePlan { requests, sizes }
+        let presentation_positions = self
+            .tiles_with_render_positions()
+            .filter(|(tile, _, _)| ids.contains(tile.window().id()) && tile.has_expand_selection())
+            .map(|(tile, pos, _)| (tile.window().id().clone(), pos))
+            .collect();
+        NormalSpineRestorePlan {
+            requests,
+            sizes,
+            presentation_positions,
+        }
     }
 
     pub(super) fn prepare_normal_spine_restore(&mut self, plan: &NormalSpineRestorePlan<W::Id>) {
@@ -925,6 +935,20 @@ impl<W: LayoutElement> Workspace<W> {
         );
         self.floating
             .commit_normal_restore(&plan.sizes, transaction, settle_matching);
+        let deltas = self
+            .tiles_with_render_positions()
+            .filter_map(|(tile, pos, _)| {
+                plan.presentation_positions
+                    .iter()
+                    .find(|(id, _)| id == tile.window().id())
+                    .map(|(id, before)| (id.clone(), *before - pos))
+            })
+            .collect::<Vec<_>>();
+        for tile in self.tiles_mut() {
+            if let Some((_, delta)) = deltas.iter().find(|(id, _)| id == tile.window().id()) {
+                tile.rebase_expand_restore_position(*delta);
+            }
+        }
     }
 
     fn restore_normal_spines_inner(&mut self, ids: &[W::Id], settle_matching: bool) -> Vec<W::Id> {
@@ -2629,8 +2653,13 @@ impl<W: LayoutElement> Workspace<W> {
     ) {
         // Include hidden tab members: selection itself is not an activation or ownership change.
         for (tile, pos, _) in self.tiles_with_render_positions() {
+            if !tile.has_expand_selection() {
+                continue;
+            }
             if let Some(element) =
-                tile.render_expand_preview(ctx.r(), pos, xray_pos, &mut |elem| push(elem.into()))
+                tile.render_expand_preview(ctx.r(), pos, xray_pos, true, &mut |elem| {
+                    push(elem.into())
+                })
             {
                 push(element.into());
             }

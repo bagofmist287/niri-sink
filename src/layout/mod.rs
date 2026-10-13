@@ -1852,6 +1852,38 @@ impl<W: LayoutElement> Layout<W> {
         changed
     }
 
+    /// Protocol readiness also invalidates the held allocation without a new client commit.
+    /// Refresh through its native owner so geometry caches and presentation see the same release.
+    pub(crate) fn finish_ready_normal_restores(&mut self) -> bool {
+        let mut ready = self
+            .workspaces()
+            .flat_map(|(_, _, ws)| ws.tiles())
+            .filter(|tile| {
+                tile.has_normal_restore_allocation() && tile.window().normal_restore_ready()
+            })
+            .map(|tile| tile.window().id().clone())
+            .collect::<Vec<_>>();
+        if let Some(InteractiveMoveState::Moving(move_)) = &self.interactive_move {
+            if move_.tile.has_normal_restore_allocation()
+                && move_.tile.window().normal_restore_ready()
+            {
+                ready.push(move_.tile.window().id().clone());
+            }
+        }
+        let changed = !ready.is_empty();
+        for id in ready {
+            self.update_window(&id, None);
+        }
+        changed
+    }
+
+    pub(crate) fn commit_expand_preview(&mut self, id: &W::Id) -> bool {
+        self.workspaces_mut()
+            .flat_map(|ws| ws.tiles_mut())
+            .find(|tile| tile.window().id() == id)
+            .is_some_and(|tile| tile.commit_expand_preview())
+    }
+
     pub(crate) fn clear_expand_previews(&mut self) {
         for tile in self.workspaces_mut().flat_map(|ws| ws.tiles_mut()) {
             tile.clear_expand_preview();

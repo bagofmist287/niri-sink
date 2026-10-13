@@ -1007,7 +1007,7 @@ impl State {
             return self.cancel_shrink_expand_preview();
         }
         let lease = self.niri.expand_selection_lease.take().unwrap();
-        self.niri.layout.clear_expand_previews();
+        self.niri.layout.commit_expand_preview(&lease.selected);
         if let Some((token, _)) = self.niri.shrink_preview_timer.take() {
             self.niri.event_loop.remove(token);
         }
@@ -1281,6 +1281,9 @@ impl State {
     }
 
     pub(crate) fn refresh_shrink_expand_operations(&mut self) {
+        if self.niri.layout.finish_ready_normal_restores() {
+            self.niri.queue_redraw_all();
+        }
         if self.niri.shrink_expand.preview().is_some() && !self.shrink_preview_valid() {
             self.cancel_shrink_expand_preview();
         }
