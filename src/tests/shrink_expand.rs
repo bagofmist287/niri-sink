@@ -2634,6 +2634,10 @@ fn expand_selection_invalidations_cancel_without_substituting_a_new_target() {
     for reason in [
         "selected-close",
         "selected-normal",
+        "origin-close",
+        "origin-shrink",
+        "overview-generation",
+        "output",
         "workspace",
         "lock",
         "disable",
@@ -2662,6 +2666,28 @@ fn expand_selection_invalidations_cancel_without_substituting_a_new_target() {
                     .find(|ws| ws.has_window(&windows[1].1))
                     .unwrap();
                 ws.restore_normal_spines(std::slice::from_ref(&windows[1].1));
+            }
+            "origin-close" => {
+                let window = fixture.client(client).window(&surfaces[0]);
+                window.xdg_toplevel.destroy();
+                window.xdg_surface.destroy();
+                window.surface.destroy();
+            }
+            "origin-shrink" => {
+                assert!(fixture.niri().layout.commit_shrink(
+                    &windows[0].1,
+                    ShrinkAxis::Horizontal,
+                    40.
+                ));
+            }
+            "overview-generation" => {
+                // Returning to the same boolean state must still invalidate the old scene lease.
+                fixture.niri().layout.toggle_overview();
+                fixture.niri().layout.toggle_overview();
+            }
+            "output" => {
+                let output = fixture.niri_output(1);
+                fixture.niri().remove_output(&output);
             }
             "workspace" => fixture.niri().layout.switch_workspace_down(),
             "lock" => lock = Some(super::sink::lock_fixture(&mut fixture, client)),

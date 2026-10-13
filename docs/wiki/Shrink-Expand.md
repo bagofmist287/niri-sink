@@ -95,9 +95,10 @@ paths. Current checks cover new-column planning/commit, fallback, revalidation
 and real Wayland pointer drops. Native layout fixtures also cover shared and
 tabbed columns (including fullscreen/maximized insertion), Overview workspace
 creation/reuse, cross-output placement and output loss. Software EGL verifies
-the workspace-gap hint's aspect and paint. Existing-workspace hint pixels,
-live configuration changes during movement and physical device/system
-combinations still require E3/E4 qualification.
+both workspace-gap and existing-workspace hints, including Overview zoom.
+Layout tests cover live border/thickness and output/workspace overrides during
+movement, and compare native edge scrolling against ordinary windows. Physical
+device/system and complete effects combinations still require E4 qualification.
 
 A valid body release below the native 8 px recognition threshold directly expands
 the spine through the current-slot allocator. Reaching the threshold forms a move:
