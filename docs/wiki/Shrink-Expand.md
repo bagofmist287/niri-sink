@@ -1,4 +1,4 @@
-# Shrink / Expand development configuration
+# Shrink / Expand
 
 Explicit `focus-window` by ID, MRU confirmation, foreign-toplevel activation, and
 policy-approved XDG activation, and clicking its native tab indicator expand a spine
@@ -38,8 +38,8 @@ idle inhibitor keeps its original semantics.
 
 The `shrink/development` branch provides the six commands below when
 `enabled true`, with independent spine rendering and compositor-owned hit regions.
-Adjacent selection includes a content preview. This is a partial development candidate;
-the installed Sink session has not been replaced by this branch.
+Adjacent selection includes a content preview. This experimental feature is disabled
+by default; enable it explicitly in the configuration used by a supporting binary.
 
 ```kdl
 shrink-expand {
@@ -104,10 +104,11 @@ window rules. The parser, paint resolver and internal rendering are tested, incl
 paint changes, urgency and explicit inheritance in software EGL. Configuration
 reload supports disable-time restoration as described below.
 
-The internal spine model also excludes spines from `focus-window-previous`.
+Spines are excluded from `focus-window-previous`.
 They remain in window inventory and keep their collapsed form; when every
 window is a spine, this navigation action retains no client focus. Explicit
-spine activation and MRU confirmation still await runtime integration.
+spine activation and MRU confirmation expand through the permission checks described
+above.
 
 Internal native movement uses a spine's own outer rectangle as its pointer
 anchor and keeps the spine collapsed. Switching a moving spine to floating
@@ -134,7 +135,8 @@ creation/reuse, cross-output placement and output loss. Software EGL verifies
 both workspace-gap and existing-workspace hints, including Overview zoom.
 Layout tests cover live border/thickness and output/workspace overrides during
 movement, and compare native edge scrolling against ordinary windows. Physical
-device/system and complete effects combinations still require E4 qualification.
+input-device calibration and physical interaction remain specific to the running
+session and its hardware.
 
 A valid body release below the native 8 px recognition threshold directly expands
 the spine through the current-slot allocator. Reaching the threshold forms a move:
@@ -212,8 +214,8 @@ client or popup. An immediate expansion starts from this visible pose. Floating
 spatial shrink commits the preview's left/top edge anchor before the native size
 update, without changing normal-window resize or move behavior. Turning animation
 off completes the visual immediately. These paths have layout, real Wayland/grab
-and software EGL evidence; physical-device and nested-session checks remain later
-qualification.
+and software EGL evidence, with live-client effects also checked in nested sessions.
+Nested sessions do not establish physical input-device behavior.
 
 Internal direct and workspace-wide expansion now use the current native slot's
 normal size plan. Direct expansion selects that window, but waits for the
@@ -273,9 +275,9 @@ handoff, then the normal Tile owns the presentation. Input releases on processed
 commit or the original deadline, independently of animation. The held allocation
 also releases at that deadline without requiring another client commit, and
 presentation resources drop when the visual finishes. Native effects/capture
-policy remain in the rendering path; controlled software EGL and Wayland fixtures
-cover geometry, focus, receipts and lifetime, with broader system qualification
-still pending.
+policy remain in the rendering path. Software EGL and Wayland fixtures cover
+geometry, focus, receipts and lifetime; nested live clients additionally exercise
+effects, capture privacy, lock handling and presentation feedback.
 
 ## Base commands and operation observation
 
