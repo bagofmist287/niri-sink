@@ -2283,7 +2283,43 @@ impl<W: LayoutElement> Tile<W> {
         // If we're resizing, try to render a shader, or a fallback.
         let mut pushed_resize = false;
         if let Some(resize) = &self.resize_animation {
-            if ResizeRenderElement::has_shader(ctx.renderer) {
+            if ctx.target.should_block_out(rules.block_out_from)
+                && !ctx.target.should_block_out(resize.snapshot.block_out_from)
+            {
+                // The current privacy rule also covers older public snapshots. Their
+                // blocked-out contents were baked under the old rule, so neither cached
+                // texture is safe here. Mask the animated native area without sampling it.
+                if radius != CornerRadius::default()
+                    && BorderRenderElement::has_shader(ctx.renderer)
+                {
+                    let black = Color::from_color32f([0., 0., 0., 1.].into());
+                    let elem = BorderRenderElement::new(
+                        area.size,
+                        Rectangle::from_size(area.size),
+                        GradientInterpolation::default(),
+                        black,
+                        black,
+                        0.,
+                        Rectangle::from_size(area.size),
+                        0.,
+                        radius,
+                        scale.x as f32,
+                        win_alpha,
+                    )
+                    .with_location(area.loc);
+                    push(elem.into());
+                } else {
+                    let mask = SolidColorBuffer::new(area.size, [0., 0., 0., 1.]);
+                    let elem = SolidColorRenderElement::from_buffer(
+                        &mask,
+                        area.loc,
+                        win_alpha,
+                        Kind::Unspecified,
+                    );
+                    push(elem.into());
+                }
+                pushed_resize = true;
+            } else if ResizeRenderElement::has_shader(ctx.renderer) {
                 let mut ctx = ctx.as_gles();
 
                 if let Some(texture_from) = resize.snapshot.texture(ctx.r(), scale) {

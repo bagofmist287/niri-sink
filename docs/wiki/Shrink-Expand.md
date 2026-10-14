@@ -237,6 +237,8 @@ focus follow the barrier, not the visual clock. Turning animation off preserves
 the barrier and shows content immediately when it releases. The shape follows live
 layout paint and the configured spine overrides; screen-capture block-out remains
 effective. Capture caches remain separate from output presentation feedback.
+Enabling capture block-out during a native resize also masks content snapshots
+retained under older window rules, including a restoring selection projection.
 During a selected restoration, subsequent fullscreen or maximized mode changes
 also update the projected content's native opacity, backdrop, corners and
 decoration transitions. Selecting a spine alone keeps its normal content style.

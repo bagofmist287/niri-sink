@@ -5205,194 +5205,206 @@ fn expand_mode_projection_preserves_native_resize_snapshot_and_canvas() {
     let mut renderer = spine_test_renderer();
     for scale in [1., 1.25] {
         for mode in [SizingMode::Fullscreen, SizingMode::Maximized] {
-            let mut options = Options::default();
-            options.layout.border.off = true;
-            options.layout.focus_ring.off = true;
-            options.layout.shadow.on = false;
-            options.animations.window_resize.anim = niri_config::Animation {
-                off: false,
-                kind: niri_config::animations::Kind::Easing(
-                    niri_config::animations::EasingParams {
-                        duration_ms: 1000,
-                        curve: niri_config::animations::Curve::Linear,
-                    },
-                ),
-            };
-            options.animations.window_movement.0 = niri_config::Animation {
-                off: false,
-                kind: niri_config::animations::Kind::Easing(
-                    niri_config::animations::EasingParams {
-                        duration_ms: 10000,
-                        curve: niri_config::animations::Curve::Linear,
-                    },
-                ),
-            };
-            let options = Rc::new(options);
-            let mut clock = Clock::with_time(Duration::ZERO);
-            let make = || {
-                let mut params = TestWindowParams::new(1);
-                params.bbox = Rectangle::from_size((120, 80).into());
-                params.rules = Some(ResolvedWindowRules {
-                    opacity: Some(0.5),
-                    block_out_from: Some(niri_config::BlockOutFrom::ScreenCapture),
-                    ..Default::default()
-                });
-                let client = TestWindow::new(params);
-                *client.0.render_solid.borrow_mut() =
-                    Some(SolidColorBuffer::new((120., 80.), [0., 0., 0.5, 0.5]));
-                *client.0.render_solid_blocked.borrow_mut() =
-                    Some(SolidColorBuffer::new((120., 80.), [0., 0., 0., 1.]));
-                let tile = Tile::new(
-                    client.clone(),
-                    (480., 320.).into(),
-                    scale,
-                    clock.clone(),
-                    options.clone(),
-                );
-                (tile, client)
-            };
-            let (mut native, native_client) = make();
-            let (mut restored, restored_client) = make();
-            restored.set_spine(ShrinkAxis::Horizontal, 32.);
-            let plan = crate::layout::shrink_expand::NormalSizePlan {
-                allocation: (120., 80.).into(),
-                client_size: (120, 80).into(),
-                sizing_mode: SizingMode::Normal,
-            };
-            restored.set_expand_preview(plan, 0.5, true);
-            restored.commit_expand_preview();
-            restored.prepare_normal_restore(plan);
-            restored.submit_normal_restore(false, Transaction::new(), false);
-            restored_client.communicate();
-            restored.update_window();
-            let physical = Size::from((120., 80.)).to_physical_precise_round(scale);
-            let mut textures = Vec::new();
-            for color in [[0., 0., 0.5, 0.5], [0., 0., 0., 1.]] {
-                let old = SolidColorBuffer::new((120., 80.), color);
-                let (texture, _sync) = render_to_texture(
-                    &mut renderer,
-                    physical,
-                    Scale::from(scale),
-                    Transform::Normal,
-                    Fourcc::Abgr8888,
-                    std::iter::once(SolidColorRenderElement::from_buffer(
-                        &old,
-                        (0., 0.),
-                        1.,
-                        Kind::Unspecified,
-                    )),
-                )
-                .unwrap();
-                textures.push(texture);
-            }
-            for (tile, client) in [
-                (&mut native, &native_client),
-                (&mut restored, &restored_client),
-            ] {
-                if mode.is_fullscreen() {
-                    tile.request_fullscreen(true, None);
-                } else {
-                    tile.request_maximized((480., 320.).into(), true, None);
-                }
-                assert!(client.communicate());
-                let mut snapshot = client.0.animation_snapshot.borrow_mut();
-                let snapshot = snapshot
-                    .as_mut()
-                    .expect("native animated configure has a snapshot");
-                snapshot
-                    .texture
-                    .set(Some((textures[0].clone(), Rectangle::from_size(physical))))
-                    .unwrap();
-                snapshot.block_out_from = Some(niri_config::BlockOutFrom::ScreenCapture);
-                snapshot
-                    .blocked_out_texture
-                    .set(Some((textures[1].clone(), Rectangle::from_size(physical))))
-                    .unwrap();
-                *client.0.render_solid.borrow_mut() =
-                    Some(SolidColorBuffer::new((480., 320.), [0., 0.5, 0., 0.5]));
-                client
-                    .0
-                    .render_solid_blocked
-                    .borrow_mut()
-                    .as_mut()
-                    .unwrap()
-                    .resize((480., 320.));
-                // The snapshot borrow ends here, before update_window takes it.
-            }
-            native.update_window();
-            restored.update_window();
-            for millis in [250, 500, 750] {
-                clock.set_unadjusted(Duration::from_millis(millis));
-                native.advance_animations();
-                restored.advance_animations();
-                let view = Rectangle::from_size((1000., 800.).into());
-                native.update_render_elements(true, view);
-                restored.update_render_elements(true, view);
-                assert!(restored.expand_preview_size().is_some());
-                assert_ne!(
-                    native.animated_tile_size(),
-                    native.tile_size(),
-                    "native mode resize is unfinished"
-                );
-                for target in [RenderTarget::Output, RenderTarget::ScreenCapture] {
-                    let mut ordinary = Vec::new();
-                    native.render(
-                        RenderCtx {
-                            renderer: &mut renderer,
-                            target,
-                            xray: None,
+            for snapshot_was_blocked in [true, false] {
+                let mut options = Options::default();
+                options.layout.border.off = true;
+                options.layout.focus_ring.off = true;
+                options.layout.shadow.on = false;
+                options.animations.window_resize.anim = niri_config::Animation {
+                    off: false,
+                    kind: niri_config::animations::Kind::Easing(
+                        niri_config::animations::EasingParams {
+                            duration_ms: 1000,
+                            curve: niri_config::animations::Curve::Linear,
                         },
-                        (20., 20.).into(),
-                        XrayPos::default(),
-                        false,
-                        &mut |e| ordinary.push(e),
+                    ),
+                };
+                options.animations.window_movement.0 = niri_config::Animation {
+                    off: false,
+                    kind: niri_config::animations::Kind::Easing(
+                        niri_config::animations::EasingParams {
+                            duration_ms: 10000,
+                            curve: niri_config::animations::Curve::Linear,
+                        },
+                    ),
+                };
+                let options = Rc::new(options);
+                let mut clock = Clock::with_time(Duration::ZERO);
+                let make = || {
+                    let mut params = TestWindowParams::new(1);
+                    params.bbox = Rectangle::from_size((120, 80).into());
+                    params.rules = Some(ResolvedWindowRules {
+                        opacity: Some(0.5),
+                        block_out_from: Some(niri_config::BlockOutFrom::ScreenCapture),
+                        ..Default::default()
+                    });
+                    let client = TestWindow::new(params);
+                    *client.0.render_solid.borrow_mut() =
+                        Some(SolidColorBuffer::new((120., 80.), [0., 0., 0.5, 0.5]));
+                    *client.0.render_solid_blocked.borrow_mut() =
+                        Some(SolidColorBuffer::new((120., 80.), [0., 0., 0., 1.]));
+                    let tile = Tile::new(
+                        client.clone(),
+                        (480., 320.).into(),
+                        scale,
+                        clock.clone(),
+                        options.clone(),
                     );
-                    let source_geo = native.animated_tile_size();
-                    let native_center = Point::<f64, Logical>::from((20., 20.))
-                        + source_geo.to_point().downscale(2.);
-                    let size = Size::from((1000., 800.)).to_physical_precise_round(scale);
-                    let download = render_and_download(
+                    (tile, client)
+                };
+                let (mut native, native_client) = make();
+                let (mut restored, restored_client) = make();
+                restored.set_spine(ShrinkAxis::Horizontal, 32.);
+                let plan = crate::layout::shrink_expand::NormalSizePlan {
+                    allocation: (120., 80.).into(),
+                    client_size: (120, 80).into(),
+                    sizing_mode: SizingMode::Normal,
+                };
+                restored.set_expand_preview(plan, 0.5, true);
+                restored.commit_expand_preview();
+                restored.prepare_normal_restore(plan);
+                restored.submit_normal_restore(false, Transaction::new(), false);
+                restored_client.communicate();
+                restored.update_window();
+                let physical = Size::from((120., 80.)).to_physical_precise_round(scale);
+                let mut textures = Vec::new();
+                for color in [[0., 0., 0.5, 0.5], [0., 0., 0., 1.]] {
+                    let old = SolidColorBuffer::new((120., 80.), color);
+                    let (texture, _sync) = render_to_texture(
                         &mut renderer,
-                        size,
+                        physical,
                         Scale::from(scale),
                         Transform::Normal,
                         Fourcc::Abgr8888,
-                        ordinary.into_iter().rev(),
+                        std::iter::once(SolidColorRenderElement::from_buffer(
+                            &old,
+                            (0., 0.),
+                            1.,
+                            Kind::Unspecified,
+                        )),
                     )
                     .unwrap();
-                    let data = renderer.map_texture(&download).unwrap();
-                    let at: Point<i32, smithay::utils::Physical> =
-                        native_center.to_physical_precise_round(scale);
-                    let offset = (at.y as usize * size.w as usize + at.x as usize) * 4;
-                    let expected: [u8; 4] = data[offset..offset + 4].try_into().unwrap();
-                    let projected = restored
-                        .render_expand_preview(
+                    textures.push(texture);
+                }
+                for (tile, client) in [
+                    (&mut native, &native_client),
+                    (&mut restored, &restored_client),
+                ] {
+                    if mode.is_fullscreen() {
+                        tile.request_fullscreen(true, None);
+                    } else {
+                        tile.request_maximized((480., 320.).into(), true, None);
+                    }
+                    assert!(client.communicate());
+                    let mut snapshot = client.0.animation_snapshot.borrow_mut();
+                    let snapshot = snapshot
+                        .as_mut()
+                        .expect("native animated configure has a snapshot");
+                    snapshot
+                        .texture
+                        .set(Some((textures[0].clone(), Rectangle::from_size(physical))))
+                        .unwrap();
+                    // A snapshot may predate enabling block-out in the current window rule.
+                    snapshot.block_out_from =
+                        snapshot_was_blocked.then_some(niri_config::BlockOutFrom::ScreenCapture);
+                    snapshot
+                        .blocked_out_texture
+                        .set(Some((textures[1].clone(), Rectangle::from_size(physical))))
+                        .unwrap();
+                    *client.0.render_solid.borrow_mut() =
+                        Some(SolidColorBuffer::new((480., 320.), [0., 0.5, 0., 0.5]));
+                    client
+                        .0
+                        .render_solid_blocked
+                        .borrow_mut()
+                        .as_mut()
+                        .unwrap()
+                        .resize((480., 320.));
+                    // The snapshot borrow ends here, before update_window takes it.
+                }
+                native.update_window();
+                restored.update_window();
+                for millis in [250, 500, 750] {
+                    clock.set_unadjusted(Duration::from_millis(millis));
+                    native.advance_animations();
+                    restored.advance_animations();
+                    let view = Rectangle::from_size((1000., 800.).into());
+                    native.update_render_elements(true, view);
+                    restored.update_render_elements(true, view);
+                    assert!(restored.expand_preview_size().is_some());
+                    assert_ne!(
+                        native.animated_tile_size(),
+                        native.tile_size(),
+                        "native mode resize is unfinished"
+                    );
+                    for target in [
+                        RenderTarget::Output,
+                        RenderTarget::Screencast,
+                        RenderTarget::ScreenCapture,
+                    ] {
+                        let mut ordinary = Vec::new();
+                        native.render(
                             RenderCtx {
                                 renderer: &mut renderer,
                                 target,
                                 xray: None,
                             },
-                            (300., 200.).into(),
+                            (20., 20.).into(),
                             XrayPos::default(),
                             false,
-                            &mut |_| {},
+                            &mut |e| ordinary.push(e),
+                        );
+                        let source_geo = native.animated_tile_size();
+                        let native_center = Point::<f64, Logical>::from((20., 20.))
+                            + source_geo.to_point().downscale(2.);
+                        let size = Size::from((1000., 800.)).to_physical_precise_round(scale);
+                        let download = render_and_download(
+                            &mut renderer,
+                            size,
+                            Scale::from(scale),
+                            Transform::Normal,
+                            Fourcc::Abgr8888,
+                            ordinary.into_iter().rev(),
                         )
                         .unwrap();
-                    let geo = projected.geometry(Scale::from(scale));
-                    let center = geo.loc + geo.size.to_point().downscale(2);
-                    let download = render_and_download(
-                        &mut renderer,
-                        size,
-                        Scale::from(scale),
-                        Transform::Normal,
-                        Fourcc::Abgr8888,
-                        std::iter::once(projected),
-                    )
-                    .unwrap();
-                    let data = renderer.map_texture(&download).unwrap();
-                    let offset = (center.y as usize * size.w as usize + center.x as usize) * 4;
-                    let actual = &data[offset..offset + 4];
-                    assert!(actual.iter().zip(expected).all(|(a,b)|a.abs_diff(b)<=2),"{mode:?} {target:?} scale{scale} time{millis}: {actual:?} != native {expected:?}");
+                        let data = renderer.map_texture(&download).unwrap();
+                        let at: Point<i32, smithay::utils::Physical> =
+                            native_center.to_physical_precise_round(scale);
+                        let offset = (at.y as usize * size.w as usize + at.x as usize) * 4;
+                        let expected: [u8; 4] = data[offset..offset + 4].try_into().unwrap();
+                        let projected = restored
+                            .render_expand_preview(
+                                RenderCtx {
+                                    renderer: &mut renderer,
+                                    target,
+                                    xray: None,
+                                },
+                                (300., 200.).into(),
+                                XrayPos::default(),
+                                false,
+                                &mut |_| {},
+                            )
+                            .unwrap();
+                        let geo = projected.geometry(Scale::from(scale));
+                        let center = geo.loc + geo.size.to_point().downscale(2);
+                        let download = render_and_download(
+                            &mut renderer,
+                            size,
+                            Scale::from(scale),
+                            Transform::Normal,
+                            Fourcc::Abgr8888,
+                            std::iter::once(projected),
+                        )
+                        .unwrap();
+                        let data = renderer.map_texture(&download).unwrap();
+                        let offset = (center.y as usize * size.w as usize + center.x as usize) * 4;
+                        let actual = &data[offset..offset + 4];
+                        if target != RenderTarget::Output {
+                            assert!(actual[..3].iter().all(|channel| *channel <= 2),
+                            "current privacy must cover historical snapshots: {mode:?} scale{scale} time{millis} old_blocked{snapshot_was_blocked}: {actual:?}");
+                        }
+                        assert!(actual.iter().zip(expected).all(|(a,b)|a.abs_diff(b)<=2),"{mode:?} {target:?} scale{scale} time{millis}: {actual:?} != native {expected:?}");
+                    }
                 }
             }
         }
