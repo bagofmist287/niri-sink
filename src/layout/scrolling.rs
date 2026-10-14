@@ -6372,6 +6372,7 @@ fn plan_spine_allocations<W: LayoutElement>(
         border,
         preferred,
     )
+    .map(|plans| plans.with_native_height_rounding(bounds, scale))
 }
 
 /// Native column allocation, without client configure, caches, focus or ownership changes.

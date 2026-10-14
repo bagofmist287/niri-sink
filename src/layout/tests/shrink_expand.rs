@@ -4200,8 +4200,123 @@ fn ordinary_space_switch_finds_normal_receiver_and_skips_all_spine_space() {
 }
 
 #[test]
+fn native_height_rounding_preserves_thickness_and_real_overflow_limits() {
+    use crate::layout::shrink_expand::SpinePlans;
+
+    let scale = 1.3;
+    let bounds = Size::from((200., 99.6));
+    let plans = SpinePlans::new(
+        32.,
+        [(100., 100.).into(); 2],
+        bounds,
+        scale,
+        0.,
+        ShrinkAxis::Horizontal,
+    )
+    .unwrap();
+    assert!(!plans.get(ShrinkAxis::Horizontal).fits);
+    assert!(
+        plans
+            .with_native_height_rounding(bounds, scale)
+            .get(ShrinkAxis::Horizontal)
+            .fits
+    );
+
+    for (bounds, allocation) in [
+        ((31.9, 200.), (100., 100.)), // Locked width cannot fit its physical thickness.
+        ((200., 31.9), (100., 32.)),  // Free-axis minimum thickness cannot fit either.
+        ((200., 99.6), (100., 103.)), // Genuine height overflow is not a rounding difference.
+    ] {
+        let bounds = bounds.into();
+        let plans = SpinePlans::new(
+            32.,
+            [allocation.into(); 2],
+            bounds,
+            scale,
+            0.,
+            ShrinkAxis::Horizontal,
+        )
+        .unwrap();
+        assert!(
+            !plans
+                .with_native_height_rounding(bounds, scale)
+                .get(ShrinkAxis::Horizontal)
+                .fits
+        );
+    }
+    let bounds = (99.6, 200.).into();
+    let plans = SpinePlans::new(
+        32.,
+        [(103., 100.).into(); 2],
+        bounds,
+        scale,
+        0.,
+        ShrinkAxis::Vertical,
+    )
+    .unwrap();
+    assert!(
+        !plans
+            .with_native_height_rounding(bounds, scale)
+            .get(ShrinkAxis::Vertical)
+            .fits
+    );
+}
+
+#[test]
+fn fractional_native_height_keeps_vertical_spines_legal() {
+    use niri_config::{FloatOrInt, Struts};
+
+    let mut failures = Vec::new();
+    for scale in [1., 1.25, 1.3, 1.5] {
+        for physical_height in 1590..=1610 {
+            let mut options = Options::default();
+            options.layout.gaps = 8.;
+            options.layout.border.off = false;
+            options.layout.border.width = 2.;
+            options.layout.struts = Struts {
+                left: FloatOrInt(15.),
+                right: FloatOrInt(15.),
+                top: FloatOrInt(15.),
+                bottom: FloatOrInt(15.),
+            };
+            let options = Rc::new(options);
+            let view = Size::from((2560. / scale, f64::from(physical_height) / scale));
+            let mut space = ScrollingSpace::new(
+                view,
+                Rectangle::from_size(view),
+                scale,
+                Clock::with_time(Duration::ZERO),
+                options.clone(),
+            );
+            for id in 1..=3 {
+                let mut tile = tile(id, scale, options.clone());
+                tile.clock = space.clock().clone();
+                space.add_tile(None, tile, true, ColumnWidth::Proportion(0.5), false, None);
+            }
+            settle(&mut space);
+            for id in 1..=3 {
+                let plans = space.spine_plans(&id, 32.).unwrap();
+                if !plans.get(ShrinkAxis::Horizontal).fits {
+                    failures.push((
+                        scale,
+                        physical_height,
+                        id,
+                        plans.get(ShrinkAxis::Horizontal).geometry.outer_size(),
+                        plans.get(ShrinkAxis::Vertical).fits,
+                    ));
+                }
+            }
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "ordinary half-width columns rejected vertical spines: {failures:?}"
+    );
+}
+
+#[test]
 fn axis_plans_are_read_only_and_match_committed_native_column_sizes() {
-    for scale in [1., 1.25] {
+    for scale in [1., 1.25, 1.3, 1.5] {
         for display in [ColumnDisplay::Normal, ColumnDisplay::Tabbed] {
             for axis in [ShrinkAxis::Horizontal, ShrinkAxis::Vertical] {
                 let mut options = Options::default();

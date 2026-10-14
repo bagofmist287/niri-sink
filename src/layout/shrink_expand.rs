@@ -295,6 +295,19 @@ impl SpinePlans {
         }
     }
 
+    /// Columns round the free height to an integer logical pixel before physical rounding.
+    /// Match that budget without relaxing the locked width or the minimum spine thickness.
+    pub fn with_native_height_rounding(mut self, bounds: Size<f64, Logical>, scale: f64) -> Self {
+        let size = self.horizontal.geometry.outer_size();
+        let width = (size.w * scale).round();
+        let height_bound = (bounds.h * scale).floor();
+        let native_height_bound = (bounds.h.round() * scale).round();
+        self.horizontal.fits = width <= (bounds.w * scale).floor()
+            && width <= height_bound
+            && (size.h * scale).round() <= height_bound.max(native_height_bound);
+        self
+    }
+
     /// Prediction is only used on the first invocation; legality takes precedence.
     pub fn first(&self) -> Option<SpinePlan> {
         self.next(self.preferred.other())

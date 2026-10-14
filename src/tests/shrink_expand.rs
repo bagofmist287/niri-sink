@@ -4861,6 +4861,107 @@ fn expand_all_runtime_restores_hidden_tabs_and_floating_without_focus_jump() {
 }
 
 #[test]
+fn fractional_height_changes_keep_keyboard_axes_and_mouse_width_shrink_available() {
+    use smithay::input::pointer::ButtonEvent;
+
+    use crate::shrink_expand::Kind;
+    use crate::utils::ResizeEdge;
+
+    let config = niri_config::Config::parse_mem(
+        r#"
+animations { off; }
+shrink-expand { enabled true; shrink-buffer-ms 60000; mouse-zone-px 200; }
+layout {
+    gaps 8
+    default-column-width { proportion 0.5; }
+    border { on; width 2; }
+    struts { left 15; right 15; top 15; bottom 15; }
+}
+"#,
+    )
+    .unwrap();
+    let mut fixture = Fixture::with_config(config);
+    fixture.add_output(1, (2560, 1599));
+    let output = fixture.niri_output(1);
+    output.change_current_state(
+        None,
+        None,
+        Some(smithay::output::Scale::Fractional(1.3)),
+        None,
+    );
+    smithay::desktop::layer_map_for_output(&output).arrange();
+    fixture.niri().layout.update_output_size(&output);
+    let client = fixture.add_client();
+    for _ in 0..2 {
+        let surface = fixture.client(client).create_window().surface.clone();
+        fixture.client(client).window(&surface).commit();
+        fixture.roundtrip(client);
+        let window = fixture.client(client).window(&surface);
+        window.attach_new_buffer();
+        window.set_size(300, 200);
+        window.ack_last_and_commit();
+        fixture.double_roundtrip(client);
+    }
+    let windows = fixture
+        .niri()
+        .layout
+        .windows()
+        .map(|(_, w)| w.window.clone())
+        .collect::<Vec<_>>();
+    for height in 1590..=1610 {
+        output.change_current_state(
+            Some(smithay::output::Mode {
+                size: (2560, height).into(),
+                refresh: 60000,
+            }),
+            None,
+            None,
+            None,
+        );
+        smithay::desktop::layer_map_for_output(&output).arrange();
+        fixture.niri().layout.update_output_size(&output);
+        fixture.double_roundtrip(client);
+        for window in &windows {
+            fixture.niri_state().focus_window(window);
+            fixture.double_roundtrip(client);
+            let plans = fixture.niri().layout.shrink_plans(window, 32.).unwrap();
+            assert!(plans.get(ShrinkAxis::Horizontal).fits, "height={height}");
+            assert!(plans.get(ShrinkAxis::Vertical).fits);
+            for axis in [
+                ShrinkAxis::Horizontal,
+                ShrinkAxis::Vertical,
+                ShrinkAxis::Horizontal,
+                ShrinkAxis::Vertical,
+            ] {
+                let record = fixture.niri_state().begin_shrink_preview(None).unwrap();
+                assert_eq!(record.kind, Kind::ShrinkTimed(axis), "height={height}");
+            }
+            fixture.niri_state().cancel_shrink_expand_preview();
+        }
+    }
+    let (window, pointer) = spatial_test_pointer(&mut fixture, ResizeEdge::RIGHT);
+    spatial_test_motion(&mut fixture, &pointer, (-2000., 0.));
+    fixture.double_roundtrip(client);
+    let preview = fixture.niri().shrink_expand.preview().unwrap();
+    assert_eq!(
+        preview.record.kind,
+        Kind::ShrinkSpatial(ShrinkAxis::Horizontal)
+    );
+    pointer.button(
+        fixture.niri_state(),
+        &ButtonEvent {
+            serial: smithay::utils::Serial::from(403),
+            time: smithay::backend::input::InputTime::now(),
+            button: 0x110,
+            state: smithay::backend::input::ButtonState::Released,
+        },
+    );
+    fixture.double_roundtrip(client);
+    assert!(!pointer.is_grabbed());
+    assert!(fixture.niri().layout.is_spine(&window));
+}
+
+#[test]
 fn timed_shrink_repeat_rejects_old_ticket_and_commits_native_focus_handoff() {
     use crate::shrink_expand::{FinishReason, Kind, Phase};
     for floating in [false, true] {

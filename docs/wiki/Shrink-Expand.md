@@ -71,6 +71,11 @@ Mouse buffering uses distance rather than a timer. `mouse-zone-px` accepts 0 to
 separate from buffering. Vertical spine titles rotate clockwise as one piece;
 icons remain upright.
 
+Width shrinking retains the native column's allocated height, including rounding
+on fractional output scales. That rounding does not by itself disable the vertical
+spine. The physical spine thickness and genuine workspace or sibling minimum-size
+limits still determine whether an axis is available.
+
 `layout.spine` supports `active-color`, `inactive-color`, `urgent-color`, their
 corresponding `*-gradient` nodes, and `text-color`. Colors accept the existing CSS
 string or four integer RGBA arguments. Gradients use the existing border syntax,
