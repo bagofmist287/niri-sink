@@ -832,11 +832,14 @@ impl<W: LayoutElement> Workspace<W> {
     ) -> Option<super::spine_search::SpineSearch<W::Id>> {
         use super::spine_search::{SpineCandidate, SpineSearch, SpineSearchMode};
         let slots = self.scrolling.spine_search_slots();
-        let all_spines = self.sink_count() == 0
-            && self.tiles().next().is_some()
-            && self.tiles().all(Tile::is_spine);
-        if all_spines {
-            let mut floating = self.floating.tiles_with_offsets().collect::<Vec<_>>();
+        // Native tiling navigation can select any normal tiled member, including hidden tabs.
+        // Sink and ordinary floating windows do not provide a tiling search origin.
+        if self.scrolling.tiles().all(Tile::is_spine) {
+            let mut floating = self
+                .floating
+                .tiles_with_offsets()
+                .filter(|(tile, _)| tile.is_spine())
+                .collect::<Vec<_>>();
             floating.sort_by(|(a, a_pos), (b, b_pos)| {
                 a_pos
                     .y
@@ -849,10 +852,16 @@ impl<W: LayoutElement> Workspace<W> {
                     .into_iter()
                     .map(|(tile, _)| tile.window().id().clone()),
             );
+            let candidates = ids
+                .map(|id| SpineCandidate { id, distance: 0 })
+                .collect::<Vec<_>>();
+            if candidates.is_empty() {
+                return None;
+            }
             return Some(SpineSearch {
                 mode: SpineSearchMode::All,
                 origin: None,
-                candidates: ids.map(|id| SpineCandidate { id, distance: 0 }).collect(),
+                candidates,
             });
         }
         super::spine_search::adjacent_candidates(

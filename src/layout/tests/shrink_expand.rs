@@ -630,13 +630,93 @@ fn spine_search_uses_native_slots_and_keeps_scope_separate_from_floating_and_sin
             requests
         );
         layout.set_window_floating(Some(&1), true);
-        assert!(query(&layout, Some(&1)).is_none());
+        let all = query(&layout, Some(&1)).unwrap();
+        assert_eq!(all.mode, SpineSearchMode::All);
+        assert_eq!(all.origin, None);
+        assert_eq!(
+            all.candidates.iter().map(|c| c.id).collect::<Vec<_>>(),
+            [2, 3]
+        );
         layout.activate_window(&1);
         assert!(layout.sink_window());
         assert_eq!(layout.active_workspace().unwrap().sink_count(), 1);
-        assert!(query(&layout, None).is_none());
+        assert_eq!(query(&layout, None), Some(all));
         assert_eq!(layout.windows().count(), 3);
         layout.verify_invariants();
+    }
+}
+
+#[test]
+fn spine_search_ignores_sink_and_normal_floating_but_requires_spine_candidates() {
+    use crate::layout::spine_search::SpineSearchMode;
+
+    for scale in [1., 1.25] {
+        for floating_sink in [false, true] {
+            let mut options = Options::default();
+            options.sink.enabled = true;
+            let mut layout = Layout::with_options(Clock::with_time(Duration::ZERO), options);
+            Op::AddScaledOutput {
+                id: 1,
+                scale,
+                layout_config: None,
+            }
+            .apply(&mut layout);
+            for id in 1..=4 {
+                Op::AddWindow {
+                    params: TestWindowParams::new(id),
+                }
+                .apply(&mut layout);
+                Op::Communicate(id).apply(&mut layout);
+            }
+            for id in [2, 4] {
+                layout.set_window_floating(Some(&id), true);
+                Op::Communicate(id).apply(&mut layout);
+            }
+            if floating_sink {
+                layout.set_window_floating(Some(&3), true);
+            }
+            layout.activate_window(&3);
+            assert!(layout.sink_window());
+            assert!(layout.commit_shrink(&1, ShrinkAxis::Horizontal, 40.));
+            assert!(layout.commit_shrink(&2, ShrinkAxis::Vertical, 40.));
+            layout.activate_window(&4);
+            let query = |layout: &Layout<TestWindow>, origin| {
+                layout
+                    .active_workspace()
+                    .unwrap()
+                    .spine_candidates(origin, |a, b| a.id().cmp(b.id()))
+            };
+            let requests = layout
+                .windows()
+                .map(|(_, w)| (*w.id(), w.requested_size()))
+                .collect::<Vec<_>>();
+            let search = query(&layout, Some(&4)).unwrap();
+            assert_eq!(search.mode, SpineSearchMode::All);
+            assert_eq!(search.origin, None);
+            assert_eq!(
+                search.candidates.iter().map(|c| c.id).collect::<Vec<_>>(),
+                [1, 2]
+            );
+            assert_eq!(query(&layout, None), Some(search));
+            assert_eq!(layout.focus().unwrap().id(), &4);
+            assert_eq!(layout.active_workspace().unwrap().sink_depth(&3), Some(0));
+            assert_eq!(
+                layout
+                    .windows()
+                    .map(|(_, w)| (*w.id(), w.requested_size()))
+                    .collect::<Vec<_>>(),
+                requests
+            );
+            for id in [1, 2, 4] {
+                layout.remove_window(&id, Transaction::new());
+                if id == 2 {
+                    assert!(query(&layout, Some(&4)).is_none());
+                }
+            }
+            assert!(query(&layout, None).is_none());
+            assert_eq!(layout.active_workspace().unwrap().sink_count(), 1);
+            layout.verify_invariants();
+        }
     }
 }
 

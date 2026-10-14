@@ -3999,13 +3999,6 @@ fn expand_selection_cycles_without_configuring_or_replacing_the_original_focus()
                 surfaces,
                 windows,
             } = selection_fixture(all, floating);
-            if floating && !all {
-                assert_eq!(
-                    fixture.niri_state().begin_expand_selection(),
-                    Err(crate::shrink_expand::Rejected::NoTarget)
-                );
-                continue;
-            }
             let old_focus = fixture.niri().keyboard_focus.surface().cloned();
             let before = surfaces
                 .iter()
@@ -4087,6 +4080,100 @@ fn expand_selection_cycles_without_configuring_or_replacing_the_original_focus()
             for (_, window) in windows.iter().skip(if all { 0 } else { 1 }) {
                 assert!(fixture.niri().layout.is_spine(window));
             }
+        }
+    }
+}
+
+#[test]
+fn expand_selection_with_sink_retains_scope_and_only_restores_selected_spine() {
+    use crate::shrink_expand::Phase;
+
+    for floating in [false, true] {
+        for close_sink in [false, true] {
+            let SelectionFixture {
+                mut fixture,
+                client,
+                surfaces,
+                windows,
+            } = selection_fixture(false, floating);
+            let mut config = niri_config::Config::default();
+            config.animations.off = true;
+            config.shrink_expand.enabled = true;
+            config.shrink_expand.shrink_buffer_ms = 60000;
+            config.shrink_expand.expand_buffer_ms = 60000;
+            config.sink.enabled = true;
+            fixture.niri_state().reload_config(Ok(config));
+            fixture
+                .niri_state()
+                .do_action(niri_config::Action::SinkWindow, false);
+            fixture.double_roundtrip(client);
+            assert_eq!(fixture.niri().layout.sink_depth(&windows[0].1), Some(0));
+            assert!(fixture.niri().layout.focus().is_none());
+
+            let first = fixture.niri_state().begin_expand_selection().unwrap();
+            assert_eq!(first.targets, vec![windows[1].0]);
+            let second = fixture.niri_state().begin_expand_selection().unwrap();
+            assert_eq!(second.id, first.id);
+            assert_eq!(second.targets, vec![windows[2].0]);
+            assert!(fixture.niri().keyboard_focus.surface().is_none());
+            assert_eq!(
+                fixture
+                    .niri_state()
+                    .begin_shrink_preview(None)
+                    .unwrap()
+                    .phase,
+                Phase::Cancelled
+            );
+            assert!(fixture.niri().layout.is_spine(&windows[2].1));
+
+            fixture.niri_state().begin_expand_selection().unwrap();
+            let selected = fixture.niri_state().begin_expand_selection().unwrap();
+            let deadline = fixture.niri().shrink_expand.preview().unwrap().deadline;
+            if close_sink {
+                let window = fixture.client(client).window(&surfaces[0]);
+                window.xdg_toplevel.destroy();
+                window.xdg_surface.destroy();
+                window.surface.destroy();
+                fixture.double_roundtrip(client);
+            }
+            let current = fixture.niri().shrink_expand.preview().unwrap();
+            assert_eq!(current.record.ticket(), selected.ticket());
+            assert_eq!(current.record.targets, selected.targets);
+            assert_eq!(current.deadline, deadline);
+            let submitted = fixture
+                .niri_state()
+                .confirm_shrink_preview(selected.ticket())
+                .unwrap();
+            assert_eq!(submitted.phase, Phase::Submitted);
+            fixture.double_roundtrip(client);
+            // An unchanged floating allocation may already satisfy the restore barrier.
+            assert!(fixture
+                .niri()
+                .layout
+                .focus()
+                .is_none_or(|window| window.window == windows[2].1));
+            let window = fixture.client(client).window(&surfaces[2]);
+            let size = window.configures_received.last().unwrap().1.size;
+            // A zero floating configure dimension leaves that dimension to the client.
+            window.set_size(
+                if size.0 == 0 { 300 } else { size.0 as u16 },
+                if size.1 == 0 { 200 } else { size.1 as u16 },
+            );
+            window.ack_last_and_commit();
+            fixture.double_roundtrip(client);
+            assert_eq!(fixture.niri().layout.focus().unwrap().window, windows[2].1);
+            assert!(!fixture.niri().layout.is_spine(&windows[2].1));
+            for index in [1, 3] {
+                assert!(fixture.niri().layout.is_spine(&windows[index].1));
+            }
+            assert_eq!(
+                fixture.niri().layout.sink_depth(&windows[0].1),
+                (!close_sink).then_some(0)
+            );
+            assert_eq!(
+                fixture.niri().layout.windows().count(),
+                if close_sink { 3 } else { 4 }
+            );
         }
     }
 }
@@ -7011,12 +7098,6 @@ fn nearby_public_ipc_receipts_cycle_cancel_and_confirm_without_focus_or_preview_
                 windows,
             } = selection_fixture(all, floating);
             let mut ipc = ShrinkIpcClient::new(&mut fixture);
-            if floating && !all {
-                assert!(ipc
-                    .request(&mut fixture, Request::Action(Action::ExpandNearbyWindow {}))
-                    .is_err());
-                continue;
-            }
             let focus = fixture.niri().keyboard_focus.surface().cloned();
             let configs = surfaces
                 .iter()

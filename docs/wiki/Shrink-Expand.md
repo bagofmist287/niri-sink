@@ -254,10 +254,13 @@ scale and capture isolation; this is not physical-device or nested-session evide
 Nearby expansion pins the current ordinary tiled origin. It lists all direct
 spines before same-axis chains, in right/down/left/up and native member order.
 Traversal stops at ordinary or differently oriented windows and uses shortest
-paths. In a nonempty workspace containing only spines, it visits the full scrolling
+paths. When no normal tiled window is available to native tiling navigation, it visits the full scrolling
 start order, including hidden tabs, then floating positions from top to bottom,
-left to right, with window-ID ties. A mixed workspace's floating ordinary focus
-does not start a tiling search. Repeating the command cycles the current list and
+left to right, with window-ID ties. Sink windows and ordinary floating windows do
+not block this workspace-wide spine search and never enter its candidates. Hidden
+normal tabs still block it because native navigation can select them. With normal
+tiled windows present, a floating ordinary focus does not start a local tiling search.
+Repeating the command cycles the current list and
 refreshes its timer; passive changes preserve the selected ID and deadline. An
 invalid selected identity or search scope cancels rather than choosing another.
 
